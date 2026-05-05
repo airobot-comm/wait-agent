@@ -10,6 +10,8 @@ Current note:
 
 - the accepted replacement for the old custom local fullscreen and live-surface path is documented in [tmux-first-workspace-plan.md](tmux-first-workspace-plan.md)
 - the accepted code-level runtime reorganization for that migration is documented in [tmux-first-runtime-architecture.md](tmux-first-runtime-architecture.md)
+- the accepted resumed remote-session baseline is documented in [remote-session-foundation.md](remote-session-foundation.md)
+- the accepted active server-console scheduling design for `task.t6-01` is documented in [server-console-scheduling-design.md](server-console-scheduling-design.md)
 - until this architecture document is fully revised, treat the tmux-first plan as the authoritative local workspace display direction
 
 This document translates the product requirements in [wait-agent-prd.md](wait-agent-prd.md) into a build-oriented system architecture.
@@ -53,6 +55,12 @@ Network mode only adds:
 - Remote client nodes
 - Session registration and broadcast
 - A server-side interaction surface for remote sessions routed through the server control plane
+
+Remote-session refinement:
+
+- local and remote targets are one shared product surface
+- the distinction is backend transport, not a second workspace UX
+- remote targets open in the same fixed-chrome main slot model used by local targets
 
 ## 4. Runtime Topology
 
@@ -106,6 +114,8 @@ For future remote sessions, the accepted interaction path is:
 - the remote node remains the PTY owner for its sessions
 - the server maintains aggregate session state and routes control messages
 - server-side user interaction runs through a waitagent `interact` surface, not through a server-owned PTY pretending to be local
+- a local workspace console and a future server-side console may both open the same remote target at the same time
+- remote input is shared across opened consoles, remote output is broadcast to them, and resize authority stays exclusive
 
 Anti-goal:
 
@@ -195,10 +205,9 @@ This is the only place that directly owns PTY file descriptors.
 
 Responsibilities:
 
-- Maintain waiting queue per console
-- Enforce switch lock per console
-- Observe interaction rounds
-- Decide when to stay, switch, or keep waiting
+- Track per-session waiting attention state per console
+- Surface manual-only attention cues from that state
+- Decide which session is eligible when the user explicitly switches or when the focused session disappears
 
 The scheduler must be console-scoped, not global.
 
@@ -422,18 +431,16 @@ The scheduler observes:
 
 The scheduler may emit:
 
-- `update_waiting_queue`
-- `mark_session_waiting`
-- `mark_session_active`
+- Update per-session waiting indicators in chrome
+- Clear waiting indicators after user attention or renewed activity
+- Mark the currently focused session active for chrome rendering
 
 ### 9.4 Scheduler State Machine
 
-The current local product does not perform automatic switching.
+The accepted product direction does not perform automatic switching.
 
-Any future automation should be:
-
-- policy-driven rather than heuristic magic
-- explicit in user-visible state
+Waiting state may inform the user through chrome, but it must not move focus
+without an explicit user action.
 - designed after the unified local and remote session model is settled
 
 ## 10. Input Routing Architecture

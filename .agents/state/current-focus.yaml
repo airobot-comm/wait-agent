@@ -1,7 +1,7 @@
 kind: state
 version: 1
-current_task: task.t5-06
-focus_statement: task.event-r4 is now closed, so active work resumes the first deferred network slice: build the shared transport-agnostic target registry on top of the accepted local fixed-chrome baseline
+current_task: task.t5-08c4d3b
+focus_statement: the runtime-only remote path now survives connect, detach, and reattach on backend-scoped sidecars, but opened remote sessions still lack explicit session-scoped live-mirror control, so active work moves first to protocol and server-side per-session mirror-route ownership on the public --port plus --connect contract
 last_updated_from:
   file: .agents/tasks/current.yaml
   reference: current_task

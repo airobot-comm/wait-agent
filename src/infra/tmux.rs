@@ -1,7 +1,9 @@
 pub use crate::infra::tmux_backend::EmbeddedTmuxBackend;
+pub(crate) use crate::infra::tmux_error::tmux_socket_dir;
 pub use crate::infra::tmux_error::TmuxError;
+#[allow(unused_imports)]
 pub use crate::infra::tmux_types::{
-    TmuxChromeGateway, TmuxControlGateway, TmuxGateway, TmuxLayoutGateway, TmuxPaneId,
-    TmuxPaneInfo, TmuxProgram, TmuxSessionGateway, TmuxSessionName, TmuxSocketName, TmuxSplitSize,
-    TmuxWindowHandle, TmuxWindowId, TmuxWorkspaceHandle,
+    RemoteTargetPublicationBinding, TmuxChromeGateway, TmuxControlGateway, TmuxGateway,
+    TmuxLayoutGateway, TmuxPaneId, TmuxPaneInfo, TmuxProgram, TmuxSessionGateway, TmuxSessionName,
+    TmuxSocketName, TmuxSplitSize, TmuxWindowHandle, TmuxWindowId, TmuxWorkspaceHandle,
 };

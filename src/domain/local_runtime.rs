@@ -30,13 +30,14 @@ pub enum SessionCatalogEvent {
         active_session: String,
         active_target: Option<String>,
         sessions: Vec<ManagedSessionRecord>,
+        listener_display: Option<String>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChromeEvent {
     SidebarSelectionChanged {
-        session_id: String,
+        target: String,
     },
     SurfaceResized {
         surface: ChromeSurface,
@@ -64,6 +65,7 @@ mod tests {
             active_session: "sess-1".to_string(),
             active_target: Some("wa-1:sess-1".to_string()),
             sessions: vec![session("wa-1", "sess-1")],
+            listener_display: Some("192.168.1.22:7474".to_string()),
         });
 
         assert_eq!(event.event_group(), EventGroup::Session);
@@ -83,9 +85,12 @@ mod tests {
     fn session(socket: &str, session: &str) -> ManagedSessionRecord {
         ManagedSessionRecord {
             address: ManagedSessionAddress::local_tmux(socket, session),
+            selector: Some(format!("{socket}:{session}")),
+            availability: crate::domain::session_catalog::SessionAvailability::Online,
             workspace_dir: Some(PathBuf::from("/tmp/demo")),
             workspace_key: None,
             session_role: None,
+            opened_by: Vec::new(),
             attached_clients: 1,
             window_count: 1,
             command_name: Some("bash".to_string()),

@@ -1,9 +1,11 @@
 use crate::domain::chrome::SidebarViewModel;
-use crate::domain::session_catalog::{ManagedSessionRecord, ManagedSessionTaskState};
+use crate::domain::session_catalog::{
+    ManagedSessionRecord, ManagedSessionTaskState, SessionTransport,
+};
 use crate::ui::chrome::{
-    right_align, sidebar_row_prefix, style_sidebar_badge, style_sidebar_detail_line,
+    display_width, right_align, sidebar_row_prefix, style_sidebar_badge, style_sidebar_detail_line,
     style_sidebar_header_line, style_sidebar_hint_line, style_sidebar_item_line,
-    style_sidebar_separator_line, SidebarBadgeState, SidebarRowStyle,
+    style_sidebar_separator_line, truncate_display_width, SidebarBadgeState, SidebarRowStyle,
 };
 
 pub struct SidebarUi;
@@ -70,18 +72,15 @@ impl SidebarUi {
         )
         .unwrap_or(&sessions[0]);
         let detail_line = selected_detail_line(selected, width);
-        let session_capacity = height.saturating_sub(lines.len() + 2);
-        for session in sessions.iter().take(session_capacity) {
+        for session in sessions.iter().take(height.saturating_sub(lines.len() + 2)) {
             let qualified_target = session.address.qualified_target();
             let is_current = active_target == Some(qualified_target.as_str());
             let is_selected = qualified_target == selected.address.qualified_target();
-            lines.push(render_session_row(
-                session,
-                is_current,
-                is_selected,
-                width,
-                _now_millis,
-            ));
+            push_line(
+                &mut lines,
+                render_session_row(session, is_current, is_selected, width, _now_millis),
+                height,
+            );
         }
 
         while lines.len() + 2 < height {
@@ -155,16 +154,13 @@ fn render_session_row(
     let (badge, badge_width) = style_sidebar_badge(badge_state, row_style, now_millis);
     let reserved = marker.len() + 1 + 1 + badge_width;
     let label_width = width.saturating_sub(reserved);
-    let label = pad_right(
-        &truncate_left(&session.display_label(), label_width),
-        label_width,
-    );
+    let primary_label = session_row_primary_label(session, label_width);
     let prefix = sidebar_row_prefix(row_style);
-    format!("{prefix}{marker} {label} {badge}\x1b[0m")
+    format!("{prefix}{marker} {primary_label} {badge}\x1b[0m")
 }
 
 fn selected_detail_line(session: &ManagedSessionRecord, width: usize) -> String {
-    let detail = format!("{} {}", session.display_label(), session.task_state.label());
+    let detail = selected_detail_text(session, width);
     style_sidebar_detail_line(&right_align(&detail, width), width)
 }
 
@@ -188,18 +184,100 @@ fn push_line(lines: &mut Vec<String>, line: String, height: usize) {
 }
 
 fn pad_right(text: &str, width: usize) -> String {
-    format!("{text:<width$}")
+    let text = truncate_display_width(text, width);
+    let padding = width.saturating_sub(display_width(&text));
+    format!("{text}{}", " ".repeat(padding))
 }
 
-fn truncate_left(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+fn session_row_primary_label(session: &ManagedSessionRecord, width: usize) -> String {
+    let full_label = session.display_label();
+    if display_width(&full_label) <= width {
+        return pad_right(&full_label, width);
+    }
+
+    if session.address.transport() == &SessionTransport::RemotePeer {
+        let command_host_port = remote_command_host_port_label(session);
+        if display_width(&command_host_port) <= width {
+            return pad_right(&command_host_port, width);
+        }
+        let command_host = format!(
+            "{}@{}",
+            session.command_name.as_deref().unwrap_or("bash"),
+            session.address.display_authority_id()
+        );
+        if display_width(&command_host) <= width {
+            return pad_right(&command_host, width);
+        }
+        return pad_right(&truncate_display_width(&command_host_port, width), width);
+    }
+
+    pad_right(&truncate_display_width(&full_label, width), width)
+}
+
+fn remote_command_host_port_label(session: &ManagedSessionRecord) -> String {
+    let authority = session.address.authority_id();
+    let (host, port) = authority
+        .split_once('#')
+        .map(|(host, port)| (host, Some(port)))
+        .unwrap_or((session.address.display_authority_id(), None));
+    match port {
+        Some(port) => format!(
+            "{}@{}:{}",
+            session.command_name.as_deref().unwrap_or("bash"),
+            host,
+            port
+        ),
+        None => format!(
+            "{}@{}",
+            session.command_name.as_deref().unwrap_or("bash"),
+            host
+        ),
+    }
+}
+
+fn selected_detail_text(session: &ManagedSessionRecord, width: usize) -> String {
+    let suffix =
+        if session.availability != crate::domain::session_catalog::SessionAvailability::Online {
+            session.availability.as_str().to_ascii_uppercase()
+        } else {
+            session.task_state.label().to_string()
+        };
+    let full_label = session.display_label();
+    let full_detail = format!("{full_label} {suffix}");
+    if display_width(&full_detail) <= width {
+        return full_detail;
+    }
+
+    if session.address.transport() == &SessionTransport::RemotePeer {
+        let command_host_label = format!(
+            "{}@{}",
+            session.command_name.as_deref().unwrap_or("bash"),
+            session.address.display_authority_id()
+        );
+        let command_host_detail = format!("{command_host_label} {suffix}");
+        if display_width(&command_host_detail) <= width {
+            return command_host_detail;
+        }
+
+        let host_only_detail = format!("{} {suffix}", session.address.display_authority_id());
+        if display_width(&host_only_detail) <= width {
+            return host_only_detail;
+        }
+
+        let authority_only_label = session.address.display_authority_id();
+        if display_width(authority_only_label) <= width {
+            return authority_only_label.to_string();
+        }
+    }
+
+    truncate_display_width(&full_detail, width)
 }
 
 #[cfg(test)]
 mod tests {
     use super::SidebarUi;
     use crate::domain::session_catalog::{
-        ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState,
+        ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState, SessionAvailability,
     };
     use std::path::PathBuf;
 
@@ -213,9 +291,12 @@ mod tests {
             &[
                 ManagedSessionRecord {
                     address: ManagedSessionAddress::local_tmux("wa-1", "waitagent-1"),
+                    selector: Some("wa-1:waitagent-1".to_string()),
+                    availability: crate::domain::session_catalog::SessionAvailability::Online,
                     workspace_dir: Some(PathBuf::from("/tmp/demo")),
                     workspace_key: Some("1234".to_string()),
                     session_role: None,
+                    opened_by: Vec::new(),
                     attached_clients: 2,
                     window_count: 1,
                     command_name: Some("bash".to_string()),
@@ -224,9 +305,12 @@ mod tests {
                 },
                 ManagedSessionRecord {
                     address: ManagedSessionAddress::local_tmux("wa-2", "waitagent-2"),
+                    selector: Some("wa-2:waitagent-2".to_string()),
+                    availability: crate::domain::session_catalog::SessionAvailability::Online,
                     workspace_dir: Some(PathBuf::from("/tmp/demo")),
                     workspace_key: Some("5678".to_string()),
                     session_role: None,
+                    opened_by: Vec::new(),
                     attached_clients: 1,
                     window_count: 1,
                     command_name: Some("codex".to_string()),
@@ -257,5 +341,72 @@ mod tests {
         let output = SidebarUi::render("wa-1", "waitagent-1", None, None, &[], 1, 3, 0);
 
         assert!(output.contains("<"));
+    }
+
+    #[test]
+    fn sidebar_ui_renders_remote_session_on_single_line_with_host_port() {
+        let output = SidebarUi::render(
+            "wa-1",
+            "waitagent-1",
+            None,
+            Some("192.168.31.182#7513:372645a93b9cd222"),
+            &[ManagedSessionRecord {
+                address: ManagedSessionAddress::remote_peer(
+                    "192.168.31.182#7513",
+                    "372645a93b9cd222",
+                ),
+                selector: Some("192.168.31.182#7513:372645a93b9cd222".to_string()),
+                availability: SessionAvailability::Online,
+                workspace_dir: Some(PathBuf::from("/home/kk/wait-agent")),
+                workspace_key: Some("372645a93b9cd222".to_string()),
+                session_role: None,
+                opened_by: Vec::new(),
+                attached_clients: 0,
+                window_count: 1,
+                command_name: Some("bash".to_string()),
+                current_path: Some(PathBuf::from("/home/kk/wait-agent")),
+                task_state: ManagedSessionTaskState::Input,
+            }],
+            32,
+            6,
+            0,
+        );
+
+        assert!(output.contains("bash@192.168.31.182:7513"));
+        assert!(output.contains("192.168.31.182"));
+        assert!(!output.contains("session 372645a93b9cd222"));
+    }
+
+    #[test]
+    fn sidebar_ui_preserves_remote_host_in_detail_line_when_width_is_tight() {
+        let output = SidebarUi::render(
+            "wa-1",
+            "waitagent-1",
+            None,
+            Some("192.168.31.182#7513:372645a93b9cd222"),
+            &[ManagedSessionRecord {
+                address: ManagedSessionAddress::remote_peer(
+                    "192.168.31.182#7513",
+                    "372645a93b9cd222",
+                ),
+                selector: Some("192.168.31.182#7513:372645a93b9cd222".to_string()),
+                availability: SessionAvailability::Online,
+                workspace_dir: Some(PathBuf::from("/home/kk/wait-agent")),
+                workspace_key: Some("372645a93b9cd222".to_string()),
+                session_role: None,
+                opened_by: Vec::new(),
+                attached_clients: 0,
+                window_count: 1,
+                command_name: Some("bash".to_string()),
+                current_path: Some(PathBuf::from("/home/kk/wait-agent")),
+                task_state: ManagedSessionTaskState::Input,
+            }],
+            24,
+            6,
+            0,
+        );
+
+        assert!(output.contains("192.168.31.182 INPUT"));
+        assert!(!output.contains("bash@192.168.31.182:3726"));
     }
 }

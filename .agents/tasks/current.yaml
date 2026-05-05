@@ -1,38 +1,45 @@
-id: task.t5-06
+id: task.t5-08c4d3b
 kind: task
 version: 1
-title: implement the aggregate transport-agnostic target registry
+title: implement explicit remote mirror open or close protocol messages and server-side session-route ownership
 status: in_progress
-priority: medium
+priority: high
+design_ref:
+  doc: docs/remote-live-mirror-design.md
+  why:
+    - the current cross-host placeholder failure is caused by the missing session-scoped live-mirror control path rather than by one isolated rendering bug
+    - this slice establishes the protocol and server-owned mirror route that every later PTY-owner and visible-parity step depends on
 source_of_truth:
-  file: .agents/tasks/queued/task.t5-06.yaml
+  file: .agents/tasks/queued/task.t5-08c4d3b.yaml
   reference: current
 depends_on:
-  - task.event-r4.done
+  - task.t5-08c4d3a.done
 linked_primitives:
-  - primitive.network-registry-scope
   - primitive.verification-refresh
   - primitive.task-history-update
   - primitive.task-board-sync
   - primitive.agents-self-maintenance
 done_criteria:
-  - the aggregate server tracks local and remote targets in one authoritative transport-agnostic registry instead of relying on one-off publication paths
-  - registry state matches the shared target catalog and main-slot activation model used by the local tmux-first path, so later remote input, resize, and server-side console work can consume it without another schema rewrite
-  - the registry does not assume local tmux inspection, superseded daemon attach identity, or server-owned remote PTYs as the universal session model
-  - local fixed-chrome workspace behavior remains intact while aggregate registration is introduced
-  - task board and verification state are refreshed together with the implementation slice
+  - the protocol and transport facade expose explicit mirror open or close messages for one remote `session_id`
+  - server-side remote open attaches observers to one per-session mirror route instead of relying on placeholder state alone
+  - opening the same remote session from more than one console reuses the same server-side mirror route
 verification:
   - cargo test
-  - targeted review of registry ownership and update paths across the server, transport, and session layers
+  - targeted review of protocol and server mirror-route ownership
 touched_paths:
-  - src/server.rs
-  - src/session.rs
-  - src/transport.rs
-  - .agents/tasks/queued/task.t5-06.yaml
-  - .agents/tasks/backlog.yaml
+  - proto/waitagent/remote/v1/node_session.proto
+  - src/infra/remote_grpc_proto.rs
+  - src/infra/remote_grpc_transport.rs
+  - src/infra/remote_protocol.rs
+  - src/runtime
+  - src/application
+  - docs/remote-live-mirror-design.md
+  - docs/protocol.md
   - docs/execution-status-board.md
-  - docs/tmux-first-workspace-plan.md
+  - .agents/tasks/backlog.yaml
+  - .agents/tasks/current.yaml
+  - .agents/tasks/queued/task.t5-08c4d3b.yaml
+  - .agents/state/task-history.yaml
+  - .agents/state/current-focus.yaml
 notes:
-  - This task is the first network slice after the local event-driven route became the accepted default baseline.
-  - 2026-04-27 resumed: `task.event-r4` is now closed after user-reported shell and Codex manual visible-behavior validation completed, so active work moves to the shared transport-agnostic target registry.
-  - Do not fork a separate remote-only registry shape; local and remote targets must converge on one shared catalog.
+  - This slice owns the protocol and server route boundary only. It should not yet finish PTY-owner mirror reuse or final acceptance.

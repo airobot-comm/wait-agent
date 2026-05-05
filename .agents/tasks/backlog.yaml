@@ -118,16 +118,106 @@ next:
     status: superseded
   - id: task.t5-06
     title: implement the aggregate transport-agnostic target registry
-    status: in_progress
+    status: superseded
+  - id: task.t5-06a
+    title: lock the remote-session foundation docs and split the registry implementation queue
+    status: done
+  - id: task.t5-06b
+    title: generalize target identity and catalog records into a transport-agnostic model
+    status: done
+  - id: task.t5-06c
+    title: extract the target-registry service boundary and route chrome consumers through unified target records
+    status: done
   - id: task.scroll-1
     title: implement tmux-style pane history with mouse-draggable gutter scrolling
     status: superseded
   - id: task.t5-07
-    title: implement remote target input and resize routing through the server control plane
-    status: deferred
+    title: implement remote target input routing and clean remote resize boundaries through the server control plane
+    status: done
   - id: task.t6-01
     title: implement the server-side workspace console as a target-activation surface
-    status: deferred
+    status: superseded
+  - id: task.t6-01a
+    title: extract a unified server-console interaction seam for local and remote targets
+    status: done
+  - id: task.t6-01b
+    title: capture real submit and manual-switch signals through the unified server-console interaction seam
+    status: done
+  - id: task.t6-01c
+    title: track waiting transitions and build an honest server-console FIFO waiting queue
+    status: done
+  - id: task.t6-01d
+    title: cancelled auto-switch slice superseded by manual-only attention policy
+    status: superseded
+  - id: task.t6-01e
+    title: retire server-side auto-switch planning and lock server-console on manual-only attention cues
+    status: done
+  - id: task.t5-08
+    title: design the remote node connection architecture for efficient multi-connection ingress and ownership
+    status: done
+  - id: task.t5-08a1
+    title: design the gRPC proto and RPC contract for remote node sessions
+    status: done
+  - id: task.t5-08a2
+    title: design node trust, dialing policy, and canonical connection ownership
+    status: done
+  - id: task.t5-08a3
+    title: design remote render bootstrap, replay, and late-subscriber recovery
+    status: done
+  - id: task.t5-08a
+    title: introduce a real cross-host authority ingress source on the accepted connection boundary
+    status: done
+  - id: task.t5-08b
+    title: centralize live node-session ownership and remote registration lifecycle
+    status: done
+  - id: task.t5-08c
+    title: original remote phase-completion umbrella superseded by bounded session-centric slices
+    status: superseded
+  - id: task.t5-08c1
+    title: landed node-level remote target discovery slice later superseded by session-centric catalog synchronization
+    status: superseded
+  - id: task.t5-08c2
+    title: synchronize connected remote node sessions into the shared catalog
+    status: done
+  - id: task.t5-08c3
+    title: route remote control-plane traffic by session and demote attachment to observer scope
+    status: done
+  - id: task.t5-08c4
+    title: original remote sidebar plus validation umbrella superseded by backend-scoped runtime-owner slices
+    status: superseded
+  - id: task.t5-08c4a
+    title: lock the backend-scoped remote runtime-owner design and realign the execution queue
+    status: done
+  - id: task.t5-08c4b
+    title: introduce the backend-scoped remote owner sidecar and local IPC snapshot boundary
+    status: in_progress
+  - id: task.t5-08c4c
+    title: route shared-catalog and sidebar remote state through the live owner snapshot and retire file-backed remote sidebar sources
+    status: ready
+  - id: task.t5-08c4d
+    title: original runtime-only validation umbrella superseded by bounded export-boundary and validation slices
+    status: superseded
+  - id: task.t5-08c4d1
+    title: correct backend-scoped local session export semantics on the runtime-only remote path
+    status: done
+  - id: task.t5-08c4d2
+    title: close detach or reattach continuity and owner restart semantics on the corrected runtime-only path
+    status: done
+  - id: task.t5-08c4d3
+    title: original cross-host validation umbrella superseded by bounded remote live-mirror slices
+    status: superseded
+  - id: task.t5-08c4d3a
+    title: freeze the session-scoped remote live-mirror design and split the remaining phase-2 slice
+    status: done
+  - id: task.t5-08c4d3b
+    title: implement explicit remote mirror open or close protocol messages and server-side session-route ownership
+    status: in_progress
+  - id: task.t5-08c4d3c
+    title: implement PTY-owner session mirror lifecycle and reuse on the connected client node
+    status: ready
+  - id: task.t5-08c4d3d
+    title: bind bootstrap replay and live remote output into visible parity and close cross-host acceptance
+    status: ready
   - id: task.t3-07
     title: implement narrow-terminal compaction rules for the fixed-chrome workspace layout
     status: deferred
@@ -152,6 +242,8 @@ source_of_truth:
   file: .agents/tasks/backlog.yaml
 notes:
   - `.agents/tasks/*` is the unified task source; task status changes must update backlog, the current task pointer, queued task files, and task/state mirrors in the same change.
+  - Active implementation work must have an explicit top-down design source. Do not land patch-style behavior changes that only exist in chat or status notes without a governing design document.
+  - Every new in-progress or queued implementation task must declare a `design_ref` field that points to the governing top-down design document and explains why that document authorizes the slice. Tasks without `design_ref` are not ready for execution.
   - Replacement work must clean up superseded code paths as it lands; old custom fullscreen and live-surface logic should not be left in place behind the tmux-first architecture unless a named compatibility reason is documented in the active task.
   - T3-07 remains optional for the local MVP unless acceptance evidence proves it is blocking.
   - The lifecycle queue is complete enough to support the tmux-first migration; resumed network expansion is deferred until the local display baseline is rebuilt on tmux-native ownership boundaries.
@@ -163,6 +255,15 @@ notes:
   - 2026-04-24 refinement: fixed-chrome main-slot target activation is now a prerequisite for further attach-side event cleanup, because the current sidebar or footer switch path still detaches the client and launches `waitagent attach <target>`.
   - 2026-04-24 execution lock: `task.event-r2a -> task.event-r3 -> task.event-r4` is the top-priority local batch and must complete before resuming remote, network, or optional polish work.
   - Remaining network and remote tasks must build on the shared transport-agnostic target catalog and fixed-chrome main-slot activation model; do not resume them on top of superseded daemon, attach, or local-only session assumptions.
+  - 2026-04-27 refinement: the original umbrella `task.t5-06` is now split into `task.t5-06a -> task.t5-06b -> task.t5-06c` so the resumed remote queue lands docs, model, and registry-boundary work in separate bounded slices before transport routing begins.
+  - 2026-04-27 update: `task.t5-06a` is complete enough to close; active work now moves to `task.t5-06b`, which generalizes target identity and catalog records without starting transport routing.
+  - 2026-04-27 update: `task.t5-06b` is complete enough to close after the shared target model, protocol identity contract, and compatibility accessors landed; active work now moves to `task.t5-06c`, where local tmux becomes the first producer behind an explicit target-registry boundary.
+  - 2026-04-27 update: `task.t5-06c` is complete enough to close after current consumers were rerouted through a dedicated target-registry service, so active work now moves to `task.t5-07`, the first real remote transport-routing slice.
+  - 2026-04-29 refinement: the original `task.t6-01` umbrella was first split into bounded slices and later corrected again when the planned auto-switch slice was cancelled in favor of a manual-only attention policy lock.
+  - 2026-04-30 refinement: `task.t5-07`, `task.t6-01e`, and `task.t5-08a1` closed the current control-plane, server-console-planning, and protocol-contract gaps; implementation remains deliberately paused behind the remaining design slices `task.t5-08a2 -> task.t5-08a3` before `task.t5-08a -> task.t5-08c` resumes.
+  - 2026-04-30 correction: the previously landed `task.t5-08c1` discovered-target slice is no longer the accepted end state because the remote product model is `node -> sessions -> attachments`, so active work is now re-split into `task.t5-08c2 -> task.t5-08c4`.
+  - 2026-05-02 refinement: the old `task.t5-08c4d` validation umbrella is now split again into `task.t5-08c4d1 -> task.t5-08c4d3` because correcting the backend-scoped local session export boundary must land before detach or reattach and cross-host acceptance can be trusted.
+  - 2026-05-02 refinement: the old `task.t5-08c4d3` cross-host validation umbrella is now split again into `task.t5-08c4d3a -> task.t5-08c4d3d` because the latest review exposed a missing session-scoped live-mirror design and runtime lifecycle rather than a single validation-only gap.
   - The old gutter-scroll direction remains retired.
   - The old custom fullscreen-history direction is now also retired as the primary architecture because Codex-like live TUIs do not reliably repaint under the mixed narrow-PTY then widened-fullscreen model.
   - `task.architecture-1` is intentionally parked as deferred cleanup so it stays visible without silently becoming the next in-progress delivery slice.

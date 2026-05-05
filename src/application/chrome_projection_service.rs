@@ -17,21 +17,23 @@ impl ChromeProjectionService {
                 active_session,
                 active_target,
                 sessions,
+                listener_display,
             }) => {
                 self.state.active_socket = active_socket.clone();
                 self.state.active_session = active_session.clone();
                 self.state.active_target = active_target.clone();
                 self.state.sessions = sessions.clone();
+                self.state.listener_display = listener_display.clone();
                 self.state.ensure_active_target();
                 self.ensure_selected_target();
                 self.emit_both()
             }
-            LocalRuntimeEvent::Chrome(ChromeEvent::SidebarSelectionChanged { session_id }) => {
+            LocalRuntimeEvent::Chrome(ChromeEvent::SidebarSelectionChanged { target }) => {
                 self.state.selected_target = self
                     .state
                     .sessions
                     .iter()
-                    .find(|session| session.address.session_id() == session_id)
+                    .find(|session| session.address.qualified_target() == *target)
                     .map(|session| session.address.qualified_target());
                 self.emit_sidebar()
             }
@@ -131,6 +133,7 @@ impl ChromeProjectionService {
             active_session: self.state.active_session.clone(),
             active_target: self.state.active_target.clone(),
             sessions: self.state.sessions.clone(),
+            listener_display: self.state.listener_display.clone(),
             width,
             fullscreen: self.state.fullscreen,
         })
@@ -144,6 +147,7 @@ struct ChromeProjectionState {
     active_target: Option<String>,
     selected_target: Option<String>,
     sessions: Vec<ManagedSessionRecord>,
+    listener_display: Option<String>,
     sidebar_surface: ChromeSurfaceSize,
     footer_width: usize,
     fullscreen_footer_width: usize,
@@ -216,7 +220,13 @@ mod tests {
                 active_socket: "wa-1".to_string(),
                 active_session: "sess-1".to_string(),
                 active_target: Some("wa-1:sess-1".to_string()),
-                sessions: vec![session("wa-1", "sess-1", "bash")],
+                sessions: vec![session(
+                    "wa-1",
+                    "sess-1",
+                    "bash",
+                    ManagedSessionTaskState::Input,
+                )],
+                listener_display: Some("192.168.1.22:7474".to_string()),
             },
         ));
 
@@ -225,6 +235,13 @@ mod tests {
             Some(24)
         );
         assert_eq!(update.footer.as_ref().map(|view| view.width), Some(80));
+        assert_eq!(
+            update
+                .footer
+                .as_ref()
+                .and_then(|view| view.listener_display.as_deref()),
+            Some("192.168.1.22:7474")
+        );
         assert_eq!(
             update
                 .sidebar
@@ -257,15 +274,16 @@ mod tests {
                 active_session: "sess-1".to_string(),
                 active_target: Some("wa-1:sess-1".to_string()),
                 sessions: vec![
-                    session("wa-1", "sess-1", "bash"),
-                    session("wa-2", "sess-2", "codex"),
+                    session("wa-1", "sess-1", "bash", ManagedSessionTaskState::Input),
+                    session("wa-2", "sess-2", "codex", ManagedSessionTaskState::Input),
                 ],
+                listener_display: None,
             },
         ));
 
         let update = service.apply_event(&LocalRuntimeEvent::Chrome(
             ChromeEvent::SidebarSelectionChanged {
-                session_id: "sess-2".to_string(),
+                target: "wa-2:sess-2".to_string(),
             },
         ));
 
@@ -298,7 +316,13 @@ mod tests {
                 active_socket: "wa-1".to_string(),
                 active_session: "sess-1".to_string(),
                 active_target: Some("wa-1:sess-1".to_string()),
-                sessions: vec![session("wa-1", "sess-1", "bash")],
+                sessions: vec![session(
+                    "wa-1",
+                    "sess-1",
+                    "bash",
+                    ManagedSessionTaskState::Input,
+                )],
+                listener_display: None,
             },
         ));
 
@@ -333,9 +357,10 @@ mod tests {
                 active_session: "sess-1".to_string(),
                 active_target: Some("wa-1:sess-1".to_string()),
                 sessions: vec![
-                    session("wa-1", "sess-1", "bash"),
-                    session("wa-1", "sess-2", "codex"),
+                    session("wa-1", "sess-1", "bash", ManagedSessionTaskState::Input),
+                    session("wa-1", "sess-2", "codex", ManagedSessionTaskState::Input),
                 ],
+                listener_display: None,
             },
         ));
 
@@ -345,9 +370,10 @@ mod tests {
                 active_session: "sess-1".to_string(),
                 active_target: Some("wa-1:sess-2".to_string()),
                 sessions: vec![
-                    session("wa-1", "sess-1", "bash"),
-                    session("wa-1", "sess-2", "codex"),
+                    session("wa-1", "sess-1", "bash", ManagedSessionTaskState::Input),
+                    session("wa-1", "sess-2", "codex", ManagedSessionTaskState::Input),
                 ],
+                listener_display: None,
             },
         ));
 
@@ -369,17 +395,25 @@ mod tests {
         );
     }
 
-    fn session(socket: &str, session: &str, command: &str) -> ManagedSessionRecord {
+    fn session(
+        socket: &str,
+        session: &str,
+        command: &str,
+        task_state: ManagedSessionTaskState,
+    ) -> ManagedSessionRecord {
         ManagedSessionRecord {
             address: ManagedSessionAddress::local_tmux(socket, session),
+            selector: Some(format!("{socket}:{session}")),
+            availability: crate::domain::session_catalog::SessionAvailability::Online,
             workspace_dir: Some(PathBuf::from("/tmp/demo")),
             workspace_key: None,
             session_role: None,
+            opened_by: Vec::new(),
             attached_clients: 1,
             window_count: 1,
             command_name: Some(command.to_string()),
             current_path: Some(PathBuf::from("/tmp/demo")),
-            task_state: ManagedSessionTaskState::Input,
+            task_state,
         }
     }
 }

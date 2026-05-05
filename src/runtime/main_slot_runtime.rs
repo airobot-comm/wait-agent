@@ -1,7 +1,10 @@
 use crate::application::layout_service::{FOOTER_PANE_TITLE, SIDEBAR_PANE_TITLE};
-use crate::application::session_service::SessionService;
+use crate::application::target_registry_service::{
+    DefaultTargetCatalogGateway, TargetRegistryService,
+};
+use crate::cli::{prepend_global_network_args, RemoteNetworkConfig};
 use crate::cli::{ActivateTargetCommand, MainPaneDiedCommand, NewTargetCommand};
-use crate::domain::session_catalog::ManagedSessionRecord;
+use crate::domain::session_catalog::{ManagedSessionRecord, SessionTransport};
 use crate::domain::workspace::WorkspaceInstanceConfig;
 use crate::domain::workspace::WorkspaceSessionRole;
 use crate::infra::tmux::{
@@ -23,7 +26,9 @@ pub struct MainSlotRuntime {
     backend: EmbeddedTmuxBackend,
     target_host_runtime: TargetHostRuntime,
     layout_runtime: WorkspaceLayoutRuntime,
-    session_service: SessionService<EmbeddedTmuxBackend>,
+    target_registry: TargetRegistryService<DefaultTargetCatalogGateway>,
+    current_executable: PathBuf,
+    network: RemoteNetworkConfig,
 }
 
 impl MainSlotRuntime {
@@ -31,13 +36,17 @@ impl MainSlotRuntime {
         backend: EmbeddedTmuxBackend,
         target_host_runtime: TargetHostRuntime,
         layout_runtime: WorkspaceLayoutRuntime,
-        session_service: SessionService<EmbeddedTmuxBackend>,
+        target_registry: TargetRegistryService<DefaultTargetCatalogGateway>,
+        current_executable: PathBuf,
+        network: RemoteNetworkConfig,
     ) -> Self {
         Self {
             backend,
             target_host_runtime,
             layout_runtime,
-            session_service,
+            target_registry,
+            current_executable,
+            network,
         }
     }
 
@@ -47,17 +56,29 @@ impl MainSlotRuntime {
     ) -> Result<(), LifecycleError> {
         let current_workspace = self.current_workspace(&command)?;
         let current_socket = TmuxSocketName::new(&command.current_socket_name);
-        let session =
-            if target_socket_name(&command.target) == Some(command.current_socket_name.as_str()) {
-                self.find_session_matching_on_socket(&current_socket, &command.target)?
-            } else {
-                self.session_service
-                    .find_session(&command.target)
-                    .map_err(main_slot_error)?
+        let socket_scoped_registry =
+            self.target_registry_for_socket(command.current_socket_name.as_str())?;
+        let session = if target_socket_name(&command.target)
+            == Some(command.current_socket_name.as_str())
+        {
+            self.find_session_matching_on_socket(
+                &socket_scoped_registry,
+                &current_socket,
+                &command.target,
+            )?
+        } else {
+            socket_scoped_registry
+                .find_target(&command.target)
+                .map_err(main_slot_error)?
+        }
+        .ok_or_else(|| LifecycleError::Protocol(format!("unknown target `{}`", command.target)))?;
+
+        match session.address.transport() {
+            SessionTransport::LocalTmux => {}
+            SessionTransport::RemotePeer => {
+                return self.activate_remote_target_in_workspace(&current_workspace, &session);
             }
-            .ok_or_else(|| {
-                LifecycleError::Protocol(format!("unknown tmux target `{}`", command.target))
-            })?;
+        }
 
         if session.address.server_id() == command.current_socket_name
             && session.address.session_id() == command.current_session_name
@@ -116,8 +137,8 @@ impl MainSlotRuntime {
             workspace_dir: workspace_dir.to_path_buf(),
         };
         let sessions = self
-            .session_service
-            .list_sessions_on_socket(&workspace.socket_name)
+            .target_registry
+            .list_targets_on_authority(workspace.socket_name.as_str())
             .map_err(main_slot_error)?;
 
         if let Some(existing_target) = sessions.iter().find(|session| session.is_target_host()) {
@@ -146,6 +167,7 @@ impl MainSlotRuntime {
         self.backend
             .swap_panes(workspace, &target_main_pane, &workspace_main_pane)
             .map_err(main_slot_error)?;
+        self.set_workspace_main_pane(workspace, &target_main_pane)?;
         self.set_active_target(workspace, Some(&target.address.qualified_target()))?;
         self.layout_runtime
             .sync_main_slot_bindings(workspace, workspace_dir)?;
@@ -167,17 +189,31 @@ impl MainSlotRuntime {
         if command.pane_id != main_pane_id {
             return Ok(());
         }
-        let sessions = self
-            .session_service
-            .list_sessions_on_socket(&TmuxSocketName::new(&command.socket_name))
-            .map_err(main_slot_error)?;
+        let recovery_pane = TmuxPaneId::new(main_pane_id);
         let active_target = self.active_target(&workspace)?;
+        if self.active_target_is_remote(workspace.socket_name.as_str(), active_target.as_deref())? {
+            self.fallback_after_remote_main_pane_exit(
+                &current_workspace,
+                &workspace,
+                &recovery_pane,
+                active_target,
+            )?;
+            return Ok(());
+        }
+        let sessions = self
+            .target_registry
+            .list_targets_on_authority(&command.socket_name)
+            .map_err(main_slot_error)?;
         let next_target =
             next_target_host_session(&sessions, &command.socket_name, active_target.as_deref());
 
         match next_target {
             Some(target) => {
-                self.activate_target_after_main_pane_exit(&current_workspace, &target)?;
+                self.activate_target_after_main_pane_exit(
+                    &current_workspace,
+                    &recovery_pane,
+                    &target,
+                )?;
                 self.close_target_session_identity(active_target.as_deref())?;
                 self.layout_runtime
                     .refresh_workspace_chrome(&workspace, &current_workspace.workspace_dir)?;
@@ -244,11 +280,68 @@ impl MainSlotRuntime {
         let mut workspace_main_pane = self.workspace_main_pane(&workspace)?;
 
         if let Some(active_target) = self.active_target(&workspace)? {
-            if let Some(active_session) =
-                self.find_session_matching_on_socket(&workspace.socket_name, &active_target)?
-            {
+            if let Some(active_session) = self.find_session_matching_on_socket(
+                &self.target_registry_for_socket(workspace.socket_name.as_str())?,
+                &workspace.socket_name,
+                &active_target,
+            )? {
                 // tmux moves the source pane into the destination slot, so the visible
                 // workspace main-pane identity becomes `active_host_pane` after restore.
+                workspace_main_pane = self.restore_active_target_to_host(
+                    &workspace,
+                    &active_session,
+                    &workspace_main_pane,
+                )?;
+            } else if self
+                .remote_target_record(workspace.socket_name.as_str(), &active_target)?
+                .is_some()
+            {
+                self.backend
+                    .respawn_pane(
+                        &workspace,
+                        &workspace_main_pane,
+                        &workspace_host_program(&current_workspace.workspace_dir),
+                    )
+                    .map_err(main_slot_error)?;
+            }
+        }
+
+        let target_main_pane = self.target_main_pane(target)?;
+        self.backend
+            .swap_panes(&workspace, &target_main_pane, &workspace_main_pane)
+            .map_err(main_slot_error)?;
+        self.set_workspace_main_pane(&workspace, &target_main_pane)?;
+        self.set_active_target(&workspace, Some(&target.address.qualified_target()))?;
+        self.layout_runtime
+            .sync_main_slot_bindings(&workspace, &current_workspace.workspace_dir)?;
+        self.layout_runtime
+            .refresh_workspace_chrome(&workspace, &current_workspace.workspace_dir)
+    }
+
+    fn activate_remote_target_in_workspace(
+        &self,
+        current_workspace: &CurrentWorkspace,
+        target: &crate::domain::session_catalog::ManagedSessionRecord,
+    ) -> Result<(), LifecycleError> {
+        let workspace = workspace_handle(
+            &current_workspace.socket_name,
+            &current_workspace.session_name,
+        );
+        if self.active_target(&workspace)?.as_deref()
+            == Some(target.address.qualified_target().as_str())
+        {
+            self.layout_runtime
+                .sync_main_slot_bindings(&workspace, &current_workspace.workspace_dir)?;
+            return Ok(());
+        }
+
+        let mut workspace_main_pane = self.workspace_main_pane(&workspace)?;
+        if let Some(active_target) = self.active_target(&workspace)? {
+            if let Some(active_session) = self.find_session_matching_on_socket(
+                &self.target_registry_for_socket(workspace.socket_name.as_str())?,
+                &workspace.socket_name,
+                &active_target,
+            )? {
                 workspace_main_pane = self.restore_active_target_to_host(
                     &workspace,
                     &active_session,
@@ -257,10 +350,19 @@ impl MainSlotRuntime {
             }
         }
 
-        let target_main_pane = self.target_main_pane(target)?;
         self.backend
-            .swap_panes(&workspace, &target_main_pane, &workspace_main_pane)
+            .respawn_pane(
+                &workspace,
+                &workspace_main_pane,
+                &remote_main_slot_program(
+                    &self.current_executable,
+                    current_workspace,
+                    target.address.id().as_str(),
+                    &self.network,
+                ),
+            )
             .map_err(main_slot_error)?;
+        self.set_workspace_main_pane(&workspace, &workspace_main_pane)?;
         self.set_active_target(&workspace, Some(&target.address.qualified_target()))?;
         self.layout_runtime
             .sync_main_slot_bindings(&workspace, &current_workspace.workspace_dir)?;
@@ -271,29 +373,74 @@ impl MainSlotRuntime {
     fn activate_target_after_main_pane_exit(
         &self,
         current_workspace: &CurrentWorkspace,
+        recovery_pane: &TmuxPaneId,
         target: &crate::domain::session_catalog::ManagedSessionRecord,
     ) -> Result<(), LifecycleError> {
         let workspace = workspace_handle(
             &current_workspace.socket_name,
             &current_workspace.session_name,
         );
-        let workspace_main_pane = self.workspace_main_pane(&workspace)?;
         self.backend
             .respawn_pane(
                 &workspace,
-                &workspace_main_pane,
+                recovery_pane,
                 &workspace_host_program(&current_workspace.workspace_dir),
             )
             .map_err(main_slot_error)?;
         let target_main_pane = self.target_main_pane(target)?;
         self.backend
-            .swap_panes(&workspace, &target_main_pane, &workspace_main_pane)
+            .swap_panes(&workspace, &target_main_pane, recovery_pane)
             .map_err(main_slot_error)?;
+        self.set_workspace_main_pane(&workspace, &target_main_pane)?;
         self.set_active_target(&workspace, Some(&target.address.qualified_target()))?;
         self.layout_runtime
             .sync_main_slot_bindings(&workspace, &current_workspace.workspace_dir)?;
         self.layout_runtime
             .refresh_workspace_chrome(&workspace, &current_workspace.workspace_dir)?;
+        Ok(())
+    }
+
+    fn fallback_after_remote_main_pane_exit(
+        &self,
+        current_workspace: &CurrentWorkspace,
+        workspace: &TmuxWorkspaceHandle,
+        recovery_pane: &TmuxPaneId,
+        active_target: Option<String>,
+    ) -> Result<(), LifecycleError> {
+        let sessions = self
+            .target_registry
+            .list_targets_on_authority(workspace.socket_name.as_str())
+            .map_err(main_slot_error)?;
+        let next_target = next_target_host_session(&sessions, workspace.socket_name.as_str(), None);
+        match next_target {
+            Some(target) => {
+                self.activate_target_after_main_pane_exit(
+                    current_workspace,
+                    recovery_pane,
+                    &target,
+                )?;
+                self.set_active_target(
+                    workspace,
+                    Some(target.address.qualified_target().as_str()),
+                )?;
+            }
+            None => {
+                self.backend
+                    .respawn_pane(
+                        workspace,
+                        recovery_pane,
+                        &workspace_host_program(&current_workspace.workspace_dir),
+                    )
+                    .map_err(main_slot_error)?;
+                self.set_workspace_main_pane(workspace, recovery_pane)?;
+                self.set_active_target(workspace, None)?;
+                self.layout_runtime
+                    .sync_main_slot_bindings(workspace, &current_workspace.workspace_dir)?;
+                self.layout_runtime
+                    .refresh_workspace_chrome(workspace, &current_workspace.workspace_dir)?;
+            }
+        }
+        self.close_target_session_identity(active_target.as_deref())?;
         Ok(())
     }
 
@@ -334,10 +481,12 @@ impl MainSlotRuntime {
         &self,
         workspace: &TmuxWorkspaceHandle,
     ) -> Result<TmuxPaneId, LifecycleError> {
-        let pane = self
+        let configured_pane = self
             .backend
             .show_session_option(workspace, WAITAGENT_MAIN_PANE_OPTION)
             .map_err(main_slot_error)?
+            .filter(|pane| self.pane_is_live(workspace, pane));
+        let pane = configured_pane
             .or_else(|| self.infer_target_main_pane(workspace))
             .ok_or_else(|| {
                 LifecycleError::Protocol(format!(
@@ -345,7 +494,9 @@ impl MainSlotRuntime {
                     workspace.session_name.as_str()
                 ))
             })?;
-        Ok(TmuxPaneId::new(pane))
+        let pane = TmuxPaneId::new(pane);
+        self.set_workspace_main_pane(workspace, &pane)?;
+        Ok(pane)
     }
 
     fn active_target(
@@ -372,16 +523,24 @@ impl MainSlotRuntime {
             .map_err(main_slot_error)
     }
 
+    fn set_workspace_main_pane(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        pane: &TmuxPaneId,
+    ) -> Result<(), LifecycleError> {
+        self.backend
+            .set_session_option(workspace, WAITAGENT_MAIN_PANE_OPTION, pane.as_str())
+            .map_err(main_slot_error)
+    }
+
     fn resolve_session_on_socket(
         &self,
         socket_name: &TmuxSocketName,
         session_name: &str,
     ) -> Result<ManagedSessionRecord, LifecycleError> {
-        self.session_service
-            .list_sessions_on_socket(socket_name)
+        self.target_registry_for_socket(socket_name.as_str())?
+            .resolve_target_on_authority_session(socket_name.as_str(), session_name)
             .map_err(main_slot_error)?
-            .into_iter()
-            .find(|session| session.address.session_id() == session_name)
             .ok_or_else(|| {
                 LifecycleError::Protocol(format!(
                     "session `{}` on socket `{}` could not be resolved",
@@ -392,40 +551,8 @@ impl MainSlotRuntime {
     }
 
     fn close_target_session_identity(&self, target: Option<&str>) -> Result<(), LifecycleError> {
-        let Some(target) = target else {
-            return Ok(());
-        };
-        if let Some((socket_name, session_name)) = split_qualified_target(target) {
-            return match self.backend.run_socket_command(
-                &TmuxSocketName::new(socket_name),
-                &[
-                    "kill-session".to_string(),
-                    "-t".to_string(),
-                    session_name.to_string(),
-                ],
-            ) {
-                Ok(()) => Ok(()),
-                Err(error) if error.is_command_failure() => Ok(()),
-                Err(error) => Err(main_slot_error(error)),
-            };
-        }
-        let Some(session) = self
-            .session_service
-            .find_session(target)
-            .map_err(main_slot_error)?
-        else {
-            return Ok(());
-        };
-        self.backend
-            .run_socket_command(
-                &TmuxSocketName::new(session.address.server_id()),
-                &[
-                    "kill-session".to_string(),
-                    "-t".to_string(),
-                    session.address.session_id().to_string(),
-                ],
-            )
-            .map_err(main_slot_error)
+        self.target_host_runtime
+            .close_target_session_identity(target)
     }
 
     fn current_workspace(
@@ -458,27 +585,72 @@ impl MainSlotRuntime {
         })
     }
 
+    fn remote_target_record(
+        &self,
+        socket_name: &str,
+        target: &str,
+    ) -> Result<Option<ManagedSessionRecord>, LifecycleError> {
+        Ok(self
+            .target_registry_for_socket(socket_name)?
+            .find_target(target)
+            .map_err(main_slot_error)?
+            .filter(|session| session.address.transport() == &SessionTransport::RemotePeer))
+    }
+
+    fn active_target_is_remote(
+        &self,
+        socket_name: &str,
+        target: Option<&str>,
+    ) -> Result<bool, LifecycleError> {
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        Ok(self.remote_target_record(socket_name, target)?.is_some())
+    }
+
     fn infer_target_main_pane(&self, workspace: &TmuxWorkspaceHandle) -> Option<String> {
         let window = self.backend.current_window(workspace).ok()?;
         let panes = self.backend.list_panes(workspace, &window).ok()?;
         panes
             .iter()
-            .find(|pane| pane.title != SIDEBAR_PANE_TITLE && pane.title != FOOTER_PANE_TITLE)
-            .or_else(|| panes.first())
+            .find(|pane| {
+                !pane.is_dead && pane.title != SIDEBAR_PANE_TITLE && pane.title != FOOTER_PANE_TITLE
+            })
+            .or_else(|| panes.iter().find(|pane| !pane.is_dead))
             .map(|pane| pane.pane_id.as_str().to_string())
+    }
+
+    fn pane_is_live(&self, workspace: &TmuxWorkspaceHandle, pane_id: &str) -> bool {
+        let Ok(window) = self.backend.current_window(workspace) else {
+            return false;
+        };
+        let Ok(panes) = self.backend.list_panes(workspace, &window) else {
+            return false;
+        };
+        panes
+            .iter()
+            .any(|pane| pane.pane_id.as_str() == pane_id && !pane.is_dead)
     }
 
     fn find_session_matching_on_socket(
         &self,
+        target_registry: &TargetRegistryService<DefaultTargetCatalogGateway>,
         socket_name: &TmuxSocketName,
         target: &str,
     ) -> Result<Option<ManagedSessionRecord>, LifecycleError> {
-        Ok(self
-            .session_service
-            .list_sessions_on_socket(socket_name)
-            .map_err(main_slot_error)?
-            .into_iter()
-            .find(|session| session.matches_target(target)))
+        target_registry
+            .find_target_on_authority(socket_name.as_str(), target)
+            .map_err(main_slot_error)
+    }
+
+    fn target_registry_for_socket(
+        &self,
+        socket_name: &str,
+    ) -> Result<TargetRegistryService<DefaultTargetCatalogGateway>, LifecycleError> {
+        Ok(TargetRegistryService::new(
+            DefaultTargetCatalogGateway::from_build_env_with_socket_name(socket_name)
+                .map_err(main_slot_error)?,
+        ))
     }
 }
 
@@ -534,6 +706,28 @@ fn workspace_host_program(workspace_dir: &Path) -> TmuxProgram {
     TmuxProgram::new(shell).with_start_directory(workspace_dir)
 }
 
+fn remote_main_slot_program(
+    executable: &Path,
+    current_workspace: &CurrentWorkspace,
+    target: &str,
+    network: &RemoteNetworkConfig,
+) -> TmuxProgram {
+    TmuxProgram::new(executable.display().to_string())
+        .with_args(prepend_global_network_args(
+            vec![
+                "__remote-main-slot".to_string(),
+                "--socket-name".to_string(),
+                current_workspace.socket_name.clone(),
+                "--session-name".to_string(),
+                current_workspace.session_name.clone(),
+                "--target".to_string(),
+                target.to_string(),
+            ],
+            network,
+        ))
+        .with_start_directory(&current_workspace.workspace_dir)
+}
+
 fn current_terminal_target_size() -> (Option<u16>, Option<u16>) {
     let terminal_size = TerminalRuntime::stdio().current_size_or_default();
     if terminal_size.rows > 1 && terminal_size.cols > 1 {
@@ -552,12 +746,36 @@ fn main_slot_error(error: TmuxError) -> LifecycleError {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_target_host_session, split_qualified_target, target_socket_name};
-    use crate::domain::session_catalog::{
-        ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState,
+    use super::{
+        next_target_host_session, remote_main_slot_program, split_qualified_target,
+        target_socket_name, CurrentWorkspace, MainSlotRuntime, FOOTER_PANE_TITLE,
+        SIDEBAR_PANE_TITLE, WAITAGENT_ACTIVE_TARGET_OPTION, WAITAGENT_MAIN_PANE_OPTION,
     };
-    use crate::domain::workspace::WorkspaceSessionRole;
-    use std::path::PathBuf;
+    use crate::application::target_registry_service::{
+        DefaultTargetCatalogGateway, TargetRegistryService,
+    };
+    use crate::application::workspace_service::WorkspaceService;
+    use crate::cli::RemoteNetworkConfig;
+    use crate::cli::{ActivateTargetCommand, MainPaneDiedCommand};
+    use crate::domain::session_catalog::{
+        ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState, SessionAvailability,
+    };
+    use crate::domain::workspace::{
+        WorkspaceInstanceConfig, WorkspaceInstanceId, WorkspaceSessionRole,
+    };
+    use crate::infra::tmux::{
+        EmbeddedTmuxBackend, TmuxGateway, TmuxLayoutGateway, TmuxSessionName, TmuxSocketName,
+        TmuxWorkspaceHandle,
+    };
+    use crate::runtime::remote_runtime_owner_runtime::RemoteRuntimeOwnerRuntime;
+    use crate::runtime::target_host_runtime::TargetHostRuntime;
+    use crate::runtime::workspace_entry_runtime::WorkspaceEntryRuntime;
+    use crate::runtime::workspace_layout_runtime::WorkspaceLayoutRuntime;
+    use crate::runtime::workspace_runtime::WorkspaceRuntime;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn next_target_host_session_prefers_another_target_on_same_socket() {
@@ -581,6 +799,16 @@ mod tests {
             "workspace",
             WorkspaceSessionRole::WorkspaceChrome,
         )];
+
+        assert!(next_target_host_session(&sessions, "wa-1", Some("wa-1:target-a")).is_none());
+    }
+
+    #[test]
+    fn next_target_host_session_ignores_remote_targets_when_local_target_host_exits() {
+        let sessions = vec![
+            session("wa-1", "workspace", WorkspaceSessionRole::WorkspaceChrome),
+            remote_session("192.168.31.18", "pty1"),
+        ];
 
         assert!(next_target_host_session(&sessions, "wa-1", Some("wa-1:target-a")).is_none());
     }
@@ -625,17 +853,561 @@ mod tests {
         assert_eq!(split_qualified_target(":target-a"), None);
     }
 
+    #[test]
+    fn remote_main_slot_program_targets_workspace_and_remote_target() {
+        let workspace = CurrentWorkspace {
+            socket_name: "wa-1".to_string(),
+            session_name: "workspace-1".to_string(),
+            workspace_dir: PathBuf::from("/tmp/demo"),
+        };
+
+        let program = remote_main_slot_program(
+            std::path::Path::new("/tmp/waitagent"),
+            &workspace,
+            "remote-peer:peer-a:shell-1",
+            &RemoteNetworkConfig::default(),
+        );
+
+        assert_eq!(program.program, "/tmp/waitagent");
+        assert_eq!(
+            program.args,
+            vec![
+                "--port".to_string(),
+                "7474".to_string(),
+                "__remote-main-slot".to_string(),
+                "--socket-name".to_string(),
+                "wa-1".to_string(),
+                "--session-name".to_string(),
+                "workspace-1".to_string(),
+                "--target".to_string(),
+                "remote-peer:peer-a:shell-1".to_string(),
+            ]
+        );
+        assert_eq!(program.start_directory, Some(PathBuf::from("/tmp/demo")));
+    }
+
+    #[test]
+    fn activating_remote_target_respawns_workspace_main_pane_not_detached_target_host() {
+        let backend = EmbeddedTmuxBackend::from_build_env()
+            .expect("vendored tmux backend should discover build env");
+        let workspace_config = unique_workspace_config("remote-main-slot");
+        let workspace_dir = workspace_config.workspace_dir.clone();
+        let waitagent_executable = waitagent_test_executable();
+        let entry_runtime = WorkspaceEntryRuntime::new(
+            WorkspaceRuntime::new(WorkspaceService::new(backend.clone())),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                RemoteNetworkConfig::default(),
+            )
+            .expect("workspace layout runtime should build"),
+        );
+        let workspace = entry_runtime
+            .bootstrap_workspace(&workspace_dir)
+            .expect("workspace bootstrap should succeed");
+        let target_host = backend
+            .ensure_workspace(
+                &WorkspaceInstanceConfig::for_new_target_on_socket_with_size(
+                    &workspace_dir,
+                    workspace.workspace_handle.socket_name.as_str(),
+                    None,
+                    None,
+                ),
+            )
+            .expect("target host bootstrap should succeed");
+
+        let runtime = MainSlotRuntime::new(
+            backend.clone(),
+            TargetHostRuntime::from_build_env(backend.clone())
+                .expect("target host runtime should build"),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                RemoteNetworkConfig::default(),
+            )
+            .expect("workspace layout runtime should build"),
+            TargetRegistryService::new(
+                DefaultTargetCatalogGateway::from_build_env_with_socket_name(
+                    workspace.workspace_handle.socket_name.as_str(),
+                )
+                .expect("target catalog gateway should build"),
+            ),
+            waitagent_executable.clone(),
+            RemoteNetworkConfig::default(),
+        );
+
+        let local_target = format!(
+            "{}:{}",
+            workspace.workspace_handle.socket_name.as_str(),
+            target_host.session_name.as_str()
+        );
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: local_target.clone(),
+            })
+            .expect("local target activation should succeed");
+
+        let remote_runtime_owner = RemoteRuntimeOwnerRuntime::new_for_tests(
+            waitagent_executable.clone(),
+            RemoteNetworkConfig::default(),
+        );
+        let remote_target = remote_session_with_selector(
+            "peer-a",
+            "remote-1",
+            &local_target,
+            ManagedSessionTaskState::Input,
+        );
+        remote_runtime_owner
+            .upsert_session(
+                workspace.workspace_handle.socket_name.as_str(),
+                "peer-a",
+                &remote_target,
+            )
+            .expect("remote target should be discoverable on workspace socket");
+
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: remote_target.address.qualified_target(),
+            })
+            .expect("remote target activation should succeed");
+
+        wait_for_condition(|| {
+            let active_target = backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read");
+            active_target.as_deref() == Some(remote_target.address.qualified_target().as_str())
+        });
+
+        wait_for_condition(|| {
+            workspace_main_pane_command(&backend, &workspace.workspace_handle).as_deref()
+                == Some("waitagent")
+        });
+
+        let target_host_handle = TmuxWorkspaceHandle {
+            workspace_id: WorkspaceInstanceId::new(target_host.session_name.as_str().to_string()),
+            socket_name: TmuxSocketName::new(
+                workspace.workspace_handle.socket_name.as_str().to_string(),
+            ),
+            session_name: TmuxSessionName::new(target_host.session_name.as_str().to_string()),
+        };
+        let target_host_command =
+            workspace_main_pane_command(&backend, &target_host_handle).expect("target host pane");
+        kill_server(&backend, &workspace.workspace_handle);
+        let _ = fs::remove_dir_all(workspace_dir);
+
+        assert_eq!(target_host_command, "bash");
+    }
+
+    #[test]
+    fn remote_main_pane_exit_falls_back_to_local_target_host() {
+        let backend = EmbeddedTmuxBackend::from_build_env()
+            .expect("vendored tmux backend should discover build env");
+        let workspace_config = unique_workspace_config("remote-main-slot-exit");
+        let workspace_dir = workspace_config.workspace_dir.clone();
+        let waitagent_executable = waitagent_test_executable();
+        let entry_runtime = WorkspaceEntryRuntime::new(
+            WorkspaceRuntime::new(WorkspaceService::new(backend.clone())),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                RemoteNetworkConfig::default(),
+            )
+            .expect("workspace layout runtime should build"),
+        );
+        let workspace = entry_runtime
+            .bootstrap_workspace(&workspace_dir)
+            .expect("workspace bootstrap should succeed");
+        let target_host = backend
+            .ensure_workspace(
+                &WorkspaceInstanceConfig::for_new_target_on_socket_with_size(
+                    &workspace_dir,
+                    workspace.workspace_handle.socket_name.as_str(),
+                    None,
+                    None,
+                ),
+            )
+            .expect("target host bootstrap should succeed");
+
+        let runtime = MainSlotRuntime::new(
+            backend.clone(),
+            TargetHostRuntime::from_build_env(backend.clone())
+                .expect("target host runtime should build"),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                RemoteNetworkConfig::default(),
+            )
+            .expect("workspace layout runtime should build"),
+            TargetRegistryService::new(
+                DefaultTargetCatalogGateway::from_build_env_with_socket_name(
+                    workspace.workspace_handle.socket_name.as_str(),
+                )
+                .expect("target catalog gateway should build"),
+            ),
+            waitagent_executable.clone(),
+            RemoteNetworkConfig::default(),
+        );
+
+        let local_target = format!(
+            "{}:{}",
+            workspace.workspace_handle.socket_name.as_str(),
+            target_host.session_name.as_str()
+        );
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: local_target.clone(),
+            })
+            .expect("local target activation should succeed");
+
+        let remote_runtime_owner = RemoteRuntimeOwnerRuntime::new_for_tests(
+            waitagent_executable.clone(),
+            RemoteNetworkConfig::default(),
+        );
+        let remote_target = remote_session_with_selector(
+            "peer-a",
+            "remote-exit-1",
+            &local_target,
+            ManagedSessionTaskState::Input,
+        );
+        remote_runtime_owner
+            .upsert_session(
+                workspace.workspace_handle.socket_name.as_str(),
+                "peer-a",
+                &remote_target,
+            )
+            .expect("remote target should be discoverable on workspace socket");
+
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: remote_target.address.qualified_target(),
+            })
+            .expect("remote target activation should succeed");
+
+        wait_for_condition(|| {
+            let active_target = backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read");
+            active_target.as_deref() == Some(remote_target.address.qualified_target().as_str())
+        });
+        wait_for_condition(|| {
+            workspace_main_pane_command(&backend, &workspace.workspace_handle).as_deref()
+                == Some("waitagent")
+        });
+
+        let main_pane_id = backend
+            .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
+            .expect("main pane option should read")
+            .expect("main pane option should be populated");
+        runtime
+            .run_main_pane_died(MainPaneDiedCommand {
+                socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                pane_id: main_pane_id,
+            })
+            .expect("remote main pane exit should recover to local target");
+
+        wait_for_condition(|| {
+            let active_target = backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read");
+            active_target.as_deref() == Some(local_target.as_str())
+        });
+        wait_for_condition(|| {
+            workspace_main_pane_command(&backend, &workspace.workspace_handle).as_deref()
+                == Some("bash")
+        });
+
+        kill_server(&backend, &workspace.workspace_handle);
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
+    #[test]
+    fn remote_main_pane_exit_recovery_ignores_corrupted_main_pane_option() {
+        let backend = EmbeddedTmuxBackend::from_build_env()
+            .expect("vendored tmux backend should discover build env");
+        let workspace_config = unique_workspace_config("remote-main-slot-dead-pane");
+        let workspace_dir = workspace_config.workspace_dir.clone();
+        let waitagent_executable = waitagent_test_executable();
+        let entry_runtime = WorkspaceEntryRuntime::new(
+            WorkspaceRuntime::new(WorkspaceService::new(backend.clone())),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                RemoteNetworkConfig::default(),
+            )
+            .expect("workspace layout runtime should build"),
+        );
+        let workspace = entry_runtime
+            .bootstrap_workspace(&workspace_dir)
+            .expect("workspace bootstrap should succeed");
+        let target_host = backend
+            .ensure_workspace(
+                &WorkspaceInstanceConfig::for_new_target_on_socket_with_size(
+                    &workspace_dir,
+                    workspace.workspace_handle.socket_name.as_str(),
+                    None,
+                    None,
+                ),
+            )
+            .expect("target host bootstrap should succeed");
+
+        let runtime = MainSlotRuntime::new(
+            backend.clone(),
+            TargetHostRuntime::from_build_env(backend.clone())
+                .expect("target host runtime should build"),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                RemoteNetworkConfig::default(),
+            )
+            .expect("workspace layout runtime should build"),
+            TargetRegistryService::new(
+                DefaultTargetCatalogGateway::from_build_env_with_socket_name(
+                    workspace.workspace_handle.socket_name.as_str(),
+                )
+                .expect("target catalog gateway should build"),
+            ),
+            waitagent_executable.clone(),
+            RemoteNetworkConfig::default(),
+        );
+
+        let local_target = format!(
+            "{}:{}",
+            workspace.workspace_handle.socket_name.as_str(),
+            target_host.session_name.as_str()
+        );
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: local_target.clone(),
+            })
+            .expect("local target activation should succeed");
+
+        let remote_runtime_owner = RemoteRuntimeOwnerRuntime::new_for_tests(
+            waitagent_executable.clone(),
+            RemoteNetworkConfig::default(),
+        );
+        let remote_target = remote_session_with_selector(
+            "peer-a",
+            "remote-exit-dead-pane-1",
+            &local_target,
+            ManagedSessionTaskState::Input,
+        );
+        remote_runtime_owner
+            .upsert_session(
+                workspace.workspace_handle.socket_name.as_str(),
+                "peer-a",
+                &remote_target,
+            )
+            .expect("remote target should be discoverable on workspace socket");
+
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: remote_target.address.qualified_target(),
+            })
+            .expect("remote target activation should succeed");
+
+        wait_for_condition(|| {
+            let active_target = backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read");
+            active_target.as_deref() == Some(remote_target.address.qualified_target().as_str())
+        });
+        wait_for_condition(|| {
+            workspace_main_pane_command(&backend, &workspace.workspace_handle).as_deref()
+                == Some("waitagent")
+        });
+
+        let recovery_pane_id = backend
+            .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
+            .expect("main pane option should read")
+            .expect("main pane option should be populated");
+        let detached_target_handle = TmuxWorkspaceHandle {
+            workspace_id: WorkspaceInstanceId::new(target_host.session_name.as_str().to_string()),
+            socket_name: TmuxSocketName::new(
+                workspace.workspace_handle.socket_name.as_str().to_string(),
+            ),
+            session_name: TmuxSessionName::new(target_host.session_name.as_str().to_string()),
+        };
+        let detached_target_pane = backend
+            .list_panes(
+                &detached_target_handle,
+                &backend
+                    .current_window(&detached_target_handle)
+                    .expect("target host window should exist"),
+            )
+            .expect("target host panes should list")
+            .into_iter()
+            .find(|pane| !pane.is_dead)
+            .expect("target host pane should remain live")
+            .pane_id
+            .as_str()
+            .to_string();
+
+        backend
+            .set_session_option(
+                &workspace.workspace_handle,
+                WAITAGENT_MAIN_PANE_OPTION,
+                &detached_target_pane,
+            )
+            .expect("main pane option should be corrupted to another live pane");
+
+        runtime
+            .fallback_after_remote_main_pane_exit(
+                &CurrentWorkspace {
+                    socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                    session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                    workspace_dir: workspace_dir.clone(),
+                },
+                &workspace.workspace_handle,
+                &crate::infra::tmux::TmuxPaneId::new(recovery_pane_id.clone()),
+                Some(remote_target.address.qualified_target()),
+            )
+            .expect("remote main pane fallback should honor the explicit recovery pane");
+
+        wait_for_condition(|| {
+            let active_target = backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read");
+            active_target.as_deref() == Some(local_target.as_str())
+        });
+        wait_for_condition(|| {
+            workspace_main_pane_command(&backend, &workspace.workspace_handle).as_deref()
+                == Some("bash")
+        });
+
+        let recovered_main_pane = backend
+            .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
+            .expect("main pane option should read after recovery")
+            .expect("main pane option should remain populated");
+        assert!(!recovered_main_pane.is_empty());
+
+        kill_server(&backend, &workspace.workspace_handle);
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
     fn session(socket: &str, session: &str, role: WorkspaceSessionRole) -> ManagedSessionRecord {
         ManagedSessionRecord {
             address: ManagedSessionAddress::local_tmux(socket, session),
+            selector: Some(format!("{socket}:{session}")),
+            availability: crate::domain::session_catalog::SessionAvailability::Online,
             workspace_dir: Some(PathBuf::from("/tmp/demo")),
             workspace_key: None,
             session_role: Some(role),
+            opened_by: Vec::new(),
             attached_clients: 1,
             window_count: 1,
             command_name: Some("bash".to_string()),
             current_path: Some(PathBuf::from("/tmp/demo")),
             task_state: ManagedSessionTaskState::Input,
         }
+    }
+
+    fn remote_session(authority_id: &str, session_id: &str) -> ManagedSessionRecord {
+        remote_session_with_selector(
+            authority_id,
+            session_id,
+            &format!("{authority_id}:{session_id}"),
+            ManagedSessionTaskState::Running,
+        )
+    }
+
+    fn remote_session_with_selector(
+        authority_id: &str,
+        session_id: &str,
+        selector: &str,
+        task_state: ManagedSessionTaskState,
+    ) -> ManagedSessionRecord {
+        ManagedSessionRecord {
+            address: ManagedSessionAddress::remote_peer(authority_id, session_id),
+            selector: Some(selector.to_string()),
+            availability: SessionAvailability::Online,
+            workspace_dir: None,
+            workspace_key: None,
+            session_role: Some(WorkspaceSessionRole::TargetHost),
+            opened_by: Vec::new(),
+            attached_clients: 1,
+            window_count: 1,
+            command_name: Some("bash".to_string()),
+            current_path: None,
+            task_state,
+        }
+    }
+
+    fn unique_workspace_config(prefix: &str) -> WorkspaceInstanceConfig {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let workspace_dir = std::env::temp_dir().join(format!("waitagent-{prefix}-{nonce:x}"));
+        fs::create_dir_all(&workspace_dir)
+            .expect("temporary workspace directory should be created");
+        WorkspaceInstanceConfig {
+            workspace_dir,
+            workspace_key: format!("{prefix}-{nonce:x}"),
+            socket_name: format!("wa-test-{nonce:x}"),
+            session_name: format!("waitagent-test-{prefix}-{nonce:x}"),
+            session_role: WorkspaceSessionRole::WorkspaceChrome,
+            initial_rows: None,
+            initial_cols: None,
+        }
+    }
+
+    fn waitagent_test_executable() -> PathBuf {
+        let current_exe = std::env::current_exe().expect("current test executable should exist");
+        let executable = current_exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("test executable should live under target/debug/deps")
+            .join(format!("waitagent{}", std::env::consts::EXE_SUFFIX));
+        assert!(
+            executable.exists(),
+            "waitagent test executable should exist at {}",
+            executable.display()
+        );
+        executable
+    }
+
+    fn workspace_main_pane_command(
+        backend: &EmbeddedTmuxBackend,
+        workspace: &TmuxWorkspaceHandle,
+    ) -> Option<String> {
+        let window = backend.current_window(workspace).ok()?;
+        let panes = backend.list_panes(workspace, &window).ok()?;
+        panes
+            .into_iter()
+            .find(|pane| {
+                !pane.is_dead && pane.title != SIDEBAR_PANE_TITLE && pane.title != FOOTER_PANE_TITLE
+            })
+            .and_then(|pane| pane.current_command)
+    }
+
+    fn wait_for_condition(predicate: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(predicate(), "condition should become true before timeout");
+    }
+
+    fn kill_server(backend: &EmbeddedTmuxBackend, workspace: &TmuxWorkspaceHandle) {
+        let _ = backend.run_socket_command(
+            &TmuxSocketName::new(workspace.socket_name.as_str().to_string()),
+            &["kill-server".to_string()],
+        );
     }
 }

@@ -2,6 +2,7 @@ use crate::infra::tmux::TmuxError;
 use crate::infra::tmux_glue_contract::TmuxGlueContractError;
 use std::path::{Path, PathBuf};
 
+#[allow(unused_imports)]
 pub use crate::infra::tmux_glue_contract::{
     ProcessTmuxGlueExecutor, TmuxGlueArtifacts, TmuxGlueBuildConfig, TmuxGlueBuildError,
     TmuxGlueBuildPlan, TmuxGlueBuildStatus, TmuxGlueBuildStep, TmuxGlueBuildStepKind,
@@ -40,6 +41,12 @@ impl VendoredTmuxSource {
         Ok(Self {
             path: PathBuf::from(path),
         })
+    }
+
+    pub fn system_default() -> Self {
+        Self {
+            path: PathBuf::from("tmux"),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -101,6 +108,18 @@ impl TmuxGlueArtifacts {
     pub fn from_build_env() -> Result<Self, TmuxError> {
         let manifest = TmuxGlueManifest::from_build_env()?;
         Self::from_manifest(&manifest)
+    }
+
+    pub fn system_default() -> Self {
+        Self {
+            source_path: PathBuf::new(),
+            build_root: PathBuf::new(),
+            tmux_binary_path: PathBuf::from("tmux"),
+            static_lib_path: PathBuf::new(),
+            include_dir_path: PathBuf::new(),
+            configure_stamp_path: PathBuf::new(),
+            build_stamp_path: PathBuf::new(),
+        }
     }
 }
 

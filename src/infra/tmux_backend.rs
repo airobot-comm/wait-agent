@@ -16,19 +16,27 @@ use crate::infra::tmux_types::{
     TmuxSessionGateway, TmuxSessionName, TmuxSocketName, TmuxWindowHandle, TmuxWindowId,
     TmuxWorkspaceHandle,
 };
+use crate::runtime::remote_authority_target_host_runtime::RemoteTargetTerminalFlags;
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 mod control;
 mod layout;
+mod remote;
 
 const WAITAGENT_SOCKET_PREFIX: &str = "wa-";
+const SYSTEM_TMUX_PROGRAM: &str = "tmux";
 const WAITAGENT_WORKSPACE_DIR_ENV: &str = "WAITAGENT_WORKSPACE_DIR";
 const WAITAGENT_WORKSPACE_KEY_ENV: &str = "WAITAGENT_WORKSPACE_KEY";
 const WAITAGENT_SESSION_ROLE_ENV: &str = "WAITAGENT_SESSION_ROLE";
 const WAITAGENT_TRANSPORT_ENV: &str = "WAITAGENT_SESSION_TRANSPORT";
 const WAITAGENT_TRANSPORT_LOCAL_TMUX: &str = "local-tmux";
+const WAITAGENT_REMOTE_PUBLICATION_AUTHORITY_ID_ENV: &str =
+    "WAITAGENT_REMOTE_PUBLICATION_AUTHORITY_ID";
+const WAITAGENT_REMOTE_PUBLICATION_TRANSPORT_SESSION_ID_ENV: &str =
+    "WAITAGENT_REMOTE_PUBLICATION_TRANSPORT_SESSION_ID";
+const WAITAGENT_REMOTE_PUBLICATION_SELECTOR_ENV: &str = "WAITAGENT_REMOTE_PUBLICATION_SELECTOR";
 const WAITAGENT_SIDEBAR_PANE_TITLE: &str = "waitagent-sidebar";
 const WAITAGENT_FOOTER_PANE_TITLE: &str = "waitagent-footer";
 const WAITAGENT_CHROME_REFRESH_CHANNEL_PREFIX: &str = "waitagent-chrome-refresh";
@@ -51,6 +59,9 @@ struct TmuxSessionMetadata {
     workspace_dir: Option<PathBuf>,
     workspace_key: Option<String>,
     session_role: Option<WorkspaceSessionRole>,
+    remote_publication_authority_id: Option<String>,
+    remote_publication_transport_session_id: Option<String>,
+    remote_publication_selector: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -92,6 +103,13 @@ impl EmbeddedTmuxBackend {
     }
 
     pub fn from_build_env() -> Result<Self, TmuxError> {
+        match Self::vendored_from_build_env() {
+            Ok(backend) => Ok(backend),
+            Err(_) => Ok(Self::system_default()),
+        }
+    }
+
+    fn vendored_from_build_env() -> Result<Self, TmuxError> {
         let source = VendoredTmuxSource::discover_from_build_env()?;
         let artifacts = TmuxGlueArtifacts::from_build_env()?;
         let build_status = TmuxGlueBuildStatus::from_build_env()?;
@@ -101,7 +119,22 @@ impl EmbeddedTmuxBackend {
         Ok(backend)
     }
 
+    fn system_default() -> Self {
+        let source = VendoredTmuxSource::system_default();
+        let artifacts = TmuxGlueArtifacts::system_default();
+        let build_config = TmuxGlueBuildConfig::from_artifacts(&artifacts);
+        Self::new(
+            source,
+            artifacts,
+            TmuxGlueBuildStatus::Executed,
+            build_config,
+        )
+    }
+
     fn validate_runtime_artifacts(&self) -> Result<(), TmuxError> {
+        if self.artifacts.tmux_binary_path == Path::new(SYSTEM_TMUX_PROGRAM) {
+            return Ok(());
+        }
         if self.build_status != TmuxGlueBuildStatus::Executed {
             return Err(TmuxError::new(format!(
                 "vendored tmux build is not executable yet: build status is `{}`",
@@ -157,6 +190,11 @@ impl EmbeddedTmuxBackend {
         args: &[String],
     ) -> Result<(), TmuxError> {
         self.run_on_socket(socket_name, args).map(|_| ())
+    }
+
+    pub(crate) fn socket_is_live(&self, socket_name: &TmuxSocketName) -> bool {
+        self.run_on_socket(socket_name, &["list-sessions".to_string()])
+            .is_ok()
     }
 
     pub(crate) fn show_session_option(
@@ -429,9 +467,12 @@ impl EmbeddedTmuxBackend {
                     socket_name.as_str(),
                     session_name.to_string(),
                 ),
+                selector: Some(format!("{}:{}", socket_name.as_str(), session_name)),
+                availability: crate::domain::session_catalog::SessionAvailability::Online,
                 workspace_dir: metadata.workspace_dir,
                 workspace_key: metadata.workspace_key,
                 session_role: metadata.session_role,
+                opened_by: Vec::new(),
                 attached_clients: attached_clients.parse::<usize>().unwrap_or(0),
                 window_count: window_count.parse::<usize>().unwrap_or(1),
                 command_name: runtime.command_name,
@@ -468,6 +509,15 @@ impl EmbeddedTmuxBackend {
                     WAITAGENT_SESSION_ROLE_ENV => {
                         metadata.session_role = WorkspaceSessionRole::parse(value);
                     }
+                    WAITAGENT_REMOTE_PUBLICATION_AUTHORITY_ID_ENV => {
+                        metadata.remote_publication_authority_id = Some(value.to_string());
+                    }
+                    WAITAGENT_REMOTE_PUBLICATION_TRANSPORT_SESSION_ID_ENV => {
+                        metadata.remote_publication_transport_session_id = Some(value.to_string());
+                    }
+                    WAITAGENT_REMOTE_PUBLICATION_SELECTOR_ENV => {
+                        metadata.remote_publication_selector = Some(value.to_string());
+                    }
                     _ => {}
                 }
             }
@@ -488,7 +538,7 @@ impl EmbeddedTmuxBackend {
             return Ok(TmuxSessionRuntimeMetadata::default());
         };
         let pane_text = self.capture_pane_text(socket_name, &main_pane.pane_id)?;
-        let command_name = normalized_pane_command(main_pane);
+        let command_name = normalized_pane_command(main_pane, &pane_text);
         Ok(TmuxSessionRuntimeMetadata {
             command_name: command_name.clone(),
             current_path: main_pane.current_path.clone(),
@@ -527,8 +577,6 @@ impl EmbeddedTmuxBackend {
             "-p".to_string(),
             "-t".to_string(),
             pane_id.as_str().to_string(),
-            "-S".to_string(),
-            "-40".to_string(),
         ];
         let output = self.run_on_socket(socket_name, &args)?;
         Ok(output.stdout)
@@ -680,11 +728,66 @@ impl EmbeddedTmuxBackend {
             "-p".to_string(),
             "-t".to_string(),
             pane_target.to_string(),
-            "-S".to_string(),
-            "-40".to_string(),
         ];
         let output = self.run_on_socket(&TmuxSocketName::new(socket_name), &args)?;
         Ok(output.stdout)
+    }
+
+    pub fn capture_pane_ansi_on_socket(
+        &self,
+        socket_name: &str,
+        pane_target: &str,
+    ) -> Result<String, TmuxError> {
+        let args = vec![
+            "capture-pane".to_string(),
+            "-p".to_string(),
+            "-e".to_string(),
+            "-N".to_string(),
+            "-t".to_string(),
+            pane_target.to_string(),
+        ];
+        let output = self.run_on_socket(&TmuxSocketName::new(socket_name), &args)?;
+        Ok(output.stdout)
+    }
+
+    pub fn pane_cursor_position_on_socket(
+        &self,
+        socket_name: &str,
+        pane_target: &str,
+    ) -> Result<(usize, usize), TmuxError> {
+        let args = vec![
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            pane_target.to_string(),
+            "#{cursor_x}\t#{cursor_y}".to_string(),
+        ];
+        let output = self.run_on_socket(&TmuxSocketName::new(socket_name), &args)?;
+        let mut parts = output.stdout.trim().split('\t');
+        let cursor_x = parts.next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+        let cursor_y = parts.next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+        Ok((cursor_x, cursor_y))
+    }
+
+    pub fn pane_terminal_flags_on_socket(
+        &self,
+        socket_name: &str,
+        pane_target: &str,
+    ) -> Result<RemoteTargetTerminalFlags, TmuxError> {
+        let args = vec![
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            pane_target.to_string(),
+            "#{alternate_on}\t#{keypad_cursor_flag}\t#{cursor_flag}".to_string(),
+        ];
+        let output = self.run_on_socket(&TmuxSocketName::new(socket_name), &args)?;
+        let mut parts = output.stdout.trim().split('\t');
+        Ok(RemoteTargetTerminalFlags {
+            alternate_screen_active: parts.next().unwrap_or("0") == "1",
+            application_cursor_keys: parts.next().unwrap_or("0") == "1",
+            cursor_visible: parts.next().unwrap_or("1") == "1",
+        })
     }
 
     fn wait_for_workspace_channel_on_socket(
@@ -815,10 +918,14 @@ impl EmbeddedTmuxBackend {
     }
 }
 
-fn normalized_pane_command(pane: &TmuxPaneInfo) -> Option<String> {
+fn normalized_pane_command(pane: &TmuxPaneInfo, pane_text: &str) -> Option<String> {
     let current_command = pane.current_command.as_deref()?;
     let foreground_argv = foreground_process_argv_for_pane_shell(pane.pane_pid);
-    Some(normalized_command_name(current_command, foreground_argv.as_deref()).to_string())
+    let normalized = normalized_command_name(current_command, foreground_argv.as_deref());
+    infer_visible_agent_command(normalized, pane_text)
+        .unwrap_or(normalized)
+        .to_string()
+        .into()
 }
 
 fn normalized_command_name<'a>(current_command: &'a str, argv: Option<&[String]>) -> &'a str {
@@ -877,6 +984,26 @@ fn wrapped_cli_name(arg: &str) -> Option<&'static str> {
         "claude" | "claude.js" => Some("claude"),
         _ => None,
     }
+}
+
+fn infer_visible_agent_command<'a>(current_command: &'a str, pane_text: &str) -> Option<&'a str> {
+    if !matches!(current_command, "bash" | "zsh" | "fish" | "sh") {
+        return None;
+    }
+    let lowered = pane_text.to_ascii_lowercase();
+    if lowered.contains("skip") && lowered.contains("codex") {
+        return Some("codex");
+    }
+    if lowered.contains("type your message")
+        || lowered.contains("send a message")
+        || lowered.contains("openai codex")
+    {
+        return Some("codex");
+    }
+    if lowered.contains("claude") && lowered.contains("type your message") {
+        return Some("claude");
+    }
+    None
 }
 
 fn process_argv(pid: u32) -> std::io::Result<Vec<String>> {
@@ -1181,6 +1308,43 @@ impl TmuxSessionGateway for EmbeddedTmuxBackend {
         self.command_runner()
             .run_from_current_client(&["detach-client".to_string()])
     }
+
+    fn current_client_session(&self) -> Result<Option<ManagedSessionRecord>, Self::Error> {
+        let socket_name = current_client_socket_name()?;
+        let output = self.command_runner().capture_from_current_client(&[
+            "display-message".to_string(),
+            "-p".to_string(),
+            "#{session_name}".to_string(),
+        ])?;
+        let session_name = output.stdout.trim();
+        if session_name.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .list_sessions_on_socket(&socket_name)?
+            .into_iter()
+            .find(|session| session.address.session_id() == session_name))
+    }
+}
+
+fn current_client_socket_name() -> Result<TmuxSocketName, TmuxError> {
+    let tmux = std::env::var("TMUX")
+        .map_err(|_| TmuxError::new("TMUX is not set for current client session lookup"))?;
+    let socket_path = tmux
+        .split(',')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| TmuxError::new("TMUX does not contain a socket path"))?;
+    let socket_name = std::path::Path::new(socket_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            TmuxError::new(format!(
+                "TMUX socket path `{socket_path}` does not have a valid socket name"
+            ))
+        })?;
+    Ok(TmuxSocketName::new(socket_name))
 }
 
 impl TmuxChromeGateway for EmbeddedTmuxBackend {
@@ -1221,7 +1385,7 @@ mod tests {
         TmuxGateway, TmuxLayoutGateway, TmuxProgram, TmuxSessionGateway, TmuxSessionName,
         TmuxSocketName, TmuxSplitSize, TmuxWindowHandle, TmuxWindowId, TmuxWorkspaceHandle,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::mpsc;
     use std::thread;
@@ -1368,6 +1532,16 @@ mod tests {
             .static_lib_path
             .to_string_lossy()
             .ends_with("/lib/libtmux-glue.a"));
+    }
+
+    #[test]
+    fn system_default_backend_does_not_require_vendored_artifact_files() {
+        let backend = EmbeddedTmuxBackend::system_default();
+
+        assert_eq!(backend.artifacts().tmux_binary_path, PathBuf::from("tmux"));
+        backend
+            .validate_runtime_artifacts()
+            .expect("system tmux fallback should skip vendored artifact validation");
     }
 
     #[test]
@@ -1546,6 +1720,46 @@ mod tests {
 
         assert!(panes.iter().any(|pane| pane.title == "waitagent-sidebar"));
         assert!(panes.iter().any(|pane| pane.title == "waitagent-footer"));
+    }
+
+    #[test]
+    fn capture_pane_ansi_on_socket_excludes_scrollback_history() {
+        let backend = EmbeddedTmuxBackend::from_build_env()
+            .expect("vendored tmux backend should discover build env");
+        let workspace = backend
+            .ensure_workspace(&unique_workspace_config("capture-visible"))
+            .expect("workspace bootstrap should succeed");
+        let main = backend
+            .current_pane(&workspace)
+            .expect("current pane should resolve");
+        let (_, height) = backend
+            .pane_dimensions_on_socket(workspace.socket_name.as_str(), main.as_str())
+            .expect("pane dimensions should resolve");
+        let scroll_lines = height.max(2) + 4;
+
+        backend
+            .run_on_socket(
+                &workspace.socket_name,
+                &[
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    main.as_str().to_string(),
+                    format!(
+                        "printf 'history-line\\n'; for i in $(seq 1 {scroll_lines}); do printf 'visible-%02d\\n' \"$i\"; done"
+                    ),
+                    "Enter".to_string(),
+                ],
+            )
+            .expect("pane should receive scripted output");
+        thread::sleep(Duration::from_millis(350));
+
+        let captured = backend
+            .capture_pane_ansi_on_socket(workspace.socket_name.as_str(), main.as_str())
+            .expect("ansi capture should succeed");
+        kill_server(&backend, &workspace);
+
+        assert!(captured.contains("visible-"));
+        assert!(!captured.contains("history-line"));
     }
 
     #[test]

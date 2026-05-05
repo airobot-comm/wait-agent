@@ -1,4 +1,7 @@
-use crate::cli::UiPaneCommand;
+use crate::application::target_registry_service::{
+    DefaultTargetCatalogGateway, TargetRegistryService,
+};
+use crate::cli::{RemoteNetworkConfig, UiPaneCommand};
 use crate::domain::workspace::WorkspaceInstanceId;
 use crate::infra::tmux::{
     EmbeddedTmuxBackend, TmuxLayoutGateway, TmuxSessionName, TmuxSocketName, TmuxWorkspaceHandle,
@@ -28,21 +31,34 @@ extern "C" {
 const FULLSCREEN_FOOTER_OPTION: &str = "@waitagent_fullscreen_footer_line";
 const HIDE_CURSOR_ESCAPE: &str = "\x1b[?25l";
 const SHOW_CURSOR_ESCAPE: &str = "\x1b[?25h";
+const ENTER_ALT_SCREEN_ESCAPE: &str = "\x1b[?1049h";
+const EXIT_ALT_SCREEN_ESCAPE: &str = "\x1b[?1049l";
 
 pub struct EventDrivenPaneRuntime {
     backend: EmbeddedTmuxBackend,
+    network: RemoteNetworkConfig,
 }
 
 impl EventDrivenPaneRuntime {
+    #[cfg(test)]
     pub fn from_build_env() -> Result<Self, LifecycleError> {
+        Self::from_build_env_with_network(RemoteNetworkConfig::default())
+    }
+
+    pub fn from_build_env_with_network(
+        network: RemoteNetworkConfig,
+    ) -> Result<Self, LifecycleError> {
         let backend = EmbeddedTmuxBackend::from_build_env().map_err(event_pane_error)?;
-        Ok(Self { backend })
+        Ok(Self { backend, network })
     }
 
     pub fn run_sidebar(&self, command: UiPaneCommand) -> Result<(), LifecycleError> {
         let pane_target = current_tmux_pane_target();
         let terminal = TerminalRuntime::stdio();
         let _raw_mode = terminal.enter_raw_mode()?;
+        let _screen_guard = PaneScreenGuard::enter_alt_screen().map_err(|error| {
+            LifecycleError::Io("failed to enter sidebar alt screen".to_string(), error)
+        })?;
         let _cursor_guard = PaneCursorGuard::hide().map_err(|error| {
             LifecycleError::Io("failed to hide sidebar cursor".to_string(), error)
         })?;
@@ -50,7 +66,16 @@ impl EventDrivenPaneRuntime {
             spawn_pane_event_stream(self.backend.clone(), &command, true).map_err(|error| {
                 LifecycleError::Io("failed to install pane event watchers".to_string(), error)
             })?;
-        let mut chrome = EventDrivenTmuxPaneRuntime::new(self.backend.clone());
+        let mut chrome = EventDrivenTmuxPaneRuntime::new_with_target_registry_and_network(
+            self.backend.clone(),
+            TargetRegistryService::new(
+                DefaultTargetCatalogGateway::from_build_env_with_socket_name(
+                    command.socket_name.clone(),
+                )
+                .map_err(event_pane_error)?,
+            ),
+            self.network.clone(),
+        );
         let mut last_buffer = String::new();
 
         redraw_sidebar(
@@ -87,7 +112,16 @@ impl EventDrivenPaneRuntime {
             spawn_pane_event_stream(self.backend.clone(), &command, false).map_err(|error| {
                 LifecycleError::Io("failed to install pane event watchers".to_string(), error)
             })?;
-        let mut chrome = EventDrivenTmuxPaneRuntime::new(self.backend.clone());
+        let mut chrome = EventDrivenTmuxPaneRuntime::new_with_target_registry_and_network(
+            self.backend.clone(),
+            TargetRegistryService::new(
+                DefaultTargetCatalogGateway::from_build_env_with_socket_name(
+                    command.socket_name.clone(),
+                )
+                .map_err(event_pane_error)?,
+            ),
+            self.network.clone(),
+        );
         let mut last_buffer = String::new();
         let workspace = workspace_handle(&command);
         let update =
@@ -213,6 +247,7 @@ fn redraw_if_changed(buffer: String, last_buffer: &mut String) -> Result<(), Lif
 }
 
 fn write_buffer(stdout: &mut impl Write, buffer: &str) -> io::Result<()> {
+    write!(stdout, "\x1b[H\x1b[2J")?;
     for (index, line) in buffer.split('\n').enumerate() {
         let row = index + 1;
         write!(stdout, "\x1b[{row};1H{line}\x1b[K")?;
@@ -237,6 +272,10 @@ struct PaneCursorGuard {
     visible_on_drop: bool,
 }
 
+struct PaneScreenGuard {
+    restore_on_drop: bool,
+}
+
 impl PaneCursorGuard {
     fn hide() -> io::Result<Self> {
         write_escape(HIDE_CURSOR_ESCAPE)?;
@@ -246,10 +285,27 @@ impl PaneCursorGuard {
     }
 }
 
+impl PaneScreenGuard {
+    fn enter_alt_screen() -> io::Result<Self> {
+        write_escape(ENTER_ALT_SCREEN_ESCAPE)?;
+        Ok(Self {
+            restore_on_drop: true,
+        })
+    }
+}
+
 impl Drop for PaneCursorGuard {
     fn drop(&mut self) {
         if self.visible_on_drop {
             let _ = write_escape(SHOW_CURSOR_ESCAPE);
+        }
+    }
+}
+
+impl Drop for PaneScreenGuard {
+    fn drop(&mut self) {
+        if self.restore_on_drop {
+            let _ = write_escape(EXIT_ALT_SCREEN_ESCAPE);
         }
     }
 }
@@ -436,29 +492,32 @@ extern "C" fn pane_sigwinch_handler(_signal: c_int) {
 
 #[cfg(test)]
 mod tests {
-    use super::{activate_target_run_shell_args, write_buffer};
+    use super::{
+        activate_target_run_shell_args, write_buffer, ENTER_ALT_SCREEN_ESCAPE,
+        EXIT_ALT_SCREEN_ESCAPE,
+    };
 
     #[test]
-    fn single_line_pane_render_does_not_issue_clear_below_buffer() {
+    fn single_line_pane_render_clears_screen_then_draws_first_row() {
         let mut output = Vec::new();
 
         write_buffer(&mut output, "keys: ^W cmd").expect("footer render should write");
 
         let rendered = String::from_utf8(output).expect("writer should emit utf8 escape payload");
+        assert!(rendered.starts_with("\x1b[H\x1b[2J"));
         assert!(rendered.contains("\x1b[1;1Hkeys: ^W cmd\x1b[K"));
-        assert!(!rendered.contains("\x1b[2;1H\x1b[J"));
     }
 
     #[test]
-    fn multi_line_pane_render_keeps_row_local_clears_only() {
+    fn multi_line_pane_render_clears_screen_then_draws_each_row() {
         let mut output = Vec::new();
 
         write_buffer(&mut output, "line1\nline2").expect("sidebar render should write");
 
         let rendered = String::from_utf8(output).expect("writer should emit utf8 escape payload");
+        assert!(rendered.starts_with("\x1b[H\x1b[2J"));
         assert!(rendered.contains("\x1b[1;1Hline1\x1b[K"));
         assert!(rendered.contains("\x1b[2;1Hline2\x1b[K"));
-        assert!(!rendered.contains("\x1b[J"));
     }
 
     #[test]
@@ -479,5 +538,11 @@ mod tests {
                     .to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn sidebar_uses_alt_screen_sequences() {
+        assert_eq!(ENTER_ALT_SCREEN_ESCAPE, "\x1b[?1049h");
+        assert_eq!(EXIT_ALT_SCREEN_ESCAPE, "\x1b[?1049l");
     }
 }

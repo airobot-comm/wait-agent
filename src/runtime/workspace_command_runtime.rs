@@ -1,15 +1,22 @@
 use crate::application::session_service::SessionService;
+use crate::application::target_registry_service::{
+    DefaultTargetCatalogGateway, TargetRegistryService,
+};
 use crate::application::workspace_path_service::WorkspacePathService;
 use crate::application::workspace_service::WorkspaceService;
 use crate::cli::{
     ActivateTargetCommand, AttachCommand, DetachCommand, MainPaneDiedCommand, NewTargetCommand,
-    ToggleFullscreenCommand,
+    RemoteNetworkConfig, RemoteNodeIngressServerCommand, ToggleFullscreenCommand,
 };
-use crate::domain::session_catalog::ManagedSessionRecord;
+use crate::domain::session_catalog::{ManagedSessionRecord, SessionTransport};
 use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError};
 use crate::lifecycle::LifecycleError;
 use crate::runtime::main_slot_runtime::MainSlotRuntime;
 use crate::runtime::native_pane_fullscreen_runtime::NativePaneFullscreenRuntime;
+use crate::runtime::remote_node_ingress_server_runtime::RemoteNodeIngressServerRuntime;
+use crate::runtime::remote_node_session_sync_runtime::RemoteNodeSessionSyncRuntime;
+use crate::runtime::remote_runtime_owner_runtime::RemoteRuntimeOwnerRuntime;
+use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
 use crate::runtime::target_host_runtime::TargetHostRuntime;
 use crate::runtime::workspace_entry_runtime::WorkspaceEntryRuntime;
 use crate::runtime::workspace_layout_runtime::WorkspaceLayoutRuntime;
@@ -24,19 +31,45 @@ pub struct WorkspaceCommandRuntime {
     entry_runtime: WorkspaceEntryRuntime,
     main_slot_runtime: MainSlotRuntime,
     fullscreen_runtime: NativePaneFullscreenRuntime,
+    remote_runtime_owner_runtime: RemoteRuntimeOwnerRuntime,
+    remote_target_publication_runtime: RemoteTargetPublicationRuntime,
+    target_host_runtime: TargetHostRuntime,
     session_service: SessionService<EmbeddedTmuxBackend>,
+    target_registry: TargetRegistryService<DefaultTargetCatalogGateway>,
+    network: RemoteNetworkConfig,
 }
 
 impl WorkspaceCommandRuntime {
+    #[cfg(test)]
     pub fn from_build_env() -> Result<Self, LifecycleError> {
+        Self::from_build_env_with_network(RemoteNetworkConfig::default())
+    }
+
+    pub fn from_build_env_with_network(
+        network: RemoteNetworkConfig,
+    ) -> Result<Self, LifecycleError> {
         let backend = EmbeddedTmuxBackend::from_build_env().map_err(tmux_runtime_error)?;
+        let current_executable = std::env::current_exe().map_err(|error| {
+            LifecycleError::Io(
+                "failed to locate current waitagent executable".to_string(),
+                error,
+            )
+        })?;
         let entry_runtime = WorkspaceEntryRuntime::new(
             WorkspaceRuntime::new(WorkspaceService::new(backend.clone())),
-            WorkspaceLayoutRuntime::from_build_env()?,
+            WorkspaceLayoutRuntime::from_build_env_with_network(network.clone())?,
         );
         let session_service = SessionService::new(backend.clone());
+        let target_registry = TargetRegistryService::new(
+            DefaultTargetCatalogGateway::from_build_env().map_err(tmux_runtime_error)?,
+        );
         let main_slot_backend = backend.clone();
-        let target_host_runtime = TargetHostRuntime::from_backend(backend.clone());
+        let target_host_runtime = TargetHostRuntime::from_build_env(backend.clone())?;
+        let command_target_host_runtime = TargetHostRuntime::from_build_env(backend.clone())?;
+        let remote_runtime_owner_runtime =
+            RemoteRuntimeOwnerRuntime::from_build_env_with_network(network.clone())?;
+        let remote_target_publication_runtime =
+            RemoteTargetPublicationRuntime::from_build_env_with_network(network.clone())?;
 
         Ok(Self {
             path_service: WorkspacePathService::new(),
@@ -44,25 +77,44 @@ impl WorkspaceCommandRuntime {
             main_slot_runtime: MainSlotRuntime::new(
                 main_slot_backend.clone(),
                 target_host_runtime,
-                WorkspaceLayoutRuntime::from_build_env()?,
-                SessionService::new(main_slot_backend),
+                WorkspaceLayoutRuntime::from_build_env_with_network(network.clone())?,
+                TargetRegistryService::new(
+                    DefaultTargetCatalogGateway::from_build_env().map_err(tmux_runtime_error)?,
+                ),
+                current_executable,
+                network.clone(),
             ),
             fullscreen_runtime: NativePaneFullscreenRuntime::new(
                 backend.clone(),
-                SessionService::new(backend.clone()),
-                WorkspaceLayoutRuntime::from_build_env()?,
+                TargetRegistryService::new(
+                    DefaultTargetCatalogGateway::from_build_env().map_err(tmux_runtime_error)?,
+                ),
+                WorkspaceLayoutRuntime::from_build_env_with_network(network.clone())?,
             ),
+            remote_runtime_owner_runtime,
+            remote_target_publication_runtime,
+            target_host_runtime: command_target_host_runtime,
             session_service,
+            target_registry,
+            network,
         })
     }
 
     pub fn run_workspace_entry(&self) -> Result<(), LifecycleError> {
         let workspace_dir = self.resolve_workspace_dir(None)?;
         let workspace = self.entry_runtime.bootstrap_workspace(&workspace_dir)?;
+        self.remote_runtime_owner_runtime
+            .ensure_owner_running(workspace.workspace_handle.socket_name.as_str())?;
         self.main_slot_runtime.ensure_initial_target_materialized(
             &workspace.workspace_handle,
             &workspace.workspace_dir,
         )?;
+        self.remote_target_publication_runtime
+            .ensure_configured_publications_on_socket(
+                workspace.workspace_handle.socket_name.as_str(),
+            )?;
+        self.start_remote_node_ingress(workspace.workspace_handle.socket_name.as_str())?;
+        self.start_remote_session_sync(workspace.workspace_handle.socket_name.as_str())?;
         self.session_service
             .attach_workspace(&workspace.workspace_handle)
             .map_err(tmux_runtime_error)
@@ -72,19 +124,27 @@ impl WorkspaceCommandRuntime {
         match command.target.clone() {
             Some(target) => {
                 let session = self.attachable_session(target)?;
+                self.remote_runtime_owner_runtime
+                    .ensure_owner_running(session.address.server_id())?;
+                self.start_remote_node_ingress(session.address.server_id())?;
+                self.start_remote_session_sync(session.address.server_id())?;
                 self.session_service
                     .attach_session(&session)
                     .map_err(tmux_runtime_error)
             }
-            None => self
-                .session_service
-                .resolve_default_attach_session()
-                .map_err(tmux_runtime_error)
-                .and_then(|session| {
-                    self.session_service
-                        .attach_session(&session)
-                        .map_err(tmux_runtime_error)
-                }),
+            None => {
+                let session = self
+                    .session_service
+                    .resolve_default_attach_session()
+                    .map_err(tmux_runtime_error)?;
+                self.remote_runtime_owner_runtime
+                    .ensure_owner_running(session.address.server_id())?;
+                self.start_remote_node_ingress(session.address.server_id())?;
+                self.start_remote_session_sync(session.address.server_id())?;
+                self.session_service
+                    .attach_session(&session)
+                    .map_err(tmux_runtime_error)
+            }
         }
     }
 
@@ -132,6 +192,8 @@ impl WorkspaceCommandRuntime {
             self.session_service
                 .detach_session_clients(&session)
                 .map_err(tmux_runtime_error)?;
+            self.target_host_runtime
+                .refresh_published_target_session(Some(&session))?;
             println!(
                 "detached clients from {}",
                 session.address.qualified_target()
@@ -140,9 +202,12 @@ impl WorkspaceCommandRuntime {
         }
 
         if std::env::var_os("TMUX").is_some() {
+            let session = self.session_service.current_client_session().ok().flatten();
             self.session_service
                 .detach_current_client()
                 .map_err(tmux_runtime_error)?;
+            self.target_host_runtime
+                .refresh_published_target_session(session.as_ref())?;
             return Ok(());
         }
 
@@ -153,6 +218,8 @@ impl WorkspaceCommandRuntime {
         self.session_service
             .detach_session_clients(&session)
             .map_err(tmux_runtime_error)?;
+        self.target_host_runtime
+            .refresh_published_target_session(Some(&session))?;
         println!(
             "detached clients from {}",
             session.address.qualified_target()
@@ -176,11 +243,43 @@ impl WorkspaceCommandRuntime {
 
     fn attachable_session(&self, target: String) -> Result<ManagedSessionRecord, LifecycleError> {
         let session = self
-            .session_service
-            .find_session(&target)
+            .target_registry
+            .find_target(&target)
             .map_err(tmux_runtime_error)?
             .ok_or_else(|| LifecycleError::Protocol(format!("unknown tmux target `{target}`")))?;
+        if session.address.transport() != &SessionTransport::LocalTmux {
+            return Err(LifecycleError::Protocol(format!(
+                "target `{target}` is remote and cannot be attached directly; open it from the workspace sidebar or footer instead"
+            )));
+        }
         Ok(session)
+    }
+
+    fn start_remote_session_sync(&self, socket_name: &str) -> Result<(), LifecycleError> {
+        if self.network.connect.is_none() {
+            return Ok(());
+        }
+        RemoteNodeSessionSyncRuntime::ensure_owner_running(socket_name, &self.network)?;
+        Ok(())
+    }
+
+    fn start_remote_node_ingress(&self, socket_name: &str) -> Result<(), LifecycleError> {
+        RemoteNodeIngressServerRuntime::ensure_owner_running(socket_name, &self.network)
+    }
+
+    pub fn run_remote_node_ingress_server(
+        &self,
+        command: RemoteNodeIngressServerCommand,
+    ) -> Result<(), LifecycleError> {
+        RemoteNodeIngressServerRuntime::from_build_env_with_network_and_socket(
+            self.network.clone(),
+            command.socket_name,
+        )?
+        .run_owner()
+    }
+
+    pub fn network_config(&self) -> RemoteNetworkConfig {
+        self.network.clone()
     }
 }
 

@@ -2,8 +2,13 @@ use crate::application::control_service::{ControlService, FooterMenuBindings};
 use crate::application::layout_service::{
     LayoutFocusBehavior, LayoutService, FOOTER_PANE_TITLE, SIDEBAR_PANE_TITLE,
 };
-use crate::application::session_service::SessionService;
-use crate::cli::{CloseSessionCommand, LayoutReconcileCommand, UiPaneCommand};
+use crate::application::target_registry_service::{
+    DefaultTargetCatalogGateway, TargetRegistryService,
+};
+use crate::cli::{
+    prepend_global_network_args, CloseSessionCommand, LayoutReconcileCommand, RemoteNetworkConfig,
+    UiPaneCommand,
+};
 use crate::domain::workspace::WorkspaceInstanceId;
 use crate::infra::tmux::{
     EmbeddedTmuxBackend, TmuxError, TmuxLayoutGateway, TmuxPaneId, TmuxProgram, TmuxSessionName,
@@ -30,12 +35,20 @@ pub struct WorkspaceLayoutRuntime {
     backend: EmbeddedTmuxBackend,
     control_service: ControlService<EmbeddedTmuxBackend>,
     layout_service: LayoutService<EmbeddedTmuxBackend>,
-    session_service: SessionService<EmbeddedTmuxBackend>,
+    target_registry: TargetRegistryService<DefaultTargetCatalogGateway>,
     current_executable: std::path::PathBuf,
+    network: RemoteNetworkConfig,
 }
 
 impl WorkspaceLayoutRuntime {
+    #[cfg(test)]
     pub fn from_build_env() -> Result<Self, LifecycleError> {
+        Self::from_build_env_with_network(RemoteNetworkConfig::default())
+    }
+
+    pub fn from_build_env_with_network(
+        network: RemoteNetworkConfig,
+    ) -> Result<Self, LifecycleError> {
         let backend = EmbeddedTmuxBackend::from_build_env().map_err(tmux_layout_error)?;
         let current_executable = std::env::current_exe().map_err(|error| {
             LifecycleError::Io(
@@ -47,9 +60,30 @@ impl WorkspaceLayoutRuntime {
         Ok(Self {
             control_service: ControlService::new(backend.clone()),
             layout_service: LayoutService::new(backend.clone()),
-            session_service: SessionService::new(backend.clone()),
+            target_registry: TargetRegistryService::new(
+                DefaultTargetCatalogGateway::from_build_env().map_err(tmux_layout_error)?,
+            ),
             backend,
             current_executable,
+            network,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new_for_tests(
+        backend: EmbeddedTmuxBackend,
+        current_executable: PathBuf,
+        network: RemoteNetworkConfig,
+    ) -> Result<Self, LifecycleError> {
+        Ok(Self {
+            control_service: ControlService::new(backend.clone()),
+            layout_service: LayoutService::new(backend.clone()),
+            target_registry: TargetRegistryService::new(
+                DefaultTargetCatalogGateway::from_build_env().map_err(tmux_layout_error)?,
+            ),
+            backend,
+            current_executable,
+            network,
         })
     }
 
@@ -135,11 +169,25 @@ impl WorkspaceLayoutRuntime {
 
     pub fn run_chrome_refresh_all(&self) -> Result<(), LifecycleError> {
         let sessions = self
-            .session_service
-            .list_sessions()
+            .target_registry
+            .list_workspace_chrome_targets()
             .map_err(tmux_layout_error)?;
+        self.refresh_workspace_chrome_targets(&sessions)
+    }
 
-        for session in sessions.into_iter().filter(should_refresh_workspace_chrome) {
+    pub fn run_chrome_refresh_on_socket(&self, socket_name: &str) -> Result<(), LifecycleError> {
+        let sessions = self
+            .target_registry
+            .list_workspace_chrome_targets_on_authority(socket_name)
+            .map_err(tmux_layout_error)?;
+        self.refresh_workspace_chrome_targets(&sessions)
+    }
+
+    fn refresh_workspace_chrome_targets(
+        &self,
+        sessions: &[crate::domain::session_catalog::ManagedSessionRecord],
+    ) -> Result<(), LifecycleError> {
+        for session in sessions {
             let Some(workspace_dir) = session.workspace_dir.as_ref() else {
                 continue;
             };
@@ -250,10 +298,14 @@ impl WorkspaceLayoutRuntime {
         let sidebar_program = self.sidebar_program(workspace, workspace_dir);
         let footer_program = self.footer_program(workspace, workspace_dir);
         let reconcile_command = self.layout_reconcile_hook_command(workspace, workspace_dir);
-        let chrome_refresh_command = self.chrome_refresh_hook_command(workspace, workspace_dir);
         let main_pane_pipe_command =
             self.main_pane_output_bridge_shell_command(workspace, workspace_dir);
         let pane_died_command = self.main_pane_died_hook_command(workspace);
+        let previous_main_pane = self
+            .backend
+            .show_session_option(workspace, WAITAGENT_MAIN_PANE_OPTION)
+            .map_err(tmux_layout_error)?
+            .map(TmuxPaneId::new);
         let layout = self
             .layout_service
             .ensure_workspace_layout(workspace, &sidebar_program, &footer_program, focus_behavior)
@@ -280,8 +332,8 @@ impl WorkspaceLayoutRuntime {
             .ensure_layout_hooks(
                 workspace,
                 &layout.main_pane,
+                previous_main_pane.as_ref(),
                 &reconcile_command,
-                &chrome_refresh_command,
                 &pane_died_command,
             )
             .map_err(tmux_layout_error)?;
@@ -418,25 +470,31 @@ impl WorkspaceLayoutRuntime {
         workspace_dir: &Path,
     ) -> TmuxProgram {
         TmuxProgram::new(self.current_executable.display().to_string())
-            .with_args(vec![
-                "__ui-sidebar".to_string(),
-                "--socket-name".to_string(),
-                workspace.socket_name.as_str().to_string(),
-                "--session-name".to_string(),
-                workspace.session_name.as_str().to_string(),
-            ])
+            .with_args(prepend_global_network_args(
+                vec![
+                    "__ui-sidebar".to_string(),
+                    "--socket-name".to_string(),
+                    workspace.socket_name.as_str().to_string(),
+                    "--session-name".to_string(),
+                    workspace.session_name.as_str().to_string(),
+                ],
+                &self.network,
+            ))
             .with_start_directory(workspace_dir)
     }
 
     fn footer_program(&self, workspace: &TmuxWorkspaceHandle, workspace_dir: &Path) -> TmuxProgram {
         TmuxProgram::new(self.current_executable.display().to_string())
-            .with_args(vec![
-                "__ui-footer".to_string(),
-                "--socket-name".to_string(),
-                workspace.socket_name.as_str().to_string(),
-                "--session-name".to_string(),
-                workspace.session_name.as_str().to_string(),
-            ])
+            .with_args(prepend_global_network_args(
+                vec![
+                    "__ui-footer".to_string(),
+                    "--socket-name".to_string(),
+                    workspace.socket_name.as_str().to_string(),
+                    "--session-name".to_string(),
+                    workspace.session_name.as_str().to_string(),
+                ],
+                &self.network,
+            ))
             .with_start_directory(workspace_dir)
     }
 
@@ -474,22 +532,6 @@ impl WorkspaceLayoutRuntime {
         workspace_dir: &Path,
     ) -> String {
         let shell_command = layout_reconcile_hook_shell_command(
-            self.current_executable.to_string_lossy().as_ref(),
-            workspace,
-            &workspace_dir.display().to_string(),
-        );
-        format!(
-            "run-shell -b {}",
-            tmux_quote_argument(&format!("{shell_command} >/dev/null 2>&1"))
-        )
-    }
-
-    fn chrome_refresh_hook_command(
-        &self,
-        workspace: &TmuxWorkspaceHandle,
-        workspace_dir: &Path,
-    ) -> String {
-        let shell_command = chrome_refresh_hook_shell_command(
             self.current_executable.to_string_lossy().as_ref(),
             workspace,
             &workspace_dir.display().to_string(),
@@ -601,24 +643,6 @@ fn layout_reconcile_hook_shell_command(
     .join(" ")
 }
 
-fn chrome_refresh_hook_shell_command(
-    executable: &str,
-    workspace: &TmuxWorkspaceHandle,
-    workspace_dir: &str,
-) -> String {
-    [
-        shell_escape(executable),
-        shell_escape("__chrome-refresh"),
-        shell_escape("--socket-name"),
-        shell_escape(workspace.socket_name.as_str()),
-        shell_escape("--session-name"),
-        shell_escape(workspace.session_name.as_str()),
-        shell_escape("--workspace-dir"),
-        shell_escape(workspace_dir),
-    ]
-    .join(" ")
-}
-
 fn main_pane_died_hook_shell_command(
     executable: &str,
     socket_name: &str,
@@ -632,7 +656,7 @@ fn main_pane_died_hook_shell_command(
         shell_escape("--session-name"),
         shell_escape(session_name),
         shell_escape("--pane-id"),
-        shell_escape("#{hook_pane}"),
+        "#{hook_pane}".to_string(),
     ]
     .join(" ")
 }
@@ -669,6 +693,7 @@ fn tmux_layout_error(error: TmuxError) -> LifecycleError {
     )
 }
 
+#[cfg(test)]
 fn should_refresh_workspace_chrome(
     session: &crate::domain::session_catalog::ManagedSessionRecord,
 ) -> bool {
@@ -681,10 +706,10 @@ fn should_refresh_workspace_chrome(
 #[cfg(test)]
 mod tests {
     use super::{
-        chrome_refresh_hook_shell_command, footer_menu_shell_command,
-        fullscreen_toggle_tmux_command, layout_reconcile_hook_shell_command,
-        main_pane_died_hook_shell_command, main_pane_output_bridge_shell_command,
-        should_refresh_workspace_chrome, tmux_quote_argument,
+        footer_menu_shell_command, fullscreen_toggle_tmux_command,
+        layout_reconcile_hook_shell_command, main_pane_died_hook_shell_command,
+        main_pane_output_bridge_shell_command, should_refresh_workspace_chrome,
+        tmux_quote_argument,
     };
     use crate::domain::session_catalog::{
         ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState,
@@ -744,25 +769,12 @@ mod tests {
     }
 
     #[test]
-    fn chrome_refresh_hook_shell_command_targets_current_workspace() {
-        let workspace = workspace();
-
-        let command =
-            chrome_refresh_hook_shell_command("/tmp/wait agent", &workspace, "/tmp/demo path");
-
-        assert_eq!(
-            command,
-            "'/tmp/wait agent' '__chrome-refresh' '--socket-name' 'wa-1' '--session-name' 'session-1' '--workspace-dir' '/tmp/demo path'"
-        );
-    }
-
-    #[test]
     fn main_pane_died_hook_shell_command_targets_current_session() {
         let command = main_pane_died_hook_shell_command("/tmp/wait agent", "wa-1", "session-1");
 
         assert_eq!(
             command,
-            "'/tmp/wait agent' '__main-pane-died' '--socket-name' 'wa-1' '--session-name' 'session-1' '--pane-id' '#{hook_pane}'"
+            "'/tmp/wait agent' '__main-pane-died' '--socket-name' 'wa-1' '--session-name' 'session-1' '--pane-id' #{hook_pane}"
         );
     }
 
@@ -783,9 +795,12 @@ mod tests {
     fn chrome_refresh_all_only_tracks_workspace_chrome_sessions() {
         let chrome = ManagedSessionRecord {
             address: ManagedSessionAddress::local_tmux("wa-1", "session-1"),
+            selector: Some("wa-1:session-1".to_string()),
+            availability: crate::domain::session_catalog::SessionAvailability::Online,
             workspace_dir: Some(PathBuf::from("/tmp/demo")),
             workspace_key: None,
             session_role: Some(WorkspaceSessionRole::WorkspaceChrome),
+            opened_by: Vec::new(),
             attached_clients: 1,
             window_count: 1,
             command_name: Some("bash".to_string()),
@@ -794,9 +809,12 @@ mod tests {
         };
         let target = ManagedSessionRecord {
             address: ManagedSessionAddress::local_tmux("wa-1", "session-2"),
+            selector: Some("wa-1:session-2".to_string()),
+            availability: crate::domain::session_catalog::SessionAvailability::Online,
             workspace_dir: Some(PathBuf::from("/tmp/demo")),
             workspace_key: None,
             session_role: Some(WorkspaceSessionRole::TargetHost),
+            opened_by: Vec::new(),
             attached_clients: 0,
             window_count: 1,
             command_name: Some("bash".to_string()),

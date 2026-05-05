@@ -1859,6 +1859,62 @@ mod tests {
     }
 
     #[test]
+    fn engine_replays_codex_update_menu_down_redraw_from_live_capture() {
+        let bootstrap_screen = concat!(
+            "\n",
+            "  ✨\u{200a}Update available! \x1b[2m0.125.0 -> 0.128.0\x1b[0m      \n",
+            "\n",
+            "  \x1b[2mRelease notes: \x1b[4mhttps://github.com/openai/code\n",
+            "\n",
+            "\x1b[0m› 1. Update now (runs `npm install -g          \n",
+            "     @openai/codex`)   \n",
+            "  2. Skip  \n",
+            "  3. Skip until next version                  \n",
+            "\n",
+            "  \x1b[2mPress enter to continue\x1b[0m                    \n",
+            "\n\n\n\n\n\n\n\n\n\n",
+        );
+        let redraw = b"\x1b[?2026h\x1b[1;2H\x1b[0m\x1b[m\x1b[K\x1b[2;42H\x1b[0m\x1b[m\x1b[K\x1b[3;2H\x1b[0m\x1b[m\x1b[K\x1b[5;2H\x1b[0m\x1b[m\x1b[K\x1b[6;38H\x1b[0m\x1b[m\x1b[K\x1b[7;21H\x1b[0m\x1b[m\x1b[K\x1b[8;10H\x1b[0m\x1b[m\x1b[K\x1b[9;29H\x1b[0m\x1b[m\x1b[K\x1b[10;2H\x1b[0m\x1b[m\x1b[K\x1b[11;26H\x1b[0m\x1b[m\x1b[K\x1b[12;2H\x1b[0m\x1b[m\x1b[K\x1b[13;2H\x1b[0m\x1b[m\x1b[K\x1b[14;2H\x1b[0m\x1b[m\x1b[K\x1b[15;2H\x1b[0m\x1b[m\x1b[K\x1b[16;2H\x1b[0m\x1b[m\x1b[K\x1b[17;2H\x1b[0m\x1b[m\x1b[K\x1b[18;2H\x1b[0m\x1b[m\x1b[K\x1b[19;2H\x1b[0m\x1b[m\x1b[K\x1b[20;2H\x1b[0m\x1b[m\x1b[K\x1b[21;2H\x1b[0m\x1b[m\x1b[K\x1b[6;1H  1. Update now (runs `npm install -g\x1b[7;6H@openai/codex`)\x1b[8;1H\x1b[;m\xe2\x80\xba 2. Skip\x1b[m\x1b[m\x1b[0m\x1b[?25l\x1b[?2026l";
+        let mut engine = TerminalEngine::new(TerminalSize {
+            rows: 21,
+            cols: 47,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        let mut bootstrap = String::from("\x1b[2J\x1b[H");
+        for (index, line) in bootstrap_screen.lines().enumerate() {
+            bootstrap.push_str(&format!("\x1b[{};1H{}", index + 1, line));
+        }
+        bootstrap.push_str("\x1b[11;26H");
+
+        engine.feed(bootstrap.as_bytes());
+        engine.feed(redraw);
+        let snapshot = engine.snapshot();
+
+        assert_eq!(
+            snapshot.lines[0],
+            "                                               "
+        );
+        assert!(
+            snapshot.lines[1].starts_with("  ✨ Update available! 0.125.0 -> 0.128.0"),
+            "unexpected line 2: {:?}",
+            snapshot.lines[1]
+        );
+        assert_eq!(
+            snapshot.lines[5],
+            "  1. Update now (runs `npm install -g          "
+        );
+        assert_eq!(
+            snapshot.lines[6],
+            "     @openai/codex`)                           "
+        );
+        assert_eq!(
+            snapshot.lines[7],
+            "› 2. Skip                                      "
+        );
+    }
+
+    #[test]
     fn engine_handles_scroll_region_and_scroll_up() {
         let mut engine = TerminalEngine::new(TerminalSize {
             rows: 5,

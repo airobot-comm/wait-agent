@@ -48,6 +48,7 @@ impl EventDrivenUiPaneRuntime {
         active_session: &str,
         active_target: Option<&str>,
         sessions: Vec<ManagedSessionRecord>,
+        listener_display: Option<&str>,
     ) -> EventDrivenChromeRenderUpdate {
         self.session_catalog_projection.publish_snapshot(
             &mut self.bus,
@@ -55,6 +56,7 @@ impl EventDrivenUiPaneRuntime {
             active_session,
             active_target,
             sessions,
+            listener_display,
         );
         self.drain_pending_events(now_millis())
     }
@@ -87,21 +89,21 @@ impl EventDrivenUiPaneRuntime {
         for action in sidebar_actions(&mut self.pending_sidebar_input, bytes) {
             match action {
                 SidebarInputAction::Previous => {
-                    if let Some(session_id) = self.state.step_selection(-1) {
+                    if let Some(target) = self.state.step_selection(-1) {
                         merge_render_update(
                             &mut outcome.render,
                             self.publish(LocalRuntimeEvent::Chrome(
-                                ChromeEvent::SidebarSelectionChanged { session_id },
+                                ChromeEvent::SidebarSelectionChanged { target },
                             )),
                         );
                     }
                 }
                 SidebarInputAction::Next => {
-                    if let Some(session_id) = self.state.step_selection(1) {
+                    if let Some(target) = self.state.step_selection(1) {
                         merge_render_update(
                             &mut outcome.render,
                             self.publish(LocalRuntimeEvent::Chrome(
-                                ChromeEvent::SidebarSelectionChanged { session_id },
+                                ChromeEvent::SidebarSelectionChanged { target },
                             )),
                         );
                     }
@@ -145,7 +147,8 @@ struct EventDrivenUiPaneState {
     active_session: String,
     active_target: Option<String>,
     sessions: Vec<ManagedSessionRecord>,
-    selected_session_id: Option<String>,
+    listener_display: Option<String>,
+    selected_target: Option<String>,
 }
 
 impl EventDrivenUiPaneState {
@@ -156,25 +159,25 @@ impl EventDrivenUiPaneState {
                 active_session,
                 active_target,
                 sessions,
+                listener_display,
             }) => {
                 self.active_socket = active_socket.clone();
                 self.active_session = active_session.clone();
                 self.active_target = active_target.clone();
                 self.sessions = sessions.clone();
+                self.listener_display = listener_display.clone();
                 self.ensure_active_target();
                 self.ensure_selected_session();
             }
-            LocalRuntimeEvent::Chrome(ChromeEvent::SidebarSelectionChanged {
-                session_id: selected_session_id,
-            }) => {
+            LocalRuntimeEvent::Chrome(ChromeEvent::SidebarSelectionChanged { target }) => {
                 if self.sessions.is_empty() {
-                    self.selected_session_id = None;
+                    self.selected_target = None;
                 } else if self
                     .sessions
                     .iter()
-                    .any(|session| session.address.session_id() == selected_session_id)
+                    .any(|session| session.address.qualified_target() == *target)
                 {
-                    self.selected_session_id = Some(selected_session_id.clone());
+                    self.selected_target = Some(target.clone());
                 }
             }
             _ => {}
@@ -183,23 +186,23 @@ impl EventDrivenUiPaneState {
 
     fn ensure_selected_session(&mut self) {
         if self.sessions.is_empty() {
-            self.selected_session_id = None;
+            self.selected_target = None;
             return;
         }
 
-        let selection_is_still_valid = self.selected_session_id.as_ref().map(|session_id| {
+        let selection_is_still_valid = self.selected_target.as_ref().map(|target| {
             self.sessions
                 .iter()
-                .any(|session| session.address.session_id() == session_id)
+                .any(|session| session.address.qualified_target() == *target)
         }) == Some(true);
         if selection_is_still_valid {
             return;
         }
 
-        self.selected_session_id = self
+        self.selected_target = self
             .active_session_record()
             .or_else(|| self.sessions.first())
-            .map(|session| session.address.session_id().to_string());
+            .map(|session| session.address.qualified_target());
     }
 
     fn ensure_active_target(&mut self) {
@@ -228,17 +231,17 @@ impl EventDrivenUiPaneState {
         }
 
         let current_index = self
-            .selected_session_id
+            .selected_target
             .as_ref()
-            .and_then(|session_id| {
+            .and_then(|target| {
                 self.sessions
                     .iter()
-                    .position(|session| session.address.session_id() == session_id)
+                    .position(|session| session.address.qualified_target() == *target)
             })
             .unwrap_or(0);
         let next_index =
             ((current_index as isize + delta).rem_euclid(self.sessions.len() as isize)) as usize;
-        Some(self.sessions[next_index].address.session_id().to_string())
+        Some(self.sessions[next_index].address.qualified_target())
     }
 
     fn selected_target(&self) -> Option<String> {
@@ -258,12 +261,12 @@ impl EventDrivenUiPaneState {
     }
 
     fn selected_session(&self) -> Option<&ManagedSessionRecord> {
-        self.selected_session_id
+        self.selected_target
             .as_ref()
-            .and_then(|session_id| {
+            .and_then(|target| {
                 self.sessions
                     .iter()
-                    .find(|session| session.address.session_id() == session_id)
+                    .find(|session| session.address.qualified_target() == *target)
             })
             .or_else(|| self.active_session_record())
             .or_else(|| self.sessions.first())
@@ -384,6 +387,7 @@ mod tests {
             "sess-1",
             Some("wa-1:sess-1"),
             vec![session("wa-1", "sess-1", "bash")],
+            Some("192.168.1.22:7474"),
         );
 
         assert!(update
@@ -394,12 +398,16 @@ mod tests {
         assert!(update
             .footer
             .as_ref()
-            .map(|buffer| buffer.contains("keys: ^N new"))
+            .map(|buffer| {
+                buffer.contains("keys: ^N new") && buffer.contains("listen: 192.168.1.22:7474")
+            })
             .unwrap_or(false));
         assert!(update
             .fullscreen_status
             .as_ref()
-            .map(|buffer| buffer.contains("[Ctrl-n] new"))
+            .map(|buffer| {
+                buffer.contains("[Ctrl-n] new") && buffer.contains("listen: 192.168.1.22:7474")
+            })
             .unwrap_or(false));
     }
 
@@ -415,6 +423,7 @@ mod tests {
                 session("wa-1", "sess-1", "bash"),
                 session("wa-2", "sess-2", "codex"),
             ],
+            None,
         );
 
         let outcome = runtime.apply_sidebar_input_bytes(b"\x1b[B");
@@ -430,6 +439,31 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_selection_uses_qualified_target_when_remote_sessions_share_session_id() {
+        let mut runtime = EventDrivenUiPaneRuntime::new();
+        runtime.publish_surface_resize(ChromeSurface::SidebarPane, 40, 9);
+        runtime.publish_session_snapshot(
+            "wa-1",
+            "target-1",
+            Some("wa-1:target-1"),
+            vec![
+                session("wa-1", "target-1", "bash"),
+                remote_session("10.1.29.165", "pty1", "codex"),
+                remote_session("10.1.29.166", "pty1", "claude"),
+            ],
+            None,
+        );
+
+        runtime.apply_sidebar_input_bytes(b"\x1b[B");
+        runtime.apply_sidebar_input_bytes(b"\x1b[B");
+
+        assert_eq!(
+            runtime.selected_target().as_deref(),
+            Some("10.1.29.166:pty1")
+        );
+    }
+
+    #[test]
     fn sidebar_submit_returns_attach_or_main_pane_activation() {
         let mut runtime = EventDrivenUiPaneRuntime::new();
         runtime.publish_surface_resize(ChromeSurface::SidebarPane, 28, 9);
@@ -441,6 +475,7 @@ mod tests {
                 session("wa-1", "sess-1", "bash"),
                 session("wa-2", "sess-2", "codex"),
             ],
+            None,
         );
 
         let current = runtime.apply_sidebar_input_bytes(b"\r");
@@ -472,6 +507,7 @@ mod tests {
                 session("wa-1", "sess-1", "bash"),
                 session("wa-1", "sess-2", "codex"),
             ],
+            None,
         );
 
         runtime.apply_sidebar_input_bytes(b"\x1b[B");
@@ -483,6 +519,7 @@ mod tests {
                 session("wa-1", "sess-1", "bash"),
                 session("wa-1", "sess-2", "codex"),
             ],
+            None,
         );
 
         assert_eq!(runtime.state.active_target.as_deref(), Some("wa-1:sess-2"));
@@ -497,13 +534,33 @@ mod tests {
     fn session(socket: &str, session: &str, command: &str) -> ManagedSessionRecord {
         ManagedSessionRecord {
             address: ManagedSessionAddress::local_tmux(socket, session),
+            selector: Some(format!("{socket}:{session}")),
+            availability: crate::domain::session_catalog::SessionAvailability::Online,
             workspace_dir: Some(PathBuf::from("/tmp/demo")),
             workspace_key: None,
             session_role: None,
+            opened_by: Vec::new(),
             attached_clients: 1,
             window_count: 1,
             command_name: Some(command.to_string()),
             current_path: Some(PathBuf::from("/tmp/demo")),
+            task_state: ManagedSessionTaskState::Input,
+        }
+    }
+
+    fn remote_session(authority_id: &str, session: &str, command: &str) -> ManagedSessionRecord {
+        ManagedSessionRecord {
+            address: ManagedSessionAddress::remote_peer(authority_id, session),
+            selector: Some(format!("{authority_id}:{session}")),
+            availability: crate::domain::session_catalog::SessionAvailability::Online,
+            workspace_dir: None,
+            workspace_key: None,
+            session_role: None,
+            opened_by: Vec::new(),
+            attached_clients: 0,
+            window_count: 1,
+            command_name: Some(command.to_string()),
+            current_path: None,
             task_state: ManagedSessionTaskState::Input,
         }
     }

@@ -9,7 +9,6 @@ const SIDEBAR_PANE_STYLE: &str = "fg=colour250,bg=colour234";
 const MAIN_PANE_REMAIN_ON_EXIT_OPTION: &str = "remain-on-exit";
 const TMUX_OPTION_ON: &str = "on";
 const SESSION_LAYOUT_RECONCILE_HOOKS: [&str; 1] = ["client-resized"];
-const GLOBAL_LAYOUT_RECONCILE_HOOKS: [&str; 2] = ["session-created", "session-closed"];
 const MAIN_PANE_RECOVERY_HOOKS: [&str; 1] = ["pane-died"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +30,7 @@ where
     pub fn new(tmux: G) -> Self {
         Self {
             tmux,
-            sidebar_width: TmuxSplitSize::Cells(24),
+            sidebar_width: TmuxSplitSize::Cells(32),
             footer_height: TmuxSplitSize::Cells(1),
         }
     }
@@ -68,13 +67,6 @@ where
         self.tmux
             .set_pane_style(workspace, &sidebar_pane, SIDEBAR_PANE_STYLE)?;
         apply_width(&self.tmux, workspace, &sidebar_pane, &self.sidebar_width)?;
-        self.tmux.set_pane_option(
-            workspace,
-            &main_pane,
-            MAIN_PANE_REMAIN_ON_EXIT_OPTION,
-            TMUX_OPTION_ON,
-        )?;
-
         let panes = self.tmux.list_panes(workspace, &window)?;
         let footer_pane = match pane_with_title(&panes, FOOTER_PANE_TITLE) {
             Some(pane) => {
@@ -114,18 +106,34 @@ where
         &self,
         workspace: &TmuxWorkspaceHandle,
         main_pane: &TmuxPaneId,
+        previous_main_pane: Option<&TmuxPaneId>,
         reconcile_command: &str,
-        chrome_refresh_command: &str,
         pane_died_command: &str,
     ) -> Result<(), G::Error> {
         for hook_name in SESSION_LAYOUT_RECONCILE_HOOKS {
             self.tmux
                 .set_session_hook(workspace, hook_name, reconcile_command)?;
         }
-        for hook_name in GLOBAL_LAYOUT_RECONCILE_HOOKS {
-            self.tmux
-                .set_global_hook(workspace, hook_name, chrome_refresh_command)?;
+        if let Some(previous_main_pane) = previous_main_pane {
+            if previous_main_pane != main_pane {
+                for hook_name in MAIN_PANE_RECOVERY_HOOKS {
+                    self.tmux
+                        .unset_pane_hook(workspace, previous_main_pane, hook_name)?;
+                }
+                self.tmux.set_pane_option(
+                    workspace,
+                    previous_main_pane,
+                    MAIN_PANE_REMAIN_ON_EXIT_OPTION,
+                    "",
+                )?;
+            }
         }
+        self.tmux.set_pane_option(
+            workspace,
+            main_pane,
+            MAIN_PANE_REMAIN_ON_EXIT_OPTION,
+            TMUX_OPTION_ON,
+        )?;
         for hook_name in MAIN_PANE_RECOVERY_HOOKS {
             self.tmux
                 .set_pane_hook(workspace, main_pane, hook_name, pane_died_command)?;
@@ -211,6 +219,7 @@ mod tests {
         SetHeight(String, u16),
         SetHook(String, String),
         SetPaneHook(String, String, String),
+        UnsetPaneHook(String, String),
         SetGlobalHook(String, String),
         SetSessionOption(String, String),
         SelectMain(String),
@@ -489,6 +498,19 @@ mod tests {
             Ok(())
         }
 
+        fn unset_pane_hook(
+            &self,
+            _workspace: &TmuxWorkspaceHandle,
+            pane: &TmuxPaneId,
+            hook_name: &str,
+        ) -> Result<(), Self::Error> {
+            self.calls.borrow_mut().push(Call::UnsetPaneHook(
+                pane.as_str().to_string(),
+                hook_name.to_string(),
+            ));
+            Ok(())
+        }
+
         fn set_session_option(
             &self,
             _workspace: &TmuxWorkspaceHandle,
@@ -552,12 +574,7 @@ mod tests {
                 Call::SplitRight,
                 Call::SetTitle("%2".to_string()),
                 Call::SetPaneStyle("%2".to_string(), "fg=colour250,bg=colour234".to_string()),
-                Call::SetWidth("%2".to_string(), 24),
-                Call::SetPaneOption(
-                    "%1".to_string(),
-                    "remain-on-exit".to_string(),
-                    "on".to_string(),
-                ),
+                Call::SetWidth("%2".to_string(), 32),
                 Call::SplitBottom,
                 Call::SetTitle("%3".to_string()),
                 Call::SetHeight("%3".to_string(), 1),
@@ -612,7 +629,7 @@ mod tests {
                 Call::Respawn("%2".to_string()),
                 Call::SetTitle("%2".to_string()),
                 Call::SetPaneStyle("%2".to_string(), "fg=colour250,bg=colour234".to_string()),
-                Call::SetWidth("%2".to_string(), 24),
+                Call::SetWidth("%2".to_string(), 32),
                 Call::SetPaneOption(
                     "%1".to_string(),
                     "remain-on-exit".to_string(),
@@ -672,12 +689,7 @@ mod tests {
             vec![
                 Call::SetTitle("%2".to_string()),
                 Call::SetPaneStyle("%2".to_string(), "fg=colour250,bg=colour234".to_string()),
-                Call::SetWidth("%2".to_string(), 24),
-                Call::SetPaneOption(
-                    "%1".to_string(),
-                    "remain-on-exit".to_string(),
-                    "on".to_string(),
-                ),
+                Call::SetWidth("%2".to_string(), 32),
                 Call::SetTitle("%3".to_string()),
                 Call::SetHeight("%3".to_string(), 1),
                 Call::SelectMain("%3".to_string()),
@@ -694,8 +706,8 @@ mod tests {
             .ensure_layout_hooks(
                 &workspace(),
                 &TmuxPaneId::new("%1"),
+                None,
                 "run-shell -b 'waitagent __layout-reconcile'",
-                "run-shell -b 'waitagent __chrome-refresh --socket-name wa-wk-1 --session-name waitagent-wk-1 --workspace-dir /tmp/demo'",
                 "run-shell -b 'waitagent __main-pane-died --socket-name wa-wk-1 --session-name waitagent-wk-1 --pane-id #{hook_pane}'",
             )
             .expect("hook registration should succeed");
@@ -707,16 +719,55 @@ mod tests {
                     "client-resized".to_string(),
                     "run-shell -b 'waitagent __layout-reconcile'".to_string(),
                 ),
-                Call::SetGlobalHook(
-                    "session-created".to_string(),
-                    "run-shell -b 'waitagent __chrome-refresh --socket-name wa-wk-1 --session-name waitagent-wk-1 --workspace-dir /tmp/demo'".to_string(),
-                ),
-                Call::SetGlobalHook(
-                    "session-closed".to_string(),
-                    "run-shell -b 'waitagent __chrome-refresh --socket-name wa-wk-1 --session-name waitagent-wk-1 --workspace-dir /tmp/demo'".to_string(),
+                Call::SetPaneOption(
+                    "%1".to_string(),
+                    "remain-on-exit".to_string(),
+                    "on".to_string(),
                 ),
                 Call::SetPaneHook(
                     "%1".to_string(),
+                    "pane-died".to_string(),
+                    "run-shell -b 'waitagent __main-pane-died --socket-name wa-wk-1 --session-name waitagent-wk-1 --pane-id #{hook_pane}'".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn layout_service_clears_stale_main_pane_hooks_before_binding_new_main_pane() {
+        let gateway = FakeGateway::new(vec![]);
+        let service = LayoutService::new(gateway.clone());
+
+        service
+            .ensure_layout_hooks(
+                &workspace(),
+                &TmuxPaneId::new("%3"),
+                Some(&TmuxPaneId::new("%1")),
+                "run-shell -b 'waitagent __layout-reconcile'",
+                "run-shell -b 'waitagent __main-pane-died --socket-name wa-wk-1 --session-name waitagent-wk-1 --pane-id #{hook_pane}'",
+            )
+            .expect("hook migration should succeed");
+
+        assert_eq!(
+            gateway.calls(),
+            vec![
+                Call::SetHook(
+                    "client-resized".to_string(),
+                    "run-shell -b 'waitagent __layout-reconcile'".to_string(),
+                ),
+                Call::UnsetPaneHook("%1".to_string(), "pane-died".to_string()),
+                Call::SetPaneOption(
+                    "%1".to_string(),
+                    "remain-on-exit".to_string(),
+                    "".to_string(),
+                ),
+                Call::SetPaneOption(
+                    "%3".to_string(),
+                    "remain-on-exit".to_string(),
+                    "on".to_string(),
+                ),
+                Call::SetPaneHook(
+                    "%3".to_string(),
                     "pane-died".to_string(),
                     "run-shell -b 'waitagent __main-pane-died --socket-name wa-wk-1 --session-name waitagent-wk-1 --pane-id #{hook_pane}'".to_string(),
                 ),
