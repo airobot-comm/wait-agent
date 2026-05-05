@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -61,51 +62,23 @@ jobs:
             waitagent-*.rpm
             waitagent-*-x86_64-linux.tar.gz
 
-  release-macos-x86_64:
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install system deps
-        run: |
-          brew install bison pkg-config libevent ncurses automake autoconf
-
-      - name: Install Rust toolchain
-        run: rustup show
-
-      - name: cargo build --release
-        run: cargo build --release
-        env:
-          PKG_CONFIG_PATH: /usr/local/opt/ncurses/lib/pkgconfig:/usr/local/opt/libevent/lib/pkgconfig
-          LDFLAGS: -L/usr/local/opt/ncurses/lib -L/usr/local/opt/libevent/lib
-          CPPFLAGS: -I/usr/local/opt/ncurses/include -I/usr/local/opt/libevent/include
-
-      - name: Build .tar.gz archive
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          tar czf "waitagent-${VERSION}-x86_64-macos.tar.gz" \
-            -C target/release waitagent
-
-      - name: Build .dmg package
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          chmod +x scripts/package-dmg.sh
-          ./scripts/package-dmg.sh \
-            target/release/waitagent \
-            "waitagent-${VERSION}-x86_64-macos.dmg" \
-            "${VERSION}"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-x86_64
-          path: |
-            waitagent-*-x86_64-macos.tar.gz
-            waitagent-*-x86_64-macos.dmg
-
-  release-macos-aarch64:
+  release-macos:
     runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: aarch64
+            pkg_config: /opt/homebrew/opt/ncurses/lib/pkgconfig:/opt/homebrew/opt/libevent/lib/pkgconfig
+            ldflags: -L/opt/homebrew/opt/ncurses/lib -L/opt/homebrew/opt/libevent/lib
+            cppflags: -I/opt/homebrew/opt/ncurses/include -I/opt/homebrew/opt/libevent/include
+            dmg: true
+          - target: x86_64-apple-darwin
+            arch: x86_64
+            pkg_config: /opt/homebrew/opt/ncurses/lib/pkgconfig:/opt/homebrew/opt/libevent/lib/pkgconfig
+            ldflags: -L/opt/homebrew/opt/ncurses/lib -L/opt/homebrew/opt/libevent/lib
+            cppflags: -I/opt/homebrew/opt/ncurses/include -I/opt/homebrew/opt/libevent/include
+            dmg: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,42 +89,44 @@ jobs:
           brew install bison pkg-config libevent ncurses automake autoconf
 
       - name: Install Rust toolchain
-        run: rustup show
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
-      - name: cargo build --release
-        run: cargo build --release
+      - name: cargo build --release (${{ matrix.target }})
+        run: cargo build --release --target ${{ matrix.target }}
         env:
-          PKG_CONFIG_PATH: /opt/homebrew/opt/ncurses/lib/pkgconfig:/opt/homebrew/opt/libevent/lib/pkgconfig
-          LDFLAGS: -L/opt/homebrew/opt/ncurses/lib -L/opt/homebrew/opt/libevent/lib
-          CPPFLAGS: -I/opt/homebrew/opt/ncurses/include -I/opt/homebrew/opt/libevent/include
+          PKG_CONFIG_PATH: ${{ matrix.pkg_config }}
+          LDFLAGS: ${{ matrix.ldflags }}
+          CPPFLAGS: ${{ matrix.cppflags }}
 
-      - name: Build .tar.gz archive
+      - name: Build .tar.gz archive (${{ matrix.arch }})
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          tar czf "waitagent-${VERSION}-aarch64-macos.tar.gz" \
-            -C target/release waitagent
+          tar czf "waitagent-${VERSION}-${{ matrix.arch }}-macos.tar.gz" \
+            -C "target/${{ matrix.target }}/release" waitagent
 
-      - name: Build .dmg package
+      - name: Build .dmg package (${{ matrix.arch }})
+        if: ${{ matrix.dmg }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           chmod +x scripts/package-dmg.sh
           ./scripts/package-dmg.sh \
-            target/release/waitagent \
-            "waitagent-${VERSION}-aarch64-macos.dmg" \
+            "target/${{ matrix.target }}/release/waitagent" \
+            "waitagent-${VERSION}-${{ matrix.arch }}-macos.dmg" \
             "${VERSION}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-aarch64
+          name: macos-${{ matrix.arch }}
           path: |
-            waitagent-*-aarch64-macos.tar.gz
-            waitagent-*-aarch64-macos.dmg
+            waitagent-*-${{ matrix.arch }}-macos.tar.gz
+            waitagent-*-${{ matrix.arch }}-macos.dmg
 
   create-release:
     needs:
       - release-linux-x86_64
-      - release-macos-x86_64
-      - release-macos-aarch64
+      - release-macos
     runs-on: ubuntu-latest
     permissions:
       contents: write
