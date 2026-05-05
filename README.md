@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.svg" alt="WaitAgent" width="120">
+</p>
+
 # WaitAgent
 
 [![CI](https://github.com/kikakkz/wait-agent/actions/workflows/ci.yaml/badge.svg)](https://github.com/kikakkz/wait-agent/actions/workflows/ci.yaml)
