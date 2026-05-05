@@ -2,26 +2,28 @@
   <defs>
     <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#ffffff"/>
-      <stop offset="100%" stop-color="#a0a0a0"/>
+      <stop offset="100%" stop-color="#666666"/>
     </linearGradient>
   </defs>
 
   <!-- Background -->
   <rect width="400" height="400" rx="48" fill="#0a0a0a"/>
 
-  <!-- "W" — three strokes forming the W -->
-  <path d="M55 310 L85 110 L130 200 L175 110 L205 310"
-        stroke="url(#g)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Workspace boundary (subtle) -->
+  <rect x="52" y="52" width="296" height="296" rx="20"
+        stroke="#ffffff" stroke-width="4" opacity="0.06"/>
 
-  <!-- "A" — left, right and crossbar -->
-  <path d="M240 310 L292 110 L345 310"
-        stroke="url(#g)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
-  <line x1="262" y1="230" x2="322" y2="230"
-        stroke="url(#g)" stroke-width="14" stroke-linecap="round"/>
+  <!-- Converging connection lines (top agents → center → output) -->
+  <line x1="110" y1="120" x2="200" y2="190" stroke="#ffffff" stroke-width="4" opacity="0.12"/>
+  <line x1="200" y1="100" x2="200" y2="190" stroke="#ffffff" stroke-width="4" opacity="0.12"/>
+  <line x1="290" y1="120" x2="200" y2="190" stroke="#ffffff" stroke-width="4" opacity="0.12"/>
+  <line x1="200" y1="190" x2="200" y2="270" stroke="url(#g)" stroke-width="5"/>
 
-  <!-- Terminal prompt cursor line -->
-  <rect x="55" y="350" width="290" height="5" rx="2.5" fill="#ffffff" opacity="0.15"/>
+  <!-- Agent session nodes (inactive) -->
+  <circle cx="110" cy="120" r="15" stroke="#ffffff" stroke-width="4" opacity="0.25"/>
+  <circle cx="200" cy="100" r="15" stroke="#ffffff" stroke-width="4" opacity="0.25"/>
+  <circle cx="290" cy="120" r="15" stroke="#ffffff" stroke-width="4" opacity="0.25"/>
 
-  <!-- Agent activity dot (cyan accent) -->
-  <circle cx="345" cy="310" r="7" fill="#00ffc8" opacity="0.9"/>
+  <!-- Active focused session -->
+  <circle cx="200" cy="270" r="15" fill="#00ffc8" opacity="0.9"/>
 </svg>
