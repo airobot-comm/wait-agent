@@ -67,6 +67,7 @@ pub struct RemoteMainSlotRuntime {
 }
 
 impl RemoteMainSlotRuntime {
+    #[cfg(test)]
     pub fn new(sink: Box<dyn RemoteControlPlaneSink>) -> Self {
         Self {
             control_plane: RefCell::new(RemoteControlPlaneService::new()),
@@ -75,6 +76,7 @@ impl RemoteMainSlotRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn new_unconfigured() -> Self {
         Self::new(Box::new(UnconfiguredRemoteControlPlaneSink))
     }
@@ -211,11 +213,20 @@ impl RemoteMainSlotRuntime {
         &self,
         target: &ManagedSessionRecord,
         last_chunk_seq: u64,
+        alternate_screen_active: bool,
+        application_cursor_keys: bool,
+        cursor_visible: bool,
     ) -> Result<(), LifecycleError> {
         let message = self
             .control_plane
             .borrow_mut()
-            .route_mirror_bootstrap_complete(target, last_chunk_seq)
+            .route_mirror_bootstrap_complete(
+                target,
+                last_chunk_seq,
+                alternate_screen_active,
+                application_cursor_keys,
+                cursor_visible,
+            )
             .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
         self.send_messages(&[message])
     }
@@ -477,7 +488,13 @@ mod tests {
             .send_mirror_bootstrap_chunk(&remote_target("peer-a", "shell-1"), 1, "pty", "YQ==")
             .expect("bootstrap chunk should fan out to observers");
         runtime
-            .send_mirror_bootstrap_complete(&remote_target("peer-a", "shell-1"), 1)
+            .send_mirror_bootstrap_complete(
+                &remote_target("peer-a", "shell-1"),
+                1,
+                false,
+                false,
+                true,
+            )
             .expect("bootstrap complete should fan out to observers");
 
         let envelopes = observer_mailbox.snapshot();

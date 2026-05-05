@@ -161,6 +161,7 @@ Project status at a glance:
 - the current `task.t6-01` slice now exists as well: the dedicated server-console surface now supports a long-lived `picker -> target -> picker` lifecycle, resolves activation targets from the same shared catalog boundary, routes local targets through the existing local attach path, and routes remote targets through the shared remote interact surface with `Ctrl-]` returning to the picker
 - the remaining `task.t6-01` gap is now narrower again: target discovery, activation routing, explicit focus, and real submit or manual-switch signal ownership are already in code, so any future T6 work should stay limited to manual-only attention-cue polish rather than focus automation
 - the current remote review also fixed an important concept boundary for the last phase-2 slice: `--connect` is a node connection, not a session; one connection may publish many backend-owned local sessions; those sessions route by `session_id`; and remote projections are locally consumable but must never be republished
+- the latest real remote Codex validation exposed three concrete fidelity gaps that now need to close before phase-2 can be considered stable: remote Codex menus mis-handle arrow navigation because remote input does not yet honor authority-side application-cursor mode; reopening the same remote Codex surface after returning to a local session can leave stale framebuffer residue because bootstrap replay still restores only text plus cursor position rather than the full terminal mode state; and sidebar labels for connected remote sessions can stay stuck at `bash@host` after the client session becomes `codex` because remote published session metadata refresh is not yet surfacing command-name changes with the same immediacy and chrome refresh guarantees as the local active-target projection
 
 ## 4. Milestone Summary
 
@@ -189,6 +190,7 @@ Execution tracks at human-summary level:
 Current focus:
 
 - add explicit session-scoped live-mirror control on the accepted remote path so opening a remote session yields the client session's real visible screen rather than placeholder-only transport state
+- close the three real remote Codex fidelity defects now confirmed in end-to-end use: application-cursor-aware remote input forwarding, reopen-safe remote terminal bootstrap parity, and prompt command-name freshness for remote sidebar rows
 
 Accepted local architecture direction:
 

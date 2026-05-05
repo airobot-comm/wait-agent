@@ -143,6 +143,9 @@ pub struct MirrorBootstrapCompletePayload {
     pub session_id: String,
     pub target_id: String,
     pub last_chunk_seq: u64,
+    pub alternate_screen_active: bool,
+    pub application_cursor_keys: bool,
+    pub cursor_visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

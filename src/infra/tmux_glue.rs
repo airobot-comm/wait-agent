@@ -2,6 +2,7 @@ use crate::infra::tmux::TmuxError;
 use crate::infra::tmux_glue_contract::TmuxGlueContractError;
 use std::path::{Path, PathBuf};
 
+#[allow(unused_imports)]
 pub use crate::infra::tmux_glue_contract::{
     ProcessTmuxGlueExecutor, TmuxGlueArtifacts, TmuxGlueBuildConfig, TmuxGlueBuildError,
     TmuxGlueBuildPlan, TmuxGlueBuildStatus, TmuxGlueBuildStep, TmuxGlueBuildStepKind,

@@ -10,6 +10,7 @@ use crate::runtime::remote_node_session_runtime::{
     RemoteNodePublicationSink, RemoteNodeSessionError,
 };
 use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
+#[cfg(test)]
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
@@ -35,6 +36,7 @@ impl RemoteMainSlotIngressRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn from_build_env() -> Result<Self, LifecycleError> {
         Self::from_build_env_with_network(RemoteNetworkConfig::default())
     }
@@ -53,6 +55,7 @@ impl RemoteMainSlotIngressRuntime {
         ))
     }
 
+    #[cfg(test)]
     pub fn submit_external_authority_stream(
         &self,
         stream: UnixStream,
@@ -480,6 +483,9 @@ mod tests {
                 target_id: "remote-peer:peer-a:shell-1".to_string(),
                 last_chunk_seq: 1,
                 session_id: "shell-1".to_string(),
+                alternate_screen_active: false,
+                application_cursor_keys: false,
+                cursor_visible: true,
             })),
         }
     }

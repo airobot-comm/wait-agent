@@ -29,6 +29,23 @@ enum MirrorState {
     Active,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteTargetTerminalFlags {
+    pub alternate_screen_active: bool,
+    pub application_cursor_keys: bool,
+    pub cursor_visible: bool,
+}
+
+impl Default for RemoteTargetTerminalFlags {
+    fn default() -> Self {
+        Self {
+            alternate_screen_active: false,
+            application_cursor_keys: false,
+            cursor_visible: true,
+        }
+    }
+}
+
 pub trait RemoteTargetPtyGateway: Send + Sync + Clone + 'static {
     type Error: ToString;
 
@@ -64,6 +81,12 @@ pub trait RemoteTargetPtyGateway: Send + Sync + Clone + 'static {
         socket_name: &str,
         pane: &TmuxPaneId,
     ) -> Result<(usize, usize), Self::Error>;
+
+    fn capture_terminal_flags(
+        &self,
+        socket_name: &str,
+        pane: &TmuxPaneId,
+    ) -> Result<RemoteTargetTerminalFlags, Self::Error>;
 
     fn clear_output_pipe(&self, socket_name: &str, pane: &TmuxPaneId) -> Result<(), Self::Error>;
 
@@ -119,6 +142,14 @@ impl RemoteTargetPtyGateway for EmbeddedTmuxBackend {
         pane: &TmuxPaneId,
     ) -> Result<(usize, usize), Self::Error> {
         self.pane_cursor_position_on_socket(socket_name, pane.as_str())
+    }
+
+    fn capture_terminal_flags(
+        &self,
+        socket_name: &str,
+        pane: &TmuxPaneId,
+    ) -> Result<RemoteTargetTerminalFlags, Self::Error> {
+        self.pane_terminal_flags_on_socket(socket_name, pane.as_str())
     }
 
     fn clear_output_pipe(&self, socket_name: &str, pane: &TmuxPaneId) -> Result<(), Self::Error> {
@@ -666,6 +697,10 @@ where
         .gateway
         .capture_cursor_position(socket_name, pane)
         .map_err(remote_authority_error)?;
+    let flags = runtime
+        .gateway
+        .capture_terminal_flags(socket_name, pane)
+        .map_err(remote_authority_error)?;
     let replay = render_bootstrap_replay(&screen, cursor_x, cursor_y);
     if !replay.is_empty() {
         transport
@@ -683,6 +718,9 @@ where
             session_id,
             target_id,
             if replay.is_empty() { 0 } else { 1 },
+            flags.alternate_screen_active,
+            flags.application_cursor_keys,
+            flags.cursor_visible,
         )
         .map_err(remote_authority_error)?;
     Ok(())
@@ -799,7 +837,7 @@ mod tests {
         remote_authority_error, remote_authority_output_pump_shell_command,
         remote_authority_target_host_args, render_bootstrap_replay, write_output_chunk_frame,
         LifecycleError, RemoteAuthorityPublicationGateway, RemoteAuthorityTargetHostRuntime,
-        RemoteTargetPtyGateway,
+        RemoteTargetPtyGateway, RemoteTargetTerminalFlags,
     };
     use crate::cli::RemoteAuthorityTargetHostCommand;
     use crate::cli::RemoteNetworkConfig;
@@ -837,6 +875,7 @@ mod tests {
         clear_calls: Arc<Mutex<usize>>,
         capture_bootstrap_screen: Arc<Mutex<String>>,
         cursor_position: Arc<Mutex<(usize, usize)>>,
+        terminal_flags: Arc<Mutex<RemoteTargetTerminalFlags>>,
     }
 
     impl RemoteTargetPtyGateway for FakeGateway {
@@ -911,6 +950,17 @@ mod tests {
                 .cursor_position
                 .lock()
                 .expect("cursor position mutex should not be poisoned"))
+        }
+
+        fn capture_terminal_flags(
+            &self,
+            _socket_name: &str,
+            _pane: &TmuxPaneId,
+        ) -> Result<RemoteTargetTerminalFlags, Self::Error> {
+            Ok(*self
+                .terminal_flags
+                .lock()
+                .expect("terminal flags mutex should not be poisoned"))
         }
 
         fn set_output_pipe(
@@ -1070,7 +1120,14 @@ mod tests {
         let transport_socket_path = transport_socket_path("host");
         let transport_listener =
             UnixListener::bind(&transport_socket_path).expect("transport listener should bind");
-        let fake_gateway = FakeGateway::default();
+        let fake_gateway = FakeGateway {
+            terminal_flags: Arc::new(Mutex::new(RemoteTargetTerminalFlags {
+                alternate_screen_active: false,
+                application_cursor_keys: false,
+                cursor_visible: true,
+            })),
+            ..FakeGateway::default()
+        };
         let fake_publication_gateway = FakePublicationGateway::default();
         let runtime = RemoteAuthorityTargetHostRuntime::new(
             fake_gateway.clone(),
@@ -1242,6 +1299,9 @@ mod tests {
                     session_id: "target-1".to_string(),
                     target_id: "remote-peer:peer-a:target-1".to_string(),
                     last_chunk_seq: 0,
+                    alternate_screen_active: false,
+                    application_cursor_keys: false,
+                    cursor_visible: true,
                 }
             )
         );
@@ -1273,6 +1333,11 @@ mod tests {
         let fake_gateway = FakeGateway {
             capture_bootstrap_screen: Arc::new(Mutex::new("\u{1b}[32mbash\u{1b}[0m".to_string())),
             cursor_position: Arc::new(Mutex::new((4, 0))),
+            terminal_flags: Arc::new(Mutex::new(RemoteTargetTerminalFlags {
+                alternate_screen_active: false,
+                application_cursor_keys: false,
+                cursor_visible: true,
+            })),
             ..FakeGateway::default()
         };
         let runtime = RemoteAuthorityTargetHostRuntime::new(
@@ -1371,6 +1436,9 @@ mod tests {
                     session_id: "target-1".to_string(),
                     target_id: "remote-peer:peer-a:target-1".to_string(),
                     last_chunk_seq: 1,
+                    alternate_screen_active: false,
+                    application_cursor_keys: false,
+                    cursor_visible: true,
                 }
             )
         );
@@ -1386,6 +1454,11 @@ mod tests {
         let fake_gateway = FakeGateway {
             capture_bootstrap_screen: Arc::new(Mutex::new("\u{1b}[32mbash\u{1b}[0m".to_string())),
             cursor_position: Arc::new(Mutex::new((4, 0))),
+            terminal_flags: Arc::new(Mutex::new(RemoteTargetTerminalFlags {
+                alternate_screen_active: false,
+                application_cursor_keys: false,
+                cursor_visible: true,
+            })),
             ..FakeGateway::default()
         };
         let runtime = RemoteAuthorityTargetHostRuntime::new(

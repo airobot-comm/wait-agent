@@ -182,6 +182,9 @@ fn write_payload(
             write_string(writer, &payload.session_id)?;
             write_string(writer, &payload.target_id)?;
             write_u64(writer, payload.last_chunk_seq)?;
+            write_bool(writer, payload.alternate_screen_active)?;
+            write_bool(writer, payload.application_cursor_keys)?;
+            write_bool(writer, payload.cursor_visible)?;
         }
         ControlPlanePayload::OpenTargetOk(payload) => {
             write_u8(writer, 3)?;
@@ -315,6 +318,9 @@ fn read_payload(reader: &mut impl Read) -> Result<ControlPlanePayload, RemoteTra
             session_id: read_string(reader)?,
             target_id: read_string(reader)?,
             last_chunk_seq: read_u64(reader)?,
+            alternate_screen_active: read_bool(reader)?,
+            application_cursor_keys: read_bool(reader)?,
+            cursor_visible: read_bool(reader)?,
         }),
         3 => ControlPlanePayload::OpenTargetOk(OpenTargetOkPayload {
             session_id: read_string(reader)?,
@@ -591,6 +597,20 @@ fn read_u32(reader: &mut impl Read) -> Result<u32, RemoteTransportCodecError> {
     let mut bytes = [0u8; 4];
     reader.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn write_bool(writer: &mut impl Write, value: bool) -> Result<(), RemoteTransportCodecError> {
+    write_u8(writer, if value { 1 } else { 0 })
+}
+
+fn read_bool(reader: &mut impl Read) -> Result<bool, RemoteTransportCodecError> {
+    match read_u8(reader)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(RemoteTransportCodecError::new(format!(
+            "invalid bool tag `{other}`"
+        ))),
+    }
 }
 
 fn write_u8(writer: &mut impl Write, value: u8) -> Result<(), RemoteTransportCodecError> {

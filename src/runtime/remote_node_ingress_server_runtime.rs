@@ -109,11 +109,8 @@ impl RemoteNodeIngressServerRuntime {
                 error,
             )
         })?;
-        spawn_waitagent_sidecar(
-            &current_executable,
-            remote_node_ingress_owner_args(network),
-        )
-        .map_err(remote_node_ingress_error)?;
+        spawn_waitagent_sidecar(&current_executable, remote_node_ingress_owner_args(network))
+            .map_err(remote_node_ingress_error)?;
         for _ in 0..REMOTE_NODE_INGRESS_OWNER_READY_RETRIES {
             if remote_node_ingress_owner_available(&socket_path) {
                 return Ok(());
@@ -135,7 +132,12 @@ impl RemoteNodeIngressServerRuntime {
             .map_err(remote_node_ingress_error)?;
         let publication_runtime = self.publication_runtime.clone();
         let worker = thread::spawn(move || {
-            let _ = run_node_ingress_server_loop(publication_runtime, transport_rx, internal_rx, internal_tx);
+            let _ = run_node_ingress_server_loop(
+                publication_runtime,
+                transport_rx,
+                internal_rx,
+                internal_tx,
+            );
         });
         Ok(RemoteNodeIngressServerGuard {
             transport_guard: Some(transport_guard),
@@ -182,7 +184,9 @@ fn drain_owner_ping(listener: &std::os::unix::net::UnixListener) -> io::Result<(
 fn any_live_workspace_exists(
     publication_runtime: &RemoteTargetPublicationRuntime,
 ) -> Result<bool, LifecycleError> {
-    Ok(!publication_runtime.live_workspace_socket_names()?.is_empty())
+    Ok(!publication_runtime
+        .live_workspace_socket_names()?
+        .is_empty())
 }
 
 impl Drop for RemoteNodeIngressServerGuard {
@@ -271,17 +275,13 @@ fn route_transport_envelope(
         Some(Body::TargetPublished(payload)) => {
             let mapped = map_target_published_envelope(node_id, &envelope, payload)
                 .map_err(remote_node_ingress_error)?;
-            publication_runtime.apply_discovered_remote_session_envelope_on_live_workspaces(
-                node_id,
-                mapped,
-            )
+            publication_runtime
+                .apply_discovered_remote_session_envelope_on_live_workspaces(node_id, mapped)
         }
         Some(Body::TargetExited(payload)) => {
             let mapped = map_target_exited_envelope(node_id, &envelope, payload);
-            publication_runtime.apply_discovered_remote_session_envelope_on_live_workspaces(
-                node_id,
-                mapped,
-            )
+            publication_runtime
+                .apply_discovered_remote_session_envelope_on_live_workspaces(node_id, mapped)
         }
         Some(Body::TargetOutput(payload)) => {
             let Some(session) = session else {
@@ -345,6 +345,9 @@ fn route_transport_envelope(
                         session_id,
                         target_id,
                         payload.last_chunk_seq,
+                        payload.alternate_screen_active,
+                        payload.application_cursor_keys,
+                        payload.cursor_visible,
                     )
                 },
             )
@@ -775,33 +778,43 @@ mod tests {
     #[test]
     fn extracts_target_component_for_authority_socket_file() {
         let component = extract_target_component(
-            "waitagent-remote-wa-1-workspace-remote-peer_peer-a_target-1.sock",
+            "waitagent-remote-65fb3bc8828a0a50-b1df888881737297-d8273c888e3c986c.sock",
             "peer-a",
         );
 
-        assert_eq!(component.as_deref(), Some("remote-peer_peer-a_target-1"));
+        assert_eq!(component.as_deref(), Some("d8273c888e3c986c"));
     }
 
     #[test]
     fn extracts_target_component_for_scoped_remote_main_slot_socket_file() {
         let component = extract_target_component(
-            "waitagent-remote-wa-1-workspace-1-remote-peer_peer-a_target-1.sock",
+            "waitagent-remote-b27520f164626822-b1df888881737297-d8273c888e3c986c.sock",
             "peer-a",
         );
 
-        assert_eq!(component.as_deref(), Some("remote-peer_peer-a_target-1"));
+        assert_eq!(component.as_deref(), Some("d8273c888e3c986c"));
     }
 
     #[test]
     fn authority_socket_discovery_filters_to_authority() {
+        // Clean up any stray files from other tests that use the same authority hash
+        for entry in fs::read_dir(std::env::temp_dir()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains("-b1df888881737297-") || name.contains("-b1df89888173744a-") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+
         let matching_a =
-            temp_dir_path("waitagent-remote-wa-a-workspace-remote-peer_peer-a_target-1");
+            temp_dir_path("waitagent-remote-b1ec3ae6b7a67e00-b1df888881737297-d8273c888e3c986c");
         let matching_b =
-            temp_dir_path("waitagent-remote-wa-b-server-console-remote-peer_peer-a_target-2");
+            temp_dir_path("waitagent-remote-44df01ed9b438425-b1df888881737297-d8273f888e3c9d85");
         let matching_scoped =
-            temp_dir_path("waitagent-remote-wa-c-workspace-1-remote-peer_peer-a_target-3");
+            temp_dir_path("waitagent-remote-926d755099191094-b1df888881737297-d8273e888e3c9bd2");
         let different_authority =
-            temp_dir_path("waitagent-remote-wa-c-workspace-remote-peer_peer-b_target-1");
+            temp_dir_path("waitagent-remote-ebb26774420f3fb2-b1df89888173744a-0082fb09e9ea2a17");
         fs::write(&matching_a, b"").expect("matching file should write");
         fs::write(&matching_b, b"").expect("second matching file should write");
         fs::write(&matching_scoped, b"").expect("scoped matching file should write");
@@ -814,9 +827,9 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                matching_a.clone(),
                 matching_b.clone(),
-                matching_scoped.clone()
+                matching_scoped.clone(),
+                matching_a.clone()
             ]
         );
 
@@ -841,7 +854,7 @@ mod tests {
     fn ingress_server_bridges_bootstrap_and_output_into_live_authority_socket() {
         let node_id = "peer-a";
         let socket_path =
-            temp_dir_path("waitagent-remote-wa-test-workspace-remote-peer_peer-a_shell-1");
+            temp_dir_path("waitagent-remote-39cc9903ed327149-b1df888881737297-19fb7615081f4059");
         let socket_path_for_accept = socket_path.clone();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path)
             .expect("authority socket should bind");
@@ -868,7 +881,7 @@ mod tests {
             bridges: std::collections::HashMap::from([(
                 socket_path.clone(),
                 ActiveAuthoritySocketBridge {
-                    target_component: "remote-peer_peer-a_shell-1".to_string(),
+                    target_component: "19fb7615081f4059".to_string(),
                     transport: transport.clone(),
                 },
             )]),
@@ -999,6 +1012,9 @@ mod tests {
                 target_id: "remote-peer:peer-a:shell-1".to_string(),
                 session_id: "shell-1".to_string(),
                 last_chunk_seq: 1,
+                alternate_screen_active: false,
+                application_cursor_keys: false,
+                cursor_visible: true,
             })),
         }
     }

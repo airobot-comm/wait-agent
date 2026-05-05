@@ -333,6 +333,9 @@ impl RemoteControlPlaneService {
         &mut self,
         target: &ManagedSessionRecord,
         last_chunk_seq: u64,
+        alternate_screen_active: bool,
+        application_cursor_keys: bool,
+        cursor_visible: bool,
     ) -> Result<RoutedControlPlaneMessage, RemoteControlPlaneError> {
         validate_remote_target(target)?;
         let session_id = target.address.session_id().to_string();
@@ -354,6 +357,9 @@ impl RemoteControlPlaneService {
                     session_id,
                     target_id: target.address.id().as_str().to_string(),
                     last_chunk_seq,
+                    alternate_screen_active,
+                    application_cursor_keys,
+                    cursor_visible,
                 }),
             ),
         })

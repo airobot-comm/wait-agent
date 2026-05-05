@@ -650,7 +650,9 @@ fn should_overlay_active_target_runtime(session: &ManagedSessionRecord) -> bool 
         None | Some("bash" | "zsh" | "fish" | "sh")
     ) && matches!(
         session.task_state,
-        ManagedSessionTaskState::Unknown | ManagedSessionTaskState::Running
+        ManagedSessionTaskState::Unknown
+            | ManagedSessionTaskState::Running
+            | ManagedSessionTaskState::Input
     )
 }
 

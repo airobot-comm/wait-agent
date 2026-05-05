@@ -185,6 +185,7 @@ impl RemoteRuntimeOwnerRuntime {
         )
     }
 
+    #[cfg(test)]
     pub fn snapshot(
         &self,
         socket_name: &str,

@@ -8,6 +8,7 @@ pub trait LocalRuntimeEventPublisher {
 
 pub trait LocalRuntimeEventSubscriber {
     fn subscribe(&mut self) -> (SubscriberId, Receiver<EventEnvelope<LocalRuntimeEvent>>);
+    #[cfg(test)]
     fn unsubscribe(&mut self, subscriber_id: SubscriberId) -> bool;
 }
 
@@ -38,6 +39,7 @@ impl LocalRuntimeEventSubscriber for LocalRuntimeEventBus {
         self.inner.subscribe()
     }
 
+    #[cfg(test)]
     fn unsubscribe(&mut self, subscriber_id: SubscriberId) -> bool {
         self.inner.unsubscribe(subscriber_id)
     }

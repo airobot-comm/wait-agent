@@ -24,6 +24,7 @@ where
     G: TmuxChromeGateway + Clone,
     G::Error: ToString,
 {
+    #[cfg(test)]
     pub fn new(gateway: G) -> Self {
         Self {
             target_registry: TargetRegistryService::new(gateway.clone()),
@@ -41,6 +42,7 @@ where
     G::Error: ToString,
     R::Error: ToString,
 {
+    #[cfg(test)]
     pub fn new_with_target_registry(gateway: G, target_registry: TargetRegistryService<R>) -> Self {
         Self::new_with_target_registry_and_network(
             gateway,

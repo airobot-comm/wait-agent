@@ -94,6 +94,7 @@ where
 }
 
 impl RemoteNodeIngressRuntime<GrpcRemoteNodeIngressSource> {
+    #[cfg(test)]
     pub fn with_grpc_source(bind_addr: SocketAddr) -> Self {
         Self::new(GrpcRemoteNodeIngressSource::new(bind_addr))
     }
@@ -146,6 +147,7 @@ impl RemoteNodeIngressSource for AuthoritySocketRemoteNodeIngressSource {
 }
 
 impl GrpcRemoteNodeIngressSource {
+    #[cfg(test)]
     pub fn new(bind_addr: SocketAddr) -> Self {
         Self {
             bind_addr,
@@ -587,6 +589,9 @@ fn map_mirror_bootstrap_complete_envelope(
                 .unwrap_or_else(|| payload.target_id.clone()),
             target_id: payload.target_id.clone(),
             last_chunk_seq: payload.last_chunk_seq,
+            alternate_screen_active: payload.alternate_screen_active,
+            application_cursor_keys: payload.application_cursor_keys,
+            cursor_visible: payload.cursor_visible,
         }),
     })
 }
@@ -1181,6 +1186,9 @@ mod tests {
                 target_id: "remote-peer:peer-a:shell-1".to_string(),
                 session_id: "shell-1".to_string(),
                 last_chunk_seq: 1,
+                alternate_screen_active: false,
+                application_cursor_keys: false,
+                cursor_visible: true,
             })),
         }
     }

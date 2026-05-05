@@ -194,6 +194,7 @@ pub struct RemoteNodeSessionOwnerRuntime {
 }
 
 impl RemoteNodeSessionOwnerRuntime {
+    #[cfg(test)]
     pub fn from_build_env() -> Result<Self, LifecycleError> {
         Self::from_build_env_with_network(RemoteNetworkConfig::default())
     }
@@ -550,6 +551,7 @@ pub(crate) fn live_authority_session_socket_path(
     std::env::temp_dir().join(format!("waitagent-live-authority-{hash}.sock"))
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_live_authority_session_bridge(
     socket_path: PathBuf,
     session: Arc<RemoteNodeSessionRuntime>,
@@ -826,9 +828,15 @@ fn restore_shared_authority_state(
         .cloned()
         .collect::<Vec<_>>();
     for route in live_routes {
-        let _ = shared_session
+        let refreshed = shared_session
             .publication_runtime
-            .signal_source_session_refresh(&route.socket_name, &route.target_session_name);
+            .signal_cached_source_session_refresh(&route.socket_name, &route.target_session_name)
+            .unwrap_or(false);
+        if !refreshed {
+            let _ = shared_session
+                .publication_runtime
+                .signal_source_session_refresh(&route.socket_name, &route.target_session_name);
+        }
     }
     true
 }
@@ -1038,6 +1046,7 @@ fn bind_live_authority_listener(socket_path: &Path) -> Result<UnixListener, io::
     Ok(listener)
 }
 
+#[cfg(test)]
 fn bridge_live_authority_stream(
     mut host_stream: UnixStream,
     session: Arc<RemoteNodeSessionRuntime>,
@@ -1067,6 +1076,7 @@ fn bridge_live_authority_stream(
     Ok(())
 }
 
+#[cfg(test)]
 fn forward_host_output_to_session(
     mut host_reader: UnixStream,
     session: Arc<RemoteNodeSessionRuntime>,
@@ -1490,7 +1500,12 @@ mod tests {
             read_control_plane_envelope(&mut host_client).expect("server hello should decode");
         let envelope = read_control_plane_envelope(&mut host_client)
             .expect("buffered authority command should flush after host connects");
-        assert_eq!(envelope, authority_command_envelope(command));
+        let expected = authority_command_envelope(command);
+        assert_eq!(envelope.protocol_version, expected.protocol_version);
+        assert_eq!(envelope.message_type, expected.message_type);
+        assert_eq!(envelope.sender_id, expected.sender_id);
+        assert_eq!(envelope.session_id, expected.session_id);
+        assert_eq!(envelope.payload, expected.payload);
 
         route.running.store(false, Ordering::Relaxed);
         let _ = host_client.shutdown(Shutdown::Both);

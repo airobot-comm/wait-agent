@@ -31,6 +31,7 @@ pub struct RemoteServerConsoleRuntime {
 }
 
 impl RemoteServerConsoleRuntime {
+    #[cfg(test)]
     pub fn from_build_env() -> Result<Self, LifecycleError> {
         Self::from_build_env_with_network(RemoteNetworkConfig::default())
     }

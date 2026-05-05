@@ -590,6 +590,29 @@ impl RemoteTargetPublicationRuntime {
         )
     }
 
+    pub fn signal_cached_source_session_refresh(
+        &self,
+        socket_name: &str,
+        session_name: &str,
+    ) -> Result<bool, LifecycleError> {
+        let records = self
+            .store
+            .list_records_for_source_binding(socket_name, session_name)
+            .map_err(remote_target_publication_error)?;
+        if records.is_empty() {
+            return Ok(false);
+        }
+        for record in records {
+            signal_publication_target_published(
+                socket_name,
+                record.target.address.authority_id(),
+                &record.target,
+                Some(session_name),
+            )?;
+        }
+        Ok(true)
+    }
+
     pub fn run_socket_lifecycle_hook(
         &self,
         command: SocketLifecycleHookCommand,

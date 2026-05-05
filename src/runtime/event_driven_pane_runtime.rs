@@ -40,6 +40,7 @@ pub struct EventDrivenPaneRuntime {
 }
 
 impl EventDrivenPaneRuntime {
+    #[cfg(test)]
     pub fn from_build_env() -> Result<Self, LifecycleError> {
         Self::from_build_env_with_network(RemoteNetworkConfig::default())
     }

@@ -91,6 +91,7 @@ impl ManagedSessionAddress {
         format!("{}:{}", self.authority_id, self.session_id)
     }
 
+    #[cfg(test)]
     pub fn display_location(&self) -> &str {
         match self.transport {
             SessionTransport::LocalTmux => "local",

@@ -193,6 +193,9 @@ impl RemoteAuthorityTransportRuntime {
         session_id: &str,
         target_id: &str,
         last_chunk_seq: u64,
+        alternate_screen_active: bool,
+        application_cursor_keys: bool,
+        cursor_visible: bool,
     ) -> Result<(), RemoteAuthorityTransportError> {
         self.send_payload(
             session_id,
@@ -201,6 +204,9 @@ impl RemoteAuthorityTransportRuntime {
                 session_id: session_id.to_string(),
                 target_id: target_id.to_string(),
                 last_chunk_seq,
+                alternate_screen_active,
+                application_cursor_keys,
+                cursor_visible,
             }),
         )
     }

@@ -169,6 +169,7 @@ impl RemoteNodeSessionRuntime {
         )
     }
 
+    #[cfg(test)]
     pub fn send_open_mirror_request(
         &self,
         session_id: &str,
@@ -192,6 +193,7 @@ impl RemoteNodeSessionRuntime {
         )
     }
 
+    #[cfg(test)]
     pub fn send_close_mirror_request(
         &self,
         session_id: &str,
@@ -702,6 +704,9 @@ pub(crate) fn map_outbound_grpc_envelope(
                 target_id: payload.target_id.clone(),
                 session_id: payload.session_id.clone(),
                 last_chunk_seq: payload.last_chunk_seq,
+                alternate_screen_active: payload.alternate_screen_active,
+                application_cursor_keys: payload.application_cursor_keys,
+                cursor_visible: payload.cursor_visible,
             }))
         }
         (NodeSessionChannel::Publication, ControlPlanePayload::TargetPublished(payload)) => {
@@ -1231,6 +1236,9 @@ mod tests {
                     session_id: "shell-1".to_string(),
                     target_id: "remote-peer:peer-a:shell-1".to_string(),
                     last_chunk_seq: 1,
+                    alternate_screen_active: false,
+                    application_cursor_keys: false,
+                    cursor_visible: true,
                 }),
             )
             .expect("mirror bootstrap complete should send through grpc node session");
@@ -1243,10 +1251,16 @@ mod tests {
                     session_id,
                     target_id,
                     last_chunk_seq,
+                    alternate_screen_active,
+                    application_cursor_keys,
+                    cursor_visible,
                 }) => {
                     assert_eq!(session_id, "shell-1");
                     assert_eq!(target_id, "remote-peer:peer-a:shell-1");
                     assert_eq!(last_chunk_seq, 1);
+                    assert!(!alternate_screen_active);
+                    assert!(!application_cursor_keys);
+                    assert!(cursor_visible);
                 }
                 other => panic!("unexpected authority envelope payload: {other:?}"),
             },

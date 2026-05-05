@@ -91,9 +91,9 @@ impl EmbeddedTmuxBackend {
                     &TmuxSocketName::new(socket_name),
                     &send_literal_keys_args(pane, &literal),
                 )?,
-                TmuxInputChunk::HexByte(byte) => self.run_on_socket(
+                TmuxInputChunk::HexBytes(bytes) => self.run_on_socket(
                     &TmuxSocketName::new(socket_name),
-                    &send_hex_key_args(pane, byte),
+                    &send_hex_keys_args(pane, &bytes),
                 )?,
             };
         }
@@ -246,7 +246,7 @@ impl EmbeddedTmuxBackend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TmuxInputChunk {
     Literal(String),
-    HexByte(u8),
+    HexBytes(Vec<u8>),
 }
 
 fn split_tmux_input(bytes: &[u8]) -> Result<Vec<TmuxInputChunk>, TmuxError> {
@@ -258,8 +258,12 @@ fn split_tmux_input(bytes: &[u8]) -> Result<Vec<TmuxInputChunk>, TmuxError> {
         let byte = bytes[index];
         if is_tmux_hex_byte(byte) {
             flush_literal(&mut chunks, &mut literal);
-            chunks.push(TmuxInputChunk::HexByte(byte));
+            let start = index;
             index += 1;
+            while index < bytes.len() && bytes[index].is_ascii() {
+                index += 1;
+            }
+            chunks.push(TmuxInputChunk::HexBytes(bytes[start..index].to_vec()));
             continue;
         }
 
@@ -321,14 +325,15 @@ fn send_literal_keys_args(pane: &TmuxPaneId, literal: &str) -> Vec<String> {
     ]
 }
 
-fn send_hex_key_args(pane: &TmuxPaneId, byte: u8) -> Vec<String> {
-    vec![
+fn send_hex_keys_args(pane: &TmuxPaneId, bytes: &[u8]) -> Vec<String> {
+    let mut args = vec![
         "send-keys".to_string(),
         "-H".to_string(),
         "-t".to_string(),
         pane.as_str().to_string(),
-        format!("{byte:02x}"),
-    ]
+    ];
+    args.extend(bytes.iter().map(|byte| format!("{byte:02x}")));
+    args
 }
 
 fn resize_pane_args(pane: &TmuxPaneId, cols: usize, rows: usize) -> Vec<String> {
@@ -384,7 +389,7 @@ fn unset_session_environment_args(session_name: &str, key: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_pane_pipe_args, resize_pane_args, send_hex_key_args, send_literal_keys_args,
+        clear_pane_pipe_args, resize_pane_args, send_hex_keys_args, send_literal_keys_args,
         set_pane_pipe_args, set_session_environment_args, split_tmux_input,
         unset_session_environment_args, TmuxInputChunk,
     };
@@ -399,10 +404,7 @@ mod tests {
         let chunks = split_tmux_input(&[0x1b, b'[', b'A']).expect("escape input should split");
         assert_eq!(
             chunks,
-            vec![
-                TmuxInputChunk::HexByte(0x1b),
-                TmuxInputChunk::Literal("[A".to_string())
-            ]
+            vec![TmuxInputChunk::HexBytes(vec![0x1b, b'[', b'A'])]
         );
     }
 
@@ -413,8 +415,8 @@ mod tests {
             vec!["send-keys", "-l", "-t", "%4", "你好"]
         );
         assert_eq!(
-            send_hex_key_args(&TmuxPaneId::new("%4"), 0x1b),
-            vec!["send-keys", "-H", "-t", "%4", "1b"]
+            send_hex_keys_args(&TmuxPaneId::new("%4"), &[0x1b, b'[', b'B']),
+            vec!["send-keys", "-H", "-t", "%4", "1b", "5b", "42"]
         );
         assert_eq!(
             resize_pane_args(&TmuxPaneId::new("%4"), 120, 40),

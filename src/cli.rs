@@ -1377,6 +1377,8 @@ mod tests {
             "wa-1",
             "--target-session-name",
             "target-1",
+            "--transport-session-id",
+            "session-1",
             "--authority-id",
             "peer-a",
             "--target-id",
@@ -1389,6 +1391,7 @@ mod tests {
             Command::RemoteAuthorityTargetHost(command) => {
                 assert_eq!(command.socket_name, "wa-1");
                 assert_eq!(command.target_session_name, "target-1");
+                assert_eq!(command.transport_session_id, "session-1");
                 assert_eq!(command.authority_id, "peer-a");
                 assert_eq!(command.target_id, "remote-peer:peer-a:target-1");
                 assert_eq!(command.transport_socket_path, "/tmp/transport.sock");

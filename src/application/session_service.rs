@@ -13,6 +13,7 @@ where
         Self { gateway }
     }
 
+    #[cfg(test)]
     pub fn find_session(&self, target: &str) -> Result<Option<ManagedSessionRecord>, G::Error> {
         self.gateway.find_session(target)
     }

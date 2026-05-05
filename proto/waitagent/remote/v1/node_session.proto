@@ -186,6 +186,9 @@ message MirrorBootstrapComplete {
   string target_id = 1;
   string session_id = 2;
   uint64 last_chunk_seq = 3;
+  bool alternate_screen_active = 4;
+  bool application_cursor_keys = 5;
+  bool cursor_visible = 6;
 }
 
 message OpenTargetRequest {
