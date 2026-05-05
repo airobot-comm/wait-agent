@@ -11,5 +11,7 @@ sequence:
   - compare them against docs/execution-status-board.md and docs/agents-control-plane.md
   - add, remove, or rewrite primitives and runbooks so they match the actual workflow
   - refresh machine state references if phase or task ids changed
+post_actions:
+  - run `make ai-check` to validate completeness and consistency after any change to .agents/ files
 stop_conditions:
   - control-plane files already match the current repo and task model

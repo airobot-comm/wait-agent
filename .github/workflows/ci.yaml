@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison pkg-config libevent-dev libncurses-dev \
+            build-essential automake autoconf
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison pkg-config libevent-dev libncurses-dev \
+            build-essential automake autoconf
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: cargo build
+        run: cargo build
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison pkg-config libevent-dev libncurses-dev \
+            build-essential automake autoconf
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: cargo test
+        run: cargo test --bin waitagent -- --test-threads=1
+
+  ai-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check .agents/ control plane integrity
+        run: make ai-check

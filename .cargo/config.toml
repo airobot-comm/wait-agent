@@ -1,0 +1,2 @@
+[alias]
+ai-check = "run --manifest-path scripts/check-agents-integrity/Cargo.toml --"
