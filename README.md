@@ -1,5 +1,12 @@
 # WaitAgent
 
+[![CI](https://github.com/kikakkz/wait-agent/actions/workflows/ci.yaml/badge.svg)](https://github.com/kikakkz/wait-agent/actions/workflows/ci.yaml)
+[![Rust](https://img.shields.io/badge/rust-1.86.0-orange?logo=rust)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![tmux](https://img.shields.io/badge/tmux-vendored-1e90ff?logo=tmux)](https://github.com/tmux/tmux)
+
+> **terminal · multiplexer · workspace · agent**
+
 WaitAgent is a terminal-native interaction scheduler for multi-agent workflows.
 
 It does not try to replace agents, IDEs, or orchestration platforms. It focuses on a narrower problem:
@@ -89,3 +96,11 @@ Existing tools solve adjacent but different problems:
 - `Codex App / Cursor / Warp` solve vendor-owned multi-agent management
 
 What is still missing is a terminal-native, vendor-neutral, low-intrusion interaction layer for human-in-the-loop multi-agent CLI workflows.
+
+---
+
+## Topics
+
+`tmux` `terminal-multiplexer` `multiplexer` `workspace-manager` `terminal` `rust` `cli` `tui` `multi-agent` `ai-agents`
+
+*Add these topics on the [repo settings page](https://github.com/kikakkz/wait-agent/settings) → "Topics" for better discoverability on GitHub.*
