@@ -630,11 +630,6 @@ mod tests {
                 Call::SetTitle("%2".to_string()),
                 Call::SetPaneStyle("%2".to_string(), "fg=colour250,bg=colour234".to_string()),
                 Call::SetWidth("%2".to_string(), 32),
-                Call::SetPaneOption(
-                    "%1".to_string(),
-                    "remain-on-exit".to_string(),
-                    "on".to_string(),
-                ),
                 Call::Respawn("%3".to_string()),
                 Call::SetTitle("%3".to_string()),
                 Call::SetHeight("%3".to_string(), 1),
