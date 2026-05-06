@@ -18,6 +18,7 @@ impl SessionCatalogProjectionService {
         active_target: Option<&str>,
         sessions: Vec<ManagedSessionRecord>,
         listener_display: Option<&str>,
+        connect_endpoint: Option<&str>,
     ) -> usize
     where
         P: LocalRuntimeEventPublisher,
@@ -29,6 +30,7 @@ impl SessionCatalogProjectionService {
                 active_target: active_target.map(str::to_string),
                 sessions,
                 listener_display: listener_display.map(str::to_string),
+                connect_endpoint: connect_endpoint.map(str::to_string),
             },
         ))
     }
@@ -60,6 +62,7 @@ mod tests {
                 Some("wa-1:sess-1"),
                 vec![session("wa-1", "sess-1")],
                 Some("192.168.1.22:7474"),
+                None,
             ),
             1
         );
@@ -72,6 +75,7 @@ mod tests {
                 active_target,
                 sessions,
                 listener_display,
+                connect_endpoint: _,
             }) => {
                 assert_eq!(active_socket, "wa-1");
                 assert_eq!(active_session, "sess-1");

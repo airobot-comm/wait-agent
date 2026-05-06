@@ -76,6 +76,10 @@ fn build_footer_menu_args(
     sessions: &[ManagedSessionRecord],
 ) -> Vec<String> {
     let active = active_session(command, active_target, sessions);
+    let remote_count = sessions
+        .iter()
+        .filter(|s| s.address.transport() == &crate::domain::session_catalog::SessionTransport::RemotePeer)
+        .count();
     let mut args = vec![
         "display-menu".to_string(),
         "-c".to_string(),
@@ -88,6 +92,22 @@ fn build_footer_menu_args(
         FOOTER_MENU_TITLE.to_string(),
         "--".to_string(),
     ];
+
+    if let Some(listener) = &command.listener_display {
+        push_disabled_item(&mut args, &format!("- Listen: {listener}"));
+    }
+    if let Some(connect) = &command.connect_endpoint {
+        push_disabled_item(&mut args, &format!("- Connect: {connect}"));
+    }
+    if command.listener_display.is_some() || command.connect_endpoint.is_some() {
+        if remote_count > 0 {
+            push_disabled_item(
+                &mut args,
+                &format!("- Connected: {remote_count} remote(s)"),
+            );
+        }
+        push_separator(&mut args);
+    }
 
     if let Some(session) = active {
         push_disabled_item(
@@ -294,6 +314,8 @@ mod tests {
                 socket_name: "wa-1".to_string(),
                 session_name: "1".to_string(),
                 client_tty: "/dev/pts/7".to_string(),
+                listener_display: None,
+                connect_endpoint: None,
             },
             Path::new("/tmp/waitagent"),
             Some("wa-1:1"),
@@ -352,6 +374,8 @@ mod tests {
                 socket_name: "wa-1".to_string(),
                 session_name: "1".to_string(),
                 client_tty: "/dev/pts/7".to_string(),
+                listener_display: None,
+                connect_endpoint: None,
             },
             Path::new("/tmp/waitagent"),
             None,
@@ -360,5 +384,24 @@ mod tests {
 
         assert!(args.iter().any(|value| value == "New Session"));
         assert!(args.iter().any(|value| value == "- No Sessions"));
+    }
+
+    #[test]
+    fn footer_menu_shows_listener_and_connect_endpoints() {
+        let args = build_footer_menu_args(
+            &FooterMenuCommand {
+                socket_name: "wa-1".to_string(),
+                session_name: "1".to_string(),
+                client_tty: "/dev/pts/7".to_string(),
+                listener_display: Some("192.168.1.22:7474".to_string()),
+                connect_endpoint: Some("10.0.0.5:7474".to_string()),
+            },
+            Path::new("/tmp/waitagent"),
+            Some("wa-1:1"),
+            &[],
+        );
+
+        assert!(args.iter().any(|value| value == "- Listen: 192.168.1.22:7474"));
+        assert!(args.iter().any(|value| value == "- Connect: 10.0.0.5:7474"));
     }
 }

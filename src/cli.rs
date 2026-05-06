@@ -266,6 +266,8 @@ pub struct FooterMenuCommand {
     pub socket_name: String,
     pub session_name: String,
     pub client_tty: String,
+    pub listener_display: Option<String>,
+    pub connect_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -991,12 +993,20 @@ fn parse_footer_menu(args: Vec<String>) -> Result<FooterMenuCommand, CliError> {
     let mut socket_name = None;
     let mut session_name = None;
     let mut client_tty = None;
+    let mut listener_display = None;
+    let mut connect_endpoint = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--socket-name" => socket_name = Some(expect_value("--socket-name", &mut iter)?),
             "--session-name" => session_name = Some(expect_value("--session-name", &mut iter)?),
             "--client-tty" => client_tty = Some(expect_value("--client-tty", &mut iter)?),
+            "--listener-display" => {
+                listener_display = Some(expect_value("--listener-display", &mut iter)?)
+            }
+            "--connect-endpoint" => {
+                connect_endpoint = Some(expect_value("--connect-endpoint", &mut iter)?)
+            }
             "--help" | "-h" => {}
             _ => return Err(CliError::UnexpectedArgument(arg)),
         }
@@ -1008,6 +1018,8 @@ fn parse_footer_menu(args: Vec<String>) -> Result<FooterMenuCommand, CliError> {
         session_name: session_name
             .ok_or_else(|| CliError::MissingValue("--session-name".to_string()))?,
         client_tty: client_tty.ok_or_else(|| CliError::MissingValue("--client-tty".to_string()))?,
+        listener_display,
+        connect_endpoint,
     })
 }
 

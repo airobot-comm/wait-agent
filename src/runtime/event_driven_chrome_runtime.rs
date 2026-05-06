@@ -59,6 +59,8 @@ impl EventDrivenChromeRuntime {
                 model.active_target.as_deref(),
                 &model.sessions,
                 model.width,
+                model.listener_display.as_deref(),
+                model.connect_endpoint.as_deref(),
             );
             if self.last_footer_buffer.as_ref() != Some(&pane_buffer) {
                 self.last_footer_buffer = Some(pane_buffer.clone());
@@ -72,6 +74,8 @@ impl EventDrivenChromeRuntime {
                 model.active_target.as_deref(),
                 &model.sessions,
                 fullscreen_width,
+                model.listener_display.as_deref(),
+                model.connect_endpoint.as_deref(),
             );
             if self.last_fullscreen_footer_buffer.as_ref() != Some(&fullscreen_buffer) {
                 self.last_fullscreen_footer_buffer = Some(fullscreen_buffer.clone());
@@ -131,6 +135,7 @@ mod tests {
                 active_target: Some("wa-1:sess-1".to_string()),
                 sessions: vec![session("wa-1", "sess-1", "bash")],
                 listener_display: Some("192.168.1.22:7474".to_string()),
+                connect_endpoint: None,
             }),
             0,
         );
@@ -144,7 +149,7 @@ mod tests {
             .footer
             .as_ref()
             .map(|buffer| {
-                buffer.contains("keys: ^N new") && buffer.contains("[q] exit-page")
+                buffer.contains("keys: ^N new")
             })
             .unwrap_or(false));
         assert!(update
@@ -174,6 +179,7 @@ mod tests {
             active_target: Some("wa-1:sess-1".to_string()),
             sessions: vec![session("wa-1", "sess-1", "bash")],
             listener_display: None,
+            connect_endpoint: None,
         });
         let first = runtime.apply_event(&event, 0);
         let second = runtime.apply_event(&event, 0);
@@ -200,6 +206,7 @@ mod tests {
                 active_target: Some("wa-1:sess-1".to_string()),
                 sessions: vec![session("wa-1", "sess-1", "bash")],
                 listener_display: None,
+                connect_endpoint: None,
             }),
             0,
         );

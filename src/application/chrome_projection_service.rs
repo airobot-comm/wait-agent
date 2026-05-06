@@ -18,12 +18,14 @@ impl ChromeProjectionService {
                 active_target,
                 sessions,
                 listener_display,
+                connect_endpoint,
             }) => {
                 self.state.active_socket = active_socket.clone();
                 self.state.active_session = active_session.clone();
                 self.state.active_target = active_target.clone();
                 self.state.sessions = sessions.clone();
                 self.state.listener_display = listener_display.clone();
+                self.state.connect_endpoint = connect_endpoint.clone();
                 self.state.ensure_active_target();
                 self.ensure_selected_target();
                 self.emit_both()
@@ -134,6 +136,7 @@ impl ChromeProjectionService {
             active_target: self.state.active_target.clone(),
             sessions: self.state.sessions.clone(),
             listener_display: self.state.listener_display.clone(),
+            connect_endpoint: self.state.connect_endpoint.clone(),
             width,
             fullscreen: self.state.fullscreen,
         })
@@ -148,6 +151,7 @@ struct ChromeProjectionState {
     selected_target: Option<String>,
     sessions: Vec<ManagedSessionRecord>,
     listener_display: Option<String>,
+    connect_endpoint: Option<String>,
     sidebar_surface: ChromeSurfaceSize,
     footer_width: usize,
     fullscreen_footer_width: usize,
@@ -227,6 +231,7 @@ mod tests {
                     ManagedSessionTaskState::Input,
                 )],
                 listener_display: Some("192.168.1.22:7474".to_string()),
+                connect_endpoint: None,
             },
         ));
 
@@ -278,6 +283,7 @@ mod tests {
                     session("wa-2", "sess-2", "codex", ManagedSessionTaskState::Input),
                 ],
                 listener_display: None,
+                connect_endpoint: None,
             },
         ));
 
@@ -323,6 +329,7 @@ mod tests {
                     ManagedSessionTaskState::Input,
                 )],
                 listener_display: None,
+                connect_endpoint: None,
             },
         ));
 
@@ -361,6 +368,7 @@ mod tests {
                     session("wa-1", "sess-2", "codex", ManagedSessionTaskState::Input),
                 ],
                 listener_display: None,
+                connect_endpoint: None,
             },
         ));
 
@@ -374,6 +382,7 @@ mod tests {
                     session("wa-1", "sess-2", "codex", ManagedSessionTaskState::Input),
                 ],
                 listener_display: None,
+                connect_endpoint: None,
             },
         ));
 

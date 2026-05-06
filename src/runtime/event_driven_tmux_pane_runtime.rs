@@ -149,6 +149,7 @@ where
             active_target.as_deref(),
             visible_sessions,
             Some(self.network.advertised_listener_label().as_str()),
+            self.network.connect.as_deref(),
         ))
     }
 }

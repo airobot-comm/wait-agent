@@ -506,6 +506,8 @@ impl WorkspaceLayoutRuntime {
         let shell_command = footer_menu_shell_command(
             self.current_executable.to_string_lossy().as_ref(),
             workspace,
+            &self.network.advertised_listener_label(),
+            self.network.connect.as_deref(),
         );
         FooterMenuBindings {
             create_session_command: format!(
@@ -599,8 +601,13 @@ fn fullscreen_toggle_tmux_command(executable: &str, workspace: &TmuxWorkspaceHan
     format!("run-shell -b {}", tmux_quote_argument(&shell_command))
 }
 
-fn footer_menu_shell_command(executable: &str, workspace: &TmuxWorkspaceHandle) -> String {
-    [
+fn footer_menu_shell_command(
+    executable: &str,
+    workspace: &TmuxWorkspaceHandle,
+    listener_label: &str,
+    connect_endpoint: Option<&str>,
+) -> String {
+    let mut parts = vec![
         shell_escape(executable),
         shell_escape("__footer-menu"),
         shell_escape("--socket-name"),
@@ -609,8 +616,14 @@ fn footer_menu_shell_command(executable: &str, workspace: &TmuxWorkspaceHandle) 
         shell_escape(workspace.session_name.as_str()),
         shell_escape("--client-tty"),
         shell_escape("#{client_tty}"),
-    ]
-    .join(" ")
+        shell_escape("--listener-display"),
+        shell_escape(listener_label),
+    ];
+    if let Some(endpoint) = connect_endpoint {
+        parts.push(shell_escape("--connect-endpoint"));
+        parts.push(shell_escape(endpoint));
+    }
+    parts.join(" ")
 }
 
 fn new_target_shell_command(executable: &str, workspace: &TmuxWorkspaceHandle) -> String {
@@ -723,12 +736,33 @@ mod tests {
     fn footer_menu_shell_command_quotes_shell_arguments_but_not_tmux_layer() {
         let workspace = workspace();
 
-        let command = footer_menu_shell_command("/tmp/wait agent", &workspace);
+        let command = footer_menu_shell_command(
+            "/tmp/wait agent",
+            &workspace,
+            "192.168.1.22:7474",
+            None,
+        );
 
         assert_eq!(
             command,
-            "'/tmp/wait agent' '__footer-menu' '--socket-name' 'wa-1' '--session-name' 'session-1' '--client-tty' '#{client_tty}'"
+            "'/tmp/wait agent' '__footer-menu' '--socket-name' 'wa-1' '--session-name' 'session-1' '--client-tty' '#{client_tty}' '--listener-display' '192.168.1.22:7474'"
         );
+    }
+
+    #[test]
+    fn footer_menu_shell_command_includes_connect_endpoint_when_provided() {
+        let workspace = workspace();
+
+        let command = footer_menu_shell_command(
+            "/tmp/waitagent",
+            &workspace,
+            "192.168.1.22:7474",
+            Some("10.0.0.5:7474"),
+        );
+
+        assert!(command.contains("'--connect-endpoint'"));
+        assert!(command.contains("'10.0.0.5:7474'"));
+        assert!(command.contains("'--listener-display'"));
     }
 
     #[test]

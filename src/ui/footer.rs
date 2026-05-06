@@ -19,6 +19,8 @@ impl FooterUi {
                 model.active_target.as_deref(),
                 &model.sessions,
                 model.width,
+                model.listener_display.as_deref(),
+                model.connect_endpoint.as_deref(),
             )
         } else {
             Self::render(
@@ -27,6 +29,8 @@ impl FooterUi {
                 model.active_target.as_deref(),
                 &model.sessions,
                 model.width,
+                model.listener_display.as_deref(),
+                model.connect_endpoint.as_deref(),
             )
         }
     }
@@ -37,6 +41,8 @@ impl FooterUi {
         active_target: Option<&str>,
         sessions: &[ManagedSessionRecord],
         width: usize,
+        listener_display: Option<&str>,
+        connect_endpoint: Option<&str>,
     ) -> String {
         render_footer(
             active_socket,
@@ -45,6 +51,8 @@ impl FooterUi {
             sessions,
             width,
             FooterProjection::Pane,
+            listener_display,
+            connect_endpoint,
         )
     }
 
@@ -54,6 +62,8 @@ impl FooterUi {
         active_target: Option<&str>,
         sessions: &[ManagedSessionRecord],
         width: usize,
+        listener_display: Option<&str>,
+        connect_endpoint: Option<&str>,
     ) -> String {
         render_footer(
             active_socket,
@@ -62,6 +72,8 @@ impl FooterUi {
             sessions,
             width,
             FooterProjection::FullscreenStatus,
+            listener_display,
+            connect_endpoint,
         )
     }
 }
@@ -73,10 +85,12 @@ fn render_footer(
     sessions: &[ManagedSessionRecord],
     width: usize,
     projection: FooterProjection,
+    listener_display: Option<&str>,
+    connect_endpoint: Option<&str>,
 ) -> String {
     let width = width.max(1);
     let active = active_session_record(active_socket, active_session, active_target, sessions);
-    let left = left_status_text(projection);
+    let left = left_status_text(projection, listener_display, connect_endpoint);
     let right = active
         .and_then(|session| {
             session
@@ -113,15 +127,30 @@ fn active_session_record<'a>(
         })
 }
 
-fn left_status_text(projection: FooterProjection) -> String {
-    match projection {
-        FooterProjection::Pane => {
-            "keys: ^N new  ^O fullscreen  C-b s menu  C-b [` page  [q] exit-page".to_string()
-        }
+fn left_status_text(
+    projection: FooterProjection,
+    listener_display: Option<&str>,
+    connect_endpoint: Option<&str>,
+) -> String {
+    let base = match projection {
+        FooterProjection::Pane => "keys: ^N new  ^O fullscreen  C-b s menu".to_string(),
         FooterProjection::FullscreenStatus => {
-            "keys: [Ctrl-o] fullscreen off  [Ctrl-n] new  [C-b `] page  [PgUp/PgDn] scroll  [Up/Down] line  [q] exit-page".to_string()
+            "keys: [Ctrl-o] fullscreen off  [Ctrl-n] new  C-b [ page  [PgUp/PgDn] scroll  [Up/Down] line  [q] exit-page".to_string()
         }
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(listener) = listener_display {
+        parts.push("Listen:");
+        parts.push(listener);
     }
+    if let Some(connect) = connect_endpoint {
+        parts.push("Connect:");
+        parts.push(connect);
+    }
+    if parts.is_empty() {
+        return base;
+    }
+    format!("{base}  |  {}", parts.join("  "))
 }
 
 fn join_left_right(left: &str, right: &str, width: usize) -> String {
@@ -188,13 +217,13 @@ mod tests {
                 task_state: ManagedSessionTaskState::Input,
             }],
             96,
+            None,
+            None,
         );
 
         assert!(output.contains("keys: ^N new"));
         assert!(output.contains("^O fullscreen"));
         assert!(output.contains("C-b s menu"));
-        assert!(output.contains("C-b [` page"));
-        assert!(output.contains("[q] exit-page"));
         assert!(!output.contains("listen:"));
         assert!(!output.contains("total:"));
         assert!(!output.contains("R:"));
@@ -240,11 +269,13 @@ mod tests {
                 },
             ],
             180,
+            None,
+            None,
         );
 
         assert!(output.contains("[Ctrl-o] fullscreen off"));
         assert!(output.contains("[Ctrl-n] new"));
-        assert!(output.contains("[C-b `] page"));
+        assert!(output.contains("C-b [ page"));
         assert!(output.contains("[PgUp/PgDn] scroll"));
         assert!(output.contains("[Up/Down] line"));
         assert!(output.contains("[q] exit-page"));
