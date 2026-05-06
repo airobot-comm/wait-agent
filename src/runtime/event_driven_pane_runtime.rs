@@ -100,21 +100,25 @@ impl EventDrivenPaneRuntime {
                 }
                 PaneEvent::Resize => {
                     redraw_sidebar(
-                        chrome
-                            .refresh_sidebar_for_pane(&command, pane_target.as_deref().unwrap_or(""))?,
+                        chrome.refresh_sidebar_for_pane(
+                            &command,
+                            pane_target.as_deref().unwrap_or(""),
+                        )?,
                         &mut last_buffer,
                     )?;
                 }
                 PaneEvent::Refresh => loop {
                     redraw_sidebar(
-                        chrome
-                            .refresh_sidebar_for_pane(&command, pane_target.as_deref().unwrap_or(""))?,
+                        chrome.refresh_sidebar_for_pane(
+                            &command,
+                            pane_target.as_deref().unwrap_or(""),
+                        )?,
                         &mut last_buffer,
                     )?;
                     if pending_refreshes.swap(0, Ordering::AcqRel) <= 1 {
                         break;
                     }
-                }
+                },
             }
         }
     }
