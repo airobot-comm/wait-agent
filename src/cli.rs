@@ -1201,9 +1201,9 @@ fn help_text() -> String {
         "Usage:",
         "  waitagent [--port <port>] [--connect <host:port>]",
         "  waitagent [--port <port>] [--connect <host:port>] attach [<target>]",
-        "  waitagent [--port <port>] [--connect <host:port>] ls",
-        "  waitagent [--port <port>] [--connect <host:port>] detach [<target>]",
-        "  waitagent [--port <port>] [--connect <host:port>] stop [<target>]",
+        "  waitagent ls",
+        "  waitagent detach [<target>]",
+        "  waitagent stop [<target>]",
     ]
     .join("\n")
 }

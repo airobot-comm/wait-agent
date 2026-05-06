@@ -334,7 +334,13 @@ impl ManagedSessionRecord {
 
     fn display_scope(&self) -> String {
         match self.address.transport() {
-            SessionTransport::LocalTmux => "local".to_string(),
+            SessionTransport::LocalTmux => {
+                if self.is_workspace_chrome() {
+                    "local [main]".to_string()
+                } else {
+                    "local".to_string()
+                }
+            }
             SessionTransport::RemotePeer => format!(
                 "{}:{}",
                 self.address.display_authority_id(),

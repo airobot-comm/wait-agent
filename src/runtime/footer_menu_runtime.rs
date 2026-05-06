@@ -340,7 +340,7 @@ mod tests {
         assert!(args.contains(&"--".to_string()));
         assert!(args
             .iter()
-            .any(|value| value == "- Current: codex@local [I]"));
+            .any(|value| value == "- Current: codex@local [main] [I]"));
         assert!(args.iter().any(|value| value == "- Cwd: /tmp/demo"));
         assert!(args.iter().any(|value| value == "- Commands"));
         assert!(args.iter().any(|value| value == "- Sessions"));
@@ -348,7 +348,7 @@ mod tests {
         assert!(args.iter().any(|value| value == "Quit Client"));
         assert!(args
             .iter()
-            .any(|value| value == "* codex@local [I] cwd: /tmp/demo"));
+            .any(|value| value == "* codex@local [main] [I] cwd: /tmp/demo"));
         assert!(args.iter().any(|value| {
             value.contains("run-shell -b ")
                 && value.contains("'__activate-target'")

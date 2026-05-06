@@ -15,8 +15,9 @@ use std::io::{self, Read, Write};
 use std::os::raw::{c_int, c_void};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread;
 
 const SIGWINCH: c_int = 28;
@@ -62,7 +63,7 @@ impl EventDrivenPaneRuntime {
         let _cursor_guard = PaneCursorGuard::hide().map_err(|error| {
             LifecycleError::Io("failed to hide sidebar cursor".to_string(), error)
         })?;
-        let event_rx =
+        let (event_rx, pending_refreshes) =
             spawn_pane_event_stream(self.backend.clone(), &command, true).map_err(|error| {
                 LifecycleError::Io("failed to install pane event watchers".to_string(), error)
             })?;
@@ -97,18 +98,30 @@ impl EventDrivenPaneRuntime {
                         self.apply_sidebar_activation(&command, activation)?;
                     }
                 }
-                PaneEvent::Resize | PaneEvent::Refresh => redraw_sidebar(
-                    chrome
-                        .refresh_sidebar_for_pane(&command, pane_target.as_deref().unwrap_or(""))?,
-                    &mut last_buffer,
-                )?,
+                PaneEvent::Resize => {
+                    redraw_sidebar(
+                        chrome
+                            .refresh_sidebar_for_pane(&command, pane_target.as_deref().unwrap_or(""))?,
+                        &mut last_buffer,
+                    )?;
+                }
+                PaneEvent::Refresh => loop {
+                    redraw_sidebar(
+                        chrome
+                            .refresh_sidebar_for_pane(&command, pane_target.as_deref().unwrap_or(""))?,
+                        &mut last_buffer,
+                    )?;
+                    if pending_refreshes.swap(0, Ordering::AcqRel) <= 1 {
+                        break;
+                    }
+                }
             }
         }
     }
 
     pub fn run_footer(&self, command: UiPaneCommand) -> Result<(), LifecycleError> {
         let pane_target = current_tmux_pane_target();
-        let event_rx =
+        let (event_rx, pending_refreshes) =
             spawn_pane_event_stream(self.backend.clone(), &command, false).map_err(|error| {
                 LifecycleError::Io("failed to install pane event watchers".to_string(), error)
             })?;
@@ -134,10 +147,21 @@ impl EventDrivenPaneRuntime {
                 Ok(event) => event,
                 Err(_) => return Ok(()),
             };
-            if matches!(event, PaneEvent::Resize | PaneEvent::Refresh) {
-                let update = chrome
-                    .refresh_footer_for_pane(&command, pane_target.as_deref().unwrap_or(""))?;
-                apply_footer_update(&self.backend, &workspace, update, &mut last_buffer)?;
+            match event {
+                PaneEvent::Resize => {
+                    let update = chrome
+                        .refresh_footer_for_pane(&command, pane_target.as_deref().unwrap_or(""))?;
+                    apply_footer_update(&self.backend, &workspace, update, &mut last_buffer)?;
+                }
+                PaneEvent::Refresh => loop {
+                    let update = chrome
+                        .refresh_footer_for_pane(&command, pane_target.as_deref().unwrap_or(""))?;
+                    apply_footer_update(&self.backend, &workspace, update, &mut last_buffer)?;
+                    if pending_refreshes.swap(0, Ordering::AcqRel) <= 1 {
+                        break;
+                    }
+                },
+                PaneEvent::Input(_) => {}
             }
         }
     }
@@ -247,7 +271,7 @@ fn redraw_if_changed(buffer: String, last_buffer: &mut String) -> Result<(), Lif
 }
 
 fn write_buffer(stdout: &mut impl Write, buffer: &str) -> io::Result<()> {
-    write!(stdout, "\x1b[H\x1b[2J")?;
+    write!(stdout, "\x1b[H\x1b[J")?;
     for (index, line) in buffer.split('\n').enumerate() {
         let row = index + 1;
         write!(stdout, "\x1b[{row};1H{line}\x1b[K")?;
@@ -320,8 +344,9 @@ fn spawn_pane_event_stream(
     backend: EmbeddedTmuxBackend,
     command: &UiPaneCommand,
     include_input: bool,
-) -> io::Result<Receiver<PaneEvent>> {
+) -> io::Result<(Receiver<PaneEvent>, Arc<AtomicUsize>)> {
     let (tx, rx) = mpsc::channel();
+    let pending_refreshes = Arc::new(AtomicUsize::new(0));
     if include_input {
         spawn_input_thread(tx.clone());
     }
@@ -330,13 +355,14 @@ fn spawn_pane_event_stream(
         backend,
         command.socket_name.clone(),
         command.session_name.clone(),
+        Arc::clone(&pending_refreshes),
         tx.clone(),
     );
     thread::spawn(move || {
         let _keep_resize_watcher_alive = _resize_watcher;
         thread::park();
     });
-    Ok(rx)
+    Ok((rx, pending_refreshes))
 }
 
 fn spawn_input_thread(tx: mpsc::Sender<PaneEvent>) {
@@ -367,6 +393,7 @@ fn spawn_chrome_refresh_watcher(
     backend: EmbeddedTmuxBackend,
     socket_name: String,
     session_name: String,
+    pending_refreshes: Arc<AtomicUsize>,
     tx: mpsc::Sender<PaneEvent>,
 ) {
     thread::spawn(move || loop {
@@ -376,7 +403,9 @@ fn spawn_chrome_refresh_watcher(
         {
             break;
         }
-        if tx.send(PaneEvent::Refresh).is_err() {
+        if pending_refreshes.fetch_add(1, Ordering::AcqRel) == 0
+            && tx.send(PaneEvent::Refresh).is_err()
+        {
             break;
         }
     });
@@ -504,7 +533,7 @@ mod tests {
         write_buffer(&mut output, "keys: ^W cmd").expect("footer render should write");
 
         let rendered = String::from_utf8(output).expect("writer should emit utf8 escape payload");
-        assert!(rendered.starts_with("\x1b[H\x1b[2J"));
+        assert!(rendered.starts_with("\x1b[H\x1b[J"));
         assert!(rendered.contains("\x1b[1;1Hkeys: ^W cmd\x1b[K"));
     }
 
@@ -515,7 +544,7 @@ mod tests {
         write_buffer(&mut output, "line1\nline2").expect("sidebar render should write");
 
         let rendered = String::from_utf8(output).expect("writer should emit utf8 escape payload");
-        assert!(rendered.starts_with("\x1b[H\x1b[2J"));
+        assert!(rendered.starts_with("\x1b[H\x1b[J"));
         assert!(rendered.contains("\x1b[1;1Hline1\x1b[K"));
         assert!(rendered.contains("\x1b[2;1Hline2\x1b[K"));
     }
