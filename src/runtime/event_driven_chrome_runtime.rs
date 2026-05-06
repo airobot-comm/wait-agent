@@ -58,7 +58,6 @@ impl EventDrivenChromeRuntime {
                 &model.active_session,
                 model.active_target.as_deref(),
                 &model.sessions,
-                model.listener_display.as_deref(),
                 model.width,
             );
             if self.last_footer_buffer.as_ref() != Some(&pane_buffer) {
@@ -72,7 +71,6 @@ impl EventDrivenChromeRuntime {
                 &model.active_session,
                 model.active_target.as_deref(),
                 &model.sessions,
-                model.listener_display.as_deref(),
                 fullscreen_width,
             );
             if self.last_fullscreen_footer_buffer.as_ref() != Some(&fullscreen_buffer) {
@@ -146,14 +144,14 @@ mod tests {
             .footer
             .as_ref()
             .map(|buffer| {
-                buffer.contains("keys: ^N new") && buffer.contains("listen: 192.168.1.22:7474")
+                buffer.contains("keys: ^N new") && buffer.contains("[q] exit-page")
             })
             .unwrap_or(false));
         assert!(update
             .fullscreen_status
             .as_ref()
             .map(|buffer| {
-                buffer.contains("[Ctrl-n] new") && buffer.contains("listen: 192.168.1.22:7474")
+                buffer.contains("[Ctrl-n] new") && buffer.contains("[q] exit-page")
             })
             .unwrap_or(false));
     }

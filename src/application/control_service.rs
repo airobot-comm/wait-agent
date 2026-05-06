@@ -10,7 +10,8 @@ const SIDEBAR_HIDE_KEY: &str = "h";
 const CREATE_SESSION_KEY: &str = "C-n";
 const CREATE_SESSION_PREFIX_KEY: &str = "c";
 const FOOTER_SESSIONS_KEY: &str = "s";
-const FOOTER_SWITCH_KEY: &str = "Enter";
+// Enter intentionally unbound as no-prefix to avoid globally intercepting
+// ENTER in the main pane. Footer menu is accessible via "s".
 const SIDEBAR_COLLAPSED_WIDTH: u16 = 1;
 const TMUX_STATUS_OPTION: &str = "status";
 const TMUX_STATUS_ON: &str = "on";
@@ -161,12 +162,7 @@ where
             FOOTER_SESSIONS_KEY,
             &footer_bindings.open_sessions_menu_command,
         )?;
-        self.tmux.bind_waitagent_footer_action(
-            workspace,
-            FOOTER_SWITCH_KEY,
-            &layout.footer_pane,
-            &footer_bindings.open_sessions_menu_command,
-        )
+        Ok(())
     }
 }
 
@@ -631,11 +627,6 @@ mod tests {
                 ),
                 Call::BindCommandWithPrefix(
                     "s".to_string(),
-                    "run-shell 'waitagent __footer-menu'".to_string(),
-                ),
-                Call::BindWaitagentFooterAction(
-                    "Enter".to_string(),
-                    "%3".to_string(),
                     "run-shell 'waitagent __footer-menu'".to_string(),
                 ),
             ]

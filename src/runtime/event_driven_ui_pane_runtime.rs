@@ -399,14 +399,14 @@ mod tests {
             .footer
             .as_ref()
             .map(|buffer| {
-                buffer.contains("keys: ^N new") && buffer.contains("listen: 192.168.1.22:7474")
+                buffer.contains("keys: ^N new") && buffer.contains("[q] exit-page")
             })
             .unwrap_or(false));
         assert!(update
             .fullscreen_status
             .as_ref()
             .map(|buffer| {
-                buffer.contains("[Ctrl-n] new") && buffer.contains("listen: 192.168.1.22:7474")
+                buffer.contains("[Ctrl-n] new") && buffer.contains("[q] exit-page")
             })
             .unwrap_or(false));
     }

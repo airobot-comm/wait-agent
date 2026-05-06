@@ -1,5 +1,5 @@
 use crate::domain::chrome::FooterViewModel;
-use crate::domain::session_catalog::{ManagedSessionRecord, ManagedSessionTaskState};
+use crate::domain::session_catalog::ManagedSessionRecord;
 use crate::ui::chrome::style_status_line;
 
 pub struct FooterUi;
@@ -18,7 +18,6 @@ impl FooterUi {
                 &model.active_session,
                 model.active_target.as_deref(),
                 &model.sessions,
-                model.listener_display.as_deref(),
                 model.width,
             )
         } else {
@@ -27,7 +26,6 @@ impl FooterUi {
                 &model.active_session,
                 model.active_target.as_deref(),
                 &model.sessions,
-                model.listener_display.as_deref(),
                 model.width,
             )
         }
@@ -38,7 +36,6 @@ impl FooterUi {
         active_session: &str,
         active_target: Option<&str>,
         sessions: &[ManagedSessionRecord],
-        listener_display: Option<&str>,
         width: usize,
     ) -> String {
         render_footer(
@@ -46,7 +43,6 @@ impl FooterUi {
             active_session,
             active_target,
             sessions,
-            listener_display,
             width,
             FooterProjection::Pane,
         )
@@ -57,7 +53,6 @@ impl FooterUi {
         active_session: &str,
         active_target: Option<&str>,
         sessions: &[ManagedSessionRecord],
-        listener_display: Option<&str>,
         width: usize,
     ) -> String {
         render_footer(
@@ -65,7 +60,6 @@ impl FooterUi {
             active_session,
             active_target,
             sessions,
-            listener_display,
             width,
             FooterProjection::FullscreenStatus,
         )
@@ -77,14 +71,12 @@ fn render_footer(
     active_session: &str,
     active_target: Option<&str>,
     sessions: &[ManagedSessionRecord],
-    listener_display: Option<&str>,
     width: usize,
     projection: FooterProjection,
 ) -> String {
     let width = width.max(1);
     let active = active_session_record(active_socket, active_session, active_target, sessions);
-    let counts = task_counts(sessions);
-    let left = left_status_text(projection, sessions.len(), &counts, listener_display);
+    let left = left_status_text(projection);
     let right = active
         .and_then(|session| {
             session
@@ -121,48 +113,14 @@ fn active_session_record<'a>(
         })
 }
 
-#[derive(Default)]
-struct TaskCounts {
-    running: usize,
-    input: usize,
-    confirm: usize,
-    unknown: usize,
-}
-
-fn task_counts(sessions: &[ManagedSessionRecord]) -> TaskCounts {
-    let mut counts = TaskCounts::default();
-    for session in sessions {
-        match session.task_state {
-            ManagedSessionTaskState::Running => counts.running += 1,
-            ManagedSessionTaskState::Input => counts.input += 1,
-            ManagedSessionTaskState::Confirm => counts.confirm += 1,
-            ManagedSessionTaskState::Unknown => counts.unknown += 1,
-        }
-    }
-    counts
-}
-
-fn left_status_text(
-    projection: FooterProjection,
-    total_sessions: usize,
-    counts: &TaskCounts,
-    listener_display: Option<&str>,
-) -> String {
-    let listen = listener_display
-        .map(|value| format!("  |  listen: {value}"))
-        .unwrap_or_default();
+fn left_status_text(projection: FooterProjection) -> String {
     match projection {
         FooterProjection::Pane => {
-            format!("keys: ^N new  ^O fullscreen  C-b s menu{listen}")
+            "keys: ^N new  ^O fullscreen  C-b s menu  C-b [` page  [q] exit-page".to_string()
         }
-        FooterProjection::FullscreenStatus => format!(
-            "keys: [Ctrl-o] fullscreen off  [Ctrl-n] new  [Ctrl-b s] menu{listen} | total:{} R:{} I:{} C:{} U:{} | [PgUp/PgDn] page  [Up/Down] line",
-            total_sessions,
-            counts.running,
-            counts.input,
-            counts.confirm,
-            counts.unknown
-        ),
+        FooterProjection::FullscreenStatus => {
+            "keys: [Ctrl-o] fullscreen off  [Ctrl-n] new  [C-b `] page  [PgUp/PgDn] scroll  [Up/Down] line  [q] exit-page".to_string()
+        }
     }
 }
 
@@ -229,24 +187,24 @@ mod tests {
                 current_path: Some(PathBuf::from("/tmp/demo")),
                 task_state: ManagedSessionTaskState::Input,
             }],
-            Some("192.168.1.22:7474"),
             96,
         );
 
         assert!(output.contains("keys: ^N new"));
         assert!(output.contains("^O fullscreen"));
         assert!(output.contains("C-b s menu"));
-        assert!(output.contains("listen: 192.168.1.22:7474"));
-        assert!(output.contains("^N new"));
-        assert!(!output.contains("^W cmd"));
-        assert!(!output.contains("^Q quit"));
+        assert!(output.contains("C-b [` page"));
+        assert!(output.contains("[q] exit-page"));
+        assert!(!output.contains("listen:"));
+        assert!(!output.contains("total:"));
+        assert!(!output.contains("R:"));
         assert!(output.contains("/tmp/demo"));
         assert!(!output.contains('\n'));
         assert!(output.starts_with("\u{1b}[48;5;24m"));
     }
 
     #[test]
-    fn fullscreen_footer_ui_uses_prefixed_menu_hints() {
+    fn fullscreen_footer_ui_shows_page_and_exit_page_keys() {
         let output = FooterUi::render_fullscreen(
             "wa-1",
             "waitagent-1",
@@ -281,17 +239,18 @@ mod tests {
                     task_state: ManagedSessionTaskState::Confirm,
                 },
             ],
-            Some("192.168.1.22:7474"),
             180,
         );
 
         assert!(output.contains("[Ctrl-o] fullscreen off"));
         assert!(output.contains("[Ctrl-n] new"));
-        assert!(output.contains("[Ctrl-b s] menu"));
-        assert!(output.contains("listen: 192.168.1.22:7474"));
-        assert!(output.contains("total:2 R:0 I:1 C:1 U:0"));
-        assert!(output.contains("[PgUp/PgDn] page"));
+        assert!(output.contains("[C-b `] page"));
+        assert!(output.contains("[PgUp/PgDn] scroll"));
         assert!(output.contains("[Up/Down] line"));
+        assert!(output.contains("[q] exit-page"));
+        assert!(!output.contains("listen:"));
+        assert!(!output.contains("total:"));
+        assert!(!output.contains("R:0"));
         assert!(output.contains("/tmp/demo"));
     }
 }

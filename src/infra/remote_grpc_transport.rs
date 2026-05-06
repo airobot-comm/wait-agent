@@ -88,8 +88,9 @@ impl GrpcRemoteNodeTransport {
     }
 
     pub fn endpoint(&self, endpoint_uri: &str) -> Result<Endpoint, RemoteNodeTransportError> {
-        Endpoint::from_shared(endpoint_uri.to_string())
-            .map_err(|error| RemoteNodeTransportError::new(error.to_string()))
+        Ok(Endpoint::from_shared(endpoint_uri.to_string())
+            .map_err(|error| RemoteNodeTransportError::new(error.to_string()))?
+            .tcp_nodelay(true))
     }
 
     pub fn client(&self, channel: Channel) -> NodeSessionServiceClient<Channel> {
@@ -341,6 +342,7 @@ impl RemoteNodeTransport for GrpcRemoteNodeTransport {
                     session_shutdowns,
                 };
                 let server = Server::builder()
+                    .tcp_nodelay(true)
                     .add_service(NodeSessionServiceServer::new(service))
                     .serve_with_incoming_shutdown(incoming, async move {
                         let _ = shutdown_rx.await;
