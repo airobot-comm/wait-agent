@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (without v prefix); defaults to ref name"
+        required: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,18 +31,27 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: cargo build --release
         run: cargo build --release
 
       - name: Build .tar.gz archive
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.version.outputs.value }}"
           tar czf "waitagent-${VERSION}-x86_64-linux.tar.gz" \
             -C target/release waitagent
 
       - name: Build .deb package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.version.outputs.value }}"
           chmod +x scripts/package-deb.sh
           ./scripts/package-deb.sh \
             target/release/waitagent \
@@ -47,7 +60,7 @@ jobs:
 
       - name: Build .rpm package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.version.outputs.value }}"
           chmod +x scripts/package-rpm.sh
           ./scripts/package-rpm.sh \
             target/release/waitagent \
@@ -71,27 +84,36 @@ jobs:
 
       - name: Install system deps
         run: |
-          brew install bison pkg-config libevent ncurses automake autoconf
+          brew install bison pkg-config libevent ncurses automake autoconf utf8proc
 
       - name: Install Rust toolchain
         run: rustup show
 
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: cargo build --release
         run: cargo build --release
         env:
-          PKG_CONFIG_PATH: /opt/homebrew/opt/ncurses/lib/pkgconfig:/opt/homebrew/opt/libevent/lib/pkgconfig
-          LDFLAGS: -L/opt/homebrew/opt/ncurses/lib -L/opt/homebrew/opt/libevent/lib
-          CPPFLAGS: -I/opt/homebrew/opt/ncurses/include -I/opt/homebrew/opt/libevent/include
+          PKG_CONFIG_PATH: /opt/homebrew/opt/ncurses/lib/pkgconfig:/opt/homebrew/opt/libevent/lib/pkgconfig:/opt/homebrew/opt/utf8proc/lib/pkgconfig
+          LDFLAGS: -L/opt/homebrew/opt/ncurses/lib -L/opt/homebrew/opt/libevent/lib -L/opt/homebrew/opt/utf8proc/lib
+          CPPFLAGS: -I/opt/homebrew/opt/ncurses/include -I/opt/homebrew/opt/libevent/include -I/opt/homebrew/opt/utf8proc/include
 
       - name: Build .tar.gz archive
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.version.outputs.value }}"
           tar czf "waitagent-${VERSION}-aarch64-macos.tar.gz" \
             -C target/release waitagent
 
       - name: Build .dmg package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.version.outputs.value }}"
           chmod +x scripts/package-dmg.sh
           ./scripts/package-dmg.sh \
             target/release/waitagent \

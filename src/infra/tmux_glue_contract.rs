@@ -311,8 +311,10 @@ impl TmuxGlueBuildPlan {
                                 "--prefix={}",
                                 self.layout.stage_dir_path().display()
                             )];
-                            // macOS does not support static linking for tmux.
-                            if !cfg!(target_os = "macos") {
+                            if cfg!(target_os = "macos") {
+                                // macOS: no static linking, but need explicit utf8proc.
+                                args.push("--enable-utf8proc".to_string());
+                            } else {
                                 args.push("--enable-static".to_string());
                             }
                             args
