@@ -19,12 +19,11 @@ trap 'rm -rf "$STAGING"' EXIT
 APP_NAME="WaitAgent"
 APP_DIR="$STAGING/$APP_NAME.app"
 mkdir -p "$APP_DIR/Contents/MacOS"
-mkdir -p "$APP_DIR/Contents/Resources"
 
 cp "$BINARY" "$APP_DIR/Contents/MacOS/waitagent"
 chmod +x "$APP_DIR/Contents/MacOS/waitagent"
 
-# Create Info.plist
+# Create a minimal Info.plist
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -47,17 +46,10 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-# Create a symlink to /Applications for drag-and-drop install
 ln -s /Applications "$STAGING/Applications"
 
-# Create read-write DMG first, then compress
-RW_DMG="$STAGING/tmp.dmg"
-hdiutil create -format UDRW -volname "$APP_NAME" \
-  -fs HFS+ \
-  -srcfolder "$STAGING" \
-  "$RW_DMG"
-
-# Convert to compressed read-only DMG
-hdiutil convert "$RW_DMG" -format UDZO -o "$OUTPUT_DMG"
+# Create compressed DMG directly (single-pass, no intermediate RW image).
+hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING" \
+  -ov -format UDZO -imagekey zlib-level=9 "$OUTPUT_DMG"
 
 echo "created $OUTPUT_DMG"
