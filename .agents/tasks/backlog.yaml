@@ -233,6 +233,18 @@ next:
   - id: task.terminal-1
     title: decide and document the terminal-engine coverage strategy for reliable TUI switching
     status: superseded
+  - id: task.ux-1
+    title: sync sidebar item status with main pane output so sidebar reflects real pane state
+    status: ready
+  - id: task.ux-2
+    title: show last user input line at top of main pane area like VS Code
+    status: ready
+  - id: task.ux-3
+    title: implement workspace snapshot persistence and auto-load on startup
+    status: ready
+  - id: task.ux-4
+    title: embed web UI bundle inside waitagent binary
+    status: ready
 templates:
   - id: task-template.local-acceptance-cycle
     title: local acceptance rerun or bug-fix slice
