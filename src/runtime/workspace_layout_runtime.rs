@@ -736,12 +736,8 @@ mod tests {
     fn footer_menu_shell_command_quotes_shell_arguments_but_not_tmux_layer() {
         let workspace = workspace();
 
-        let command = footer_menu_shell_command(
-            "/tmp/wait agent",
-            &workspace,
-            "192.168.1.22:7474",
-            None,
-        );
+        let command =
+            footer_menu_shell_command("/tmp/wait agent", &workspace, "192.168.1.22:7474", None);
 
         assert_eq!(
             command,

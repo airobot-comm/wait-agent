@@ -148,16 +148,12 @@ mod tests {
         assert!(update
             .footer
             .as_ref()
-            .map(|buffer| {
-                buffer.contains("keys: ^N new")
-            })
+            .map(|buffer| { buffer.contains("keys: ^N new") })
             .unwrap_or(false));
         assert!(update
             .fullscreen_status
             .as_ref()
-            .map(|buffer| {
-                buffer.contains("[Ctrl-n] new") && buffer.contains("[q] exit-page")
-            })
+            .map(|buffer| { buffer.contains("[Ctrl-n] new") && buffer.contains("[q] exit-page") })
             .unwrap_or(false));
     }
 

@@ -78,7 +78,9 @@ fn build_footer_menu_args(
     let active = active_session(command, active_target, sessions);
     let remote_count = sessions
         .iter()
-        .filter(|s| s.address.transport() == &crate::domain::session_catalog::SessionTransport::RemotePeer)
+        .filter(|s| {
+            s.address.transport() == &crate::domain::session_catalog::SessionTransport::RemotePeer
+        })
         .count();
     let mut args = vec![
         "display-menu".to_string(),
@@ -101,10 +103,7 @@ fn build_footer_menu_args(
     }
     if command.listener_display.is_some() || command.connect_endpoint.is_some() {
         if remote_count > 0 {
-            push_disabled_item(
-                &mut args,
-                &format!("- Connected: {remote_count} remote(s)"),
-            );
+            push_disabled_item(&mut args, &format!("- Connected: {remote_count} remote(s)"));
         }
         push_separator(&mut args);
     }
@@ -401,7 +400,9 @@ mod tests {
             &[],
         );
 
-        assert!(args.iter().any(|value| value == "- Listen: 192.168.1.22:7474"));
+        assert!(args
+            .iter()
+            .any(|value| value == "- Listen: 192.168.1.22:7474"));
         assert!(args.iter().any(|value| value == "- Connect: 10.0.0.5:7474"));
     }
 }
