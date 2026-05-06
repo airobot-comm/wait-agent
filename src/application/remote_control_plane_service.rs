@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum MirrorRouteState {
     /// Mirror not yet requested for this session.
     None,
@@ -21,6 +22,7 @@ pub enum MirrorRouteState {
     Rejected(String),
 }
 
+#[allow(dead_code)]
 impl MirrorRouteState {
     fn is_active(&self) -> bool {
         matches!(self, Self::Active)
@@ -43,6 +45,7 @@ impl RemoteControlPlaneService {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub fn record_mirror_accepted(&mut self, session_id: &str) {
         if let Some(state) = self.session_states.get_mut(session_id) {
             if state.mirror_route == MirrorRouteState::Pending {
@@ -51,12 +54,14 @@ impl RemoteControlPlaneService {
         }
     }
 
+    #[allow(dead_code)]
     pub fn record_mirror_rejected(&mut self, session_id: &str, reason: String) {
         if let Some(state) = self.session_states.get_mut(session_id) {
             state.mirror_route = MirrorRouteState::Rejected(reason);
         }
     }
 
+    #[allow(dead_code)]
     pub fn handle_authority_disconnect(&mut self, authority_node_id: &str) {
         let mut sessions_to_remove = Vec::new();
         for (session_id, state) in &self.session_states {
