@@ -17,7 +17,7 @@ use crate::runtime::remote_authority_transport_runtime::authority_transport_sock
 use crate::runtime::remote_main_slot_runtime::{RemoteAttachmentBinding, RemoteMainSlotRuntime};
 use crate::runtime::remote_observer_runtime::{RemoteObserverRuntime, RemoteObserverSnapshot};
 use crate::runtime::remote_transport_runtime::{LocalNodeMailbox, RemoteConnectionRegistry};
-use crate::terminal::{TerminalRuntime, TerminalSize};
+use crate::terminal::{ScreenSnapshot, TerminalRuntime, TerminalSize};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SIGWINCH: c_int = 28;
 const HIDE_CURSOR_ESCAPE: &str = "\x1b[?25l";
@@ -285,11 +285,6 @@ impl RemoteMainSlotPaneRuntime {
             .map(Some)?;
         }
         let run_result = (|| -> Result<(), LifecycleError> {
-            // Rate-limit redraws to avoid starving input events when rapid
-            // output arrives (e.g. keystroke echo). Each output chunk from
-            // pipe-pane triggers a MailboxUpdated; redrawing on every one
-            // floods the single-threaded event loop.
-            const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
             draw_remote_snapshot(
                 &terminal,
                 &target,
@@ -297,22 +292,35 @@ impl RemoteMainSlotPaneRuntime {
                 &observer.snapshot(),
                 &authority_status,
             )?;
-            let mut last_redraw = Instant::now();
 
             loop {
                 match event_rx.recv() {
                     Ok(RemotePaneEvent::MailboxUpdated) => {
-                        observer.sync().map_err(remote_protocol_error)?;
-                        if last_redraw.elapsed() >= REDRAW_INTERVAL {
-                            draw_remote_snapshot(
-                                &terminal,
-                                &target,
-                                binding.as_ref(),
-                                &observer.snapshot(),
-                                &authority_status,
-                            )?;
-                            last_redraw = Instant::now();
+                        let raw = observer
+                            .sync_and_collect_raw()
+                            .map_err(remote_protocol_error)?;
+                        if raw.is_empty() {
+                            continue;
                         }
+                        let mut stdout = io::stdout().lock();
+                        stdout.write_all(&raw).map_err(|error| {
+                            LifecycleError::Io(
+                                "failed to write remote raw output".to_string(),
+                                error,
+                            )
+                        })?;
+                        let snapshot = observer.snapshot();
+                        if snapshot.has_visible_output
+                            && matches!(authority_status, AuthorityTransportStatus::Connected)
+                        {
+                            render_cursor_overlay(&mut stdout, snapshot.active_screen())?;
+                        }
+                        stdout.flush().map_err(|error| {
+                            LifecycleError::Io(
+                                "failed to flush remote raw output".to_string(),
+                                error,
+                            )
+                        })?;
                     }
                     Ok(RemotePaneEvent::Resize) => {
                         if let Ok(Some(size)) = terminal.capture_resize() {
@@ -954,50 +962,7 @@ fn draw_remote_snapshot(
     }
 
     if connected_visible_output {
-        // Always render a visual cursor indicator at the cursor position.
-        // Many terminal programs (e.g. Claude) hide the cursor via DECTCEM
-        // \x1b[?25l after startup and never re-show it, leaving cursor_visible
-        // false in the observer. However, the user still needs to see where
-        // input goes. The reverse-video overlay is part of the rendered text
-        // and visible regardless of pane focus or DECTCEM state.
-        let display_row = usize::from(active_screen.cursor_row.saturating_add(1));
-        let display_col = usize::from(active_screen.cursor_col.saturating_add(1));
-        let cursor_char = active_screen
-            .lines
-            .get(active_screen.cursor_row as usize)
-            .and_then(|line| {
-                let target = active_screen.cursor_col as usize;
-                let mut col = 0usize;
-                for ch in line.chars() {
-                    let w = terminal_char_display_width(ch);
-                    if col + w > target || col == target {
-                        return Some(ch);
-                    }
-                    col += w;
-                }
-                None
-            })
-            .unwrap_or(' ');
-        write!(
-            stdout,
-            "\x1b[?7h\x1b[{};{}H\x1b[7m{}\x1b[27m\x1b[{};{}H{}",
-            display_row,
-            display_col,
-            cursor_char,
-            display_row,
-            display_col,
-            if active_screen.cursor_visible {
-                "\x1b[?25h"
-            } else {
-                "\x1b[?25l"
-            },
-        )
-        .map_err(|error| {
-            LifecycleError::Io(
-                "failed to draw remote main-slot visual cursor".to_string(),
-                error,
-            )
-        })?;
+        render_cursor_overlay(&mut stdout, active_screen)?;
     } else {
         write!(stdout, "\x1b[?7h\x1b[?25l").map_err(|error| {
             LifecycleError::Io("failed to hide remote main-slot cursor".to_string(), error)
@@ -1005,6 +970,56 @@ fn draw_remote_snapshot(
     }
     stdout.flush().map_err(|error| {
         LifecycleError::Io("failed to flush remote main-slot output".to_string(), error)
+    })
+}
+
+/// Always render a visual cursor indicator at the cursor position.
+/// Many terminal programs (e.g. Claude) hide the cursor via DECTCEM
+/// \x1b[?25l after startup and never re-show it, leaving cursor_visible
+/// false in the observer. However, the user still needs to see where
+/// input goes. The reverse-video overlay is part of the rendered text
+/// and visible regardless of pane focus or DECTCEM state.
+fn render_cursor_overlay(
+    stdout: &mut io::StdoutLock<'_>,
+    active_screen: &ScreenSnapshot,
+) -> Result<(), LifecycleError> {
+    let display_row = usize::from(active_screen.cursor_row.saturating_add(1));
+    let display_col = usize::from(active_screen.cursor_col.saturating_add(1));
+    let cursor_char = active_screen
+        .lines
+        .get(active_screen.cursor_row as usize)
+        .and_then(|line| {
+            let target = active_screen.cursor_col as usize;
+            let mut col = 0usize;
+            for ch in line.chars() {
+                let w = terminal_char_display_width(ch);
+                if col + w > target || col == target {
+                    return Some(ch);
+                }
+                col += w;
+            }
+            None
+        })
+        .unwrap_or(' ');
+    write!(
+        stdout,
+        "\x1b[?7h\x1b[{};{}H\x1b[7m{}\x1b[27m\x1b[{};{}H{}",
+        display_row,
+        display_col,
+        cursor_char,
+        display_row,
+        display_col,
+        if active_screen.cursor_visible {
+            "\x1b[?25h"
+        } else {
+            "\x1b[?25l"
+        },
+    )
+    .map_err(|error| {
+        LifecycleError::Io(
+            "failed to draw remote main-slot visual cursor".to_string(),
+            error,
+        )
     })
 }
 

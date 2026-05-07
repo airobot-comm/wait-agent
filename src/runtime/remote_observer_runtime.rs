@@ -42,6 +42,7 @@ pub struct RemoteObserverRuntime {
     has_visible_output: bool,
     bootstrap_complete: bool,
     terminal: TerminalEngine,
+    pending_raw_output: Vec<u8>,
 }
 
 impl RemoteObserverRuntime {
@@ -61,7 +62,19 @@ impl RemoteObserverRuntime {
             has_visible_output: false,
             bootstrap_complete: false,
             terminal: TerminalEngine::new(terminal_size(cols, rows)),
+            pending_raw_output: Vec::new(),
         }
+    }
+
+    /// Sync pending envelopes and return the raw decoded output bytes from
+    /// TargetOutput, MirrorBootstrapChunk, and MirrorBootstrapComplete envelopes.
+    /// The raw bytes can be written directly to stdout for incremental terminal
+    /// rendering (SSH-like forwarding), while the observer continues to update
+    /// its TerminalEngine state for cursor tracking and input translation.
+    pub fn sync_and_collect_raw(&mut self) -> Result<Vec<u8>, RemoteObserverRuntimeError> {
+        self.pending_raw_output.clear();
+        let _ = self.sync()?;
+        Ok(std::mem::take(&mut self.pending_raw_output))
     }
 
     pub fn sync(&mut self) -> Result<usize, RemoteObserverRuntimeError> {
@@ -148,6 +161,7 @@ impl RemoteObserverRuntime {
         })?;
         self.session_id = Some(payload.session_id.clone());
         self.target_id = Some(payload.target_id.clone());
+        self.pending_raw_output.extend_from_slice(&decoded);
         self.terminal.feed(&decoded);
         self.has_visible_output = true;
         Ok(())
@@ -173,6 +187,9 @@ impl RemoteObserverRuntime {
         });
         self.terminal.feed(suffix.as_bytes());
         self.bootstrap_complete = true;
+        if !suffix.is_empty() {
+            self.pending_raw_output.extend_from_slice(suffix.as_bytes());
+        }
     }
 
     fn apply_target_output(
@@ -197,6 +214,7 @@ impl RemoteObserverRuntime {
         self.session_id = Some(payload.session_id.clone());
         self.target_id = Some(payload.target_id.clone());
 
+        self.pending_raw_output.extend_from_slice(&decoded);
         self.terminal.feed(&decoded);
 
         self.last_output_seq = Some(payload.output_seq);
