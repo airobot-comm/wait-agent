@@ -433,10 +433,8 @@ impl RemoteMainSlotPaneRuntime {
                             return Ok(());
                         }
                         if let Some(binding) = binding.as_ref() {
-                            let normalized = input_translator.translate(
-                                &bytes,
-                                observer.snapshot().screen.application_cursor_keys,
-                            );
+                            let normalized = input_translator
+                                .translate(&bytes, observer.application_cursor_keys());
                             if normalized.is_empty() {
                                 continue;
                             }
