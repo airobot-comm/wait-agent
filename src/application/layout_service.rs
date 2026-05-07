@@ -5,7 +5,6 @@ use crate::infra::tmux::{
 
 pub const SIDEBAR_PANE_TITLE: &str = "waitagent-sidebar";
 pub const FOOTER_PANE_TITLE: &str = "waitagent-footer";
-const SIDEBAR_PANE_STYLE: &str = "fg=colour250,bg=colour234";
 const MAIN_PANE_REMAIN_ON_EXIT_OPTION: &str = "remain-on-exit";
 const TMUX_OPTION_ON: &str = "on";
 const SESSION_LAYOUT_RECONCILE_HOOKS: [&str; 1] = ["client-resized"];
@@ -64,8 +63,6 @@ where
         };
         self.tmux
             .set_pane_title(workspace, &sidebar_pane, SIDEBAR_PANE_TITLE)?;
-        self.tmux
-            .set_pane_style(workspace, &sidebar_pane, SIDEBAR_PANE_STYLE)?;
         apply_width(&self.tmux, workspace, &sidebar_pane, &self.sidebar_width)?;
         let panes = self.tmux.list_panes(workspace, &window)?;
         let footer_pane = match pane_with_title(&panes, FOOTER_PANE_TITLE) {
@@ -573,7 +570,6 @@ mod tests {
             vec![
                 Call::SplitRight,
                 Call::SetTitle("%2".to_string()),
-                Call::SetPaneStyle("%2".to_string(), "fg=colour250,bg=colour234".to_string()),
                 Call::SetWidth("%2".to_string(), 32),
                 Call::SplitBottom,
                 Call::SetTitle("%3".to_string()),
@@ -628,7 +624,6 @@ mod tests {
             vec![
                 Call::Respawn("%2".to_string()),
                 Call::SetTitle("%2".to_string()),
-                Call::SetPaneStyle("%2".to_string(), "fg=colour250,bg=colour234".to_string()),
                 Call::SetWidth("%2".to_string(), 32),
                 Call::Respawn("%3".to_string()),
                 Call::SetTitle("%3".to_string()),
@@ -683,7 +678,6 @@ mod tests {
             gateway.calls(),
             vec![
                 Call::SetTitle("%2".to_string()),
-                Call::SetPaneStyle("%2".to_string(), "fg=colour250,bg=colour234".to_string()),
                 Call::SetWidth("%2".to_string(), 32),
                 Call::SetTitle("%3".to_string()),
                 Call::SetHeight("%3".to_string(), 1),

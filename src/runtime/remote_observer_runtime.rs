@@ -196,7 +196,9 @@ impl RemoteObserverRuntime {
         })?;
         self.session_id = Some(payload.session_id.clone());
         self.target_id = Some(payload.target_id.clone());
+
         self.terminal.feed(&decoded);
+
         self.last_output_seq = Some(payload.output_seq);
         self.has_visible_output = true;
         debug_log_observer_state(

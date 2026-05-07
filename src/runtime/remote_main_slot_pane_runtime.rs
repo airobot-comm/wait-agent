@@ -920,6 +920,14 @@ fn draw_remote_snapshot(
         connected_visible_output,
         active_screen.lines.as_slice(),
         rendered_lines.as_slice(),
+        &format!(
+            "cursor_row={} cursor_col={} cursor_visible={} has_visible_output={} alt_screen={}",
+            active_screen.cursor_row,
+            active_screen.cursor_col,
+            active_screen.cursor_visible,
+            snapshot.has_visible_output,
+            active_screen.alternate_screen,
+        ),
     );
 
     let mut stdout = io::stdout().lock();
@@ -937,15 +945,37 @@ fn draw_remote_snapshot(
     }
 
     if snapshot.has_visible_output && active_screen.cursor_visible {
+        let display_row = usize::from(active_screen.cursor_row.saturating_add(1));
+        let display_col = usize::from(active_screen.cursor_col.saturating_add(1));
+        // Visual cursor: render a reverse-video overlay at cursor position.
+        // tmux only shows the cursor in the focused (active) pane. When the
+        // sidebar is focused, the remote main-slot pane is inactive and tmux
+        // silently ignores CSI cursor show (\x1b[?25h). This overlay renders
+        // directly into the text buffer so the cursor position is always visible.
+        let cursor_char = active_screen
+            .lines
+            .get(active_screen.cursor_row as usize)
+            .and_then(|line| {
+                let target = active_screen.cursor_col as usize;
+                let mut display_col = 0usize;
+                for ch in line.chars() {
+                    let w = terminal_char_display_width(ch);
+                    if display_col + w > target || display_col == target {
+                        return Some(ch);
+                    }
+                    display_col += w;
+                }
+                None
+            })
+            .unwrap_or(' ');
         write!(
             stdout,
-            "\x1b[?7h\x1b[{};{}H\x1b[?25h",
-            usize::from(active_screen.cursor_row.saturating_add(1)),
-            usize::from(active_screen.cursor_col.saturating_add(1))
+            "\x1b[?7h\x1b[{};{}H\x1b[7m{}\x1b[27m\x1b[{};{}H\x1b[?25h",
+            display_row, display_col, cursor_char, display_row, display_col
         )
         .map_err(|error| {
             LifecycleError::Io(
-                "failed to position remote main-slot cursor".to_string(),
+                "failed to draw remote main-slot visual cursor".to_string(),
                 error,
             )
         })?;
@@ -966,6 +996,7 @@ fn debug_log_draw_snapshot(
     connected_visible_output: bool,
     lines: &[String],
     rendered_lines: &[String],
+    cursor_state: &str,
 ) {
     let Ok(path) = std::env::var("WAITAGENT_REMOTE_DEBUG_LOG") else {
         return;
@@ -977,7 +1008,7 @@ fn debug_log_draw_snapshot(
 
     let _ = writeln!(
         file,
-        "[{stage}] seq={draw_seq} target={target} last_output_seq={last_output_seq:?} connected_visible_output={connected_visible_output}"
+        "[{stage}] seq={draw_seq} target={target} last_output_seq={last_output_seq:?} connected_visible_output={connected_visible_output} {cursor_state}"
     );
     for (index, line) in lines.iter().take(12).enumerate() {
         let rendered = rendered_lines.get(index).map(String::as_str).unwrap_or("");
@@ -1758,6 +1789,114 @@ mod tests {
         assert_eq!(rendered6, "  1. Update now (runs `npm install -g");
         assert_eq!(rendered7, "     @openai/codex`)");
         assert_eq!(rendered8, "› 2. Skip");
+    }
+
+    #[test]
+    fn cursor_visibility_tracks_through_bootstrap_and_target_output() {
+        let runtime = RemoteMainSlotRuntime::with_registry(RemoteConnectionRegistry::new());
+        let mailbox = runtime
+            .ensure_local_observer_connection("observer-a")
+            .expect("observer loopback registration should succeed");
+        runtime.ensure_local_connection("peer-a");
+        let mut observer = RemoteObserverRuntime::new(mailbox, 80, 24);
+
+        // Step 1: Activate to trigger begin_bootstrap
+        runtime
+            .activate_target(
+                &remote_target(),
+                RemoteConsoleDescriptor {
+                    console_id: "console-a".to_string(),
+                    console_host_id: "observer-a".to_string(),
+                    location: ConsoleLocation::LocalWorkspace,
+                },
+                80,
+                24,
+            )
+            .expect("remote activation should succeed");
+
+        // Step 2: Send a simple bootstrap chunk (just clear screen + home)
+        let bootstrap = String::from("\x1b[2J\x1b[H");
+        runtime
+            .send_mirror_bootstrap_chunk(
+                &remote_target(),
+                1,
+                "pty",
+                encode_base64(bootstrap.as_bytes()),
+            )
+            .expect("bootstrap chunk should fan out");
+
+        // Step 3: Send bootstrap complete with cursor_visible=false
+        runtime
+            .send_mirror_bootstrap_complete(&remote_target(), 1, false, false, false)
+            .expect("bootstrap complete should fan out");
+
+        // Step 4: Sync and check cursor state after bootstrap
+        observer.sync().expect("observer sync should succeed");
+        let snapshot = observer.snapshot();
+        assert!(
+            snapshot.has_visible_output,
+            "has_visible_output should be true after bootstrap"
+        );
+        assert!(
+            !snapshot.active_screen().cursor_visible,
+            "cursor should be hidden after bootstrap with cursor_visible=false"
+        );
+
+        // Step 5: Send TargetOutput with \x1b[?25h (cursor show)
+        runtime
+            .send_target_output(&remote_target(), 1, "pty", encode_base64(b"\x1b[?25h"))
+            .expect("target output should fan out");
+
+        observer.sync().expect("observer sync should succeed");
+        let snapshot = observer.snapshot();
+        assert!(
+            snapshot.has_visible_output,
+            "has_visible_output should still be true"
+        );
+        assert!(
+            snapshot.active_screen().cursor_visible,
+            "cursor should be visible after \x1b[?25h"
+        );
+
+        // Step 6: Send TargetOutput with \x1b[?25l (cursor hide)
+        runtime
+            .send_target_output(&remote_target(), 2, "pty", encode_base64(b"\x1b[?25l"))
+            .expect("target output should fan out");
+
+        observer.sync().expect("observer sync should succeed");
+        let snapshot = observer.snapshot();
+        assert!(
+            snapshot.has_visible_output,
+            "has_visible_output should still be true"
+        );
+        assert!(
+            !snapshot.active_screen().cursor_visible,
+            "cursor should be hidden after \x1b[?25l"
+        );
+
+        // Step 7: Send TargetOutput with \x1b[?25h AGAIN (cursor show)
+        runtime
+            .send_target_output(&remote_target(), 3, "pty", encode_base64(b"\x1b[?25h"))
+            .expect("target output should fan out");
+
+        observer.sync().expect("observer sync should succeed");
+        let snapshot = observer.snapshot();
+        assert!(
+            snapshot.active_screen().cursor_visible,
+            "cursor should be visible again after second \x1b[?25h"
+        );
+
+        // Step 8: Check that cursor_row/col are default (0,0) since we only sent cursor sequences, not positioning
+        assert_eq!(
+            snapshot.active_screen().cursor_row,
+            0,
+            "cursor_row should default to 0"
+        );
+        assert_eq!(
+            snapshot.active_screen().cursor_col,
+            0,
+            "cursor_col should default to 0"
+        );
     }
 
     #[test]
