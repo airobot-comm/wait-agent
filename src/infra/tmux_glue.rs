@@ -2,6 +2,11 @@ use crate::infra::tmux::TmuxError;
 use crate::infra::tmux_glue_contract::TmuxGlueContractError;
 use std::path::{Path, PathBuf};
 
+/// The vendored tmux binary, embedded at compile time.
+/// Extracted to a runtime directory on first use.
+pub const VENDORED_TMUX_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/vendored_tmux.bin"));
+
 #[allow(unused_imports)]
 pub use crate::infra::tmux_glue_contract::{
     ProcessTmuxGlueExecutor, TmuxGlueArtifacts, TmuxGlueBuildConfig, TmuxGlueBuildError,
@@ -20,7 +25,70 @@ pub struct VendoredTmuxSource {
     path: PathBuf,
 }
 
+/// Extract the embedded vendored tmux binary to a user-local data directory.
+/// Returns the path to the extracted binary on success.
+pub fn extract_embedded_tmux() -> Result<PathBuf, TmuxError> {
+    let data_dir = data_local_dir().join("waitagent");
+    let tmux_path = data_dir.join("tmux");
+    let version_path = data_dir.join("tmux.version");
+    let tmux_version = option_env!("WAITAGENT_VENDORED_TMUX_VERSION").unwrap_or("unknown");
+
+    // Re-extract if missing, or if the embedded tmux version has changed
+    // (e.g. after a waitagent upgrade via a new package).
+    let needs_extract = !tmux_path.exists()
+        || std::fs::read_to_string(&version_path)
+            .map(|v| v != tmux_version)
+            .unwrap_or(true);
+
+    if needs_extract {
+        std::fs::create_dir_all(&data_dir).map_err(|e| {
+            TmuxError::new(format!(
+                "failed to create waitagent data directory at {}: {e}",
+                data_dir.display()
+            ))
+        })?;
+        std::fs::write(&tmux_path, VENDORED_TMUX_BYTES).map_err(|e| {
+            TmuxError::new(format!(
+                "failed to write vendored tmux binary to {}: {e}",
+                tmux_path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &tmux_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .map_err(|e| {
+            TmuxError::new(format!(
+                "failed to set permissions on vendored tmux binary at {}: {e}",
+                tmux_path.display()
+            ))
+        })?;
+        // Store the version so future runs can detect stale binaries
+        // after a waitagent upgrade.
+        let _ = std::fs::write(&version_path, tmux_version);
+    }
+    Ok(tmux_path)
+}
+
+fn data_local_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local").join("share");
+    }
+    // Last-resort fallback — should be writable on most systems
+    PathBuf::from("/tmp")
+}
+
 impl VendoredTmuxSource {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
     pub fn discover_from_repo_root(repo_root: impl AsRef<Path>) -> Result<Self, TmuxError> {
         let path = repo_root.as_ref().join(VENDORED_TMUX_SUBMODULE_PATH);
         if !path.exists() {

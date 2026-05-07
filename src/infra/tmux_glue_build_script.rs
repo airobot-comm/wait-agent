@@ -97,4 +97,12 @@ pub fn run() {
         "cargo:rustc-env={VENDORED_TMUX_BUILD_STATUS_ENV}={}",
         TmuxGlueBuildStatus::Executed.as_str()
     );
+
+    // Copy the compiled tmux binary into OUT_DIR so it can be embedded
+    // into the waitagent binary via include_bytes!(). This eliminates
+    // runtime dependency on compile-time hardcoded paths when the binary
+    // is deployed to another machine.
+    let embedded_bin_path = out_dir.join("vendored_tmux.bin");
+    std::fs::copy(&report.artifacts.tmux_binary_path, &embedded_bin_path)
+        .expect("vendored tmux binary should be copied for embedding");
 }

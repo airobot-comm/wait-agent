@@ -103,10 +103,40 @@ impl EmbeddedTmuxBackend {
     }
 
     pub fn from_build_env() -> Result<Self, TmuxError> {
+        // 1. Try the embedded vendored tmux (extracted from the binary at runtime).
+        //    This works regardless of install path or platform packaging.
+        if let Ok(backend) = Self::embedded() {
+            return Ok(backend);
+        }
+        // 2. Try vendored from build env (compile-time hardcoded paths).
+        //    This only works on the exact machine where waitagent was built.
         match Self::vendored_from_build_env() {
             Ok(backend) => Ok(backend),
             Err(_) => Ok(Self::system_default()),
         }
+    }
+
+    fn embedded() -> Result<Self, TmuxError> {
+        let tmux_binary_path = crate::infra::tmux_glue::extract_embedded_tmux()?;
+        let source = VendoredTmuxSource::new(tmux_binary_path.clone());
+        let artifacts = TmuxGlueArtifacts {
+            source_path: tmux_binary_path.clone(),
+            build_root: PathBuf::new(),
+            tmux_binary_path,
+            static_lib_path: PathBuf::new(),
+            include_dir_path: PathBuf::new(),
+            configure_stamp_path: PathBuf::new(),
+            build_stamp_path: PathBuf::new(),
+        };
+        let build_config = TmuxGlueBuildConfig::from_artifacts(&artifacts);
+        let backend = Self::new(
+            source,
+            artifacts,
+            TmuxGlueBuildStatus::Executed,
+            build_config,
+        );
+        backend.validate_runtime_artifacts()?;
+        Ok(backend)
     }
 
     fn vendored_from_build_env() -> Result<Self, TmuxError> {
@@ -1531,11 +1561,21 @@ mod tests {
         assert_eq!(handle.socket_name.as_str(), "sock-1");
         assert_eq!(handle.session_name.as_str(), "sess-1");
         assert_eq!(backend.build_status(), &TmuxGlueBuildStatus::Executed);
-        assert!(backend
-            .artifacts()
-            .static_lib_path
-            .to_string_lossy()
-            .ends_with("/lib/libtmux-glue.a"));
+        // with the embedded binary, tmux_binary_path points to the extracted binary
+        assert!(
+            backend.artifacts().tmux_binary_path.exists(),
+            "embedded tmux binary should be extracted: {}",
+            backend.artifacts().tmux_binary_path.display()
+        );
+        assert!(
+            backend
+                .artifacts()
+                .tmux_binary_path
+                .to_string_lossy()
+                .contains("waitagent/tmux"),
+            "embedded tmux binary should be in waitagent data dir: {}",
+            backend.artifacts().tmux_binary_path.display()
+        );
     }
 
     #[test]
