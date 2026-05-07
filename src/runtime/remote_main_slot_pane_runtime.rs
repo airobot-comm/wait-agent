@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SIGWINCH: c_int = 28;
 const HIDE_CURSOR_ESCAPE: &str = "\x1b[?25l";
@@ -285,6 +285,11 @@ impl RemoteMainSlotPaneRuntime {
             .map(Some)?;
         }
         let run_result = (|| -> Result<(), LifecycleError> {
+            // Rate-limit redraws to avoid starving input events when rapid
+            // output arrives (e.g. keystroke echo). Each output chunk from
+            // pipe-pane triggers a MailboxUpdated; redrawing on every one
+            // floods the single-threaded event loop.
+            const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
             draw_remote_snapshot(
                 &terminal,
                 &target,
@@ -292,18 +297,23 @@ impl RemoteMainSlotPaneRuntime {
                 &observer.snapshot(),
                 &authority_status,
             )?;
+            let mut last_redraw = Instant::now();
 
             loop {
                 match event_rx.recv() {
                     Ok(RemotePaneEvent::MailboxUpdated) => {
                         observer.sync().map_err(remote_protocol_error)?;
-                        draw_remote_snapshot(
-                            &terminal,
-                            &target,
-                            binding.as_ref(),
-                            &observer.snapshot(),
-                            &authority_status,
-                        )?;
+                        let now = Instant::now();
+                        if now - last_redraw >= REDRAW_INTERVAL {
+                            draw_remote_snapshot(
+                                &terminal,
+                                &target,
+                                binding.as_ref(),
+                                &observer.snapshot(),
+                                &authority_status,
+                            )?;
+                            last_redraw = now;
+                        }
                     }
                     Ok(RemotePaneEvent::Resize) => {
                         if let Ok(Some(size)) = terminal.capture_resize() {
