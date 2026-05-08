@@ -150,7 +150,6 @@ impl RemoteObserverRuntime {
             }
             ControlPlanePayload::TargetOutput(payload) => self.apply_target_output(payload),
             other => {
-                #[cfg(debug_assertions)]
                 eprintln!(
                     "[observer] ignored envelope type={} message_id={}",
                     other.message_type(),

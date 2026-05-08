@@ -309,7 +309,6 @@ where
             ingest_socket_path: ingest_socket_path.clone(),
         };
 
-        #[cfg(debug_assertions)]
         eprintln!(
             "[target-host] started: socket={} session={} target_id={} transport_session_id={}",
             command.socket_name,
@@ -352,7 +351,6 @@ where
                     payload,
                 ))) => {
                     if mirror_state == MirrorState::Active {
-                        #[cfg(debug_assertions)]
                         eprintln!("[target-host] re-mirror request (mirror already active)");
                         if let Err(error) = self
                             .gateway
@@ -383,7 +381,6 @@ where
                         }
                         continue;
                     }
-                    #[cfg(debug_assertions)]
                     eprintln!(
                         "[target-host] OpenMirrorRequest: payload.target_id={} payload.session_id={} cmd.target_id={} cmd.transport_session_id={}",
                         payload.target_id, payload.session_id, command.target_id, command.transport_session_id,
@@ -410,7 +407,6 @@ where
                         }
                         continue;
                     }
-                    #[cfg(debug_assertions)]
                     eprintln!("[target-host] activating mirror");
                     if let Err(error) =
                         activate_mirror(self, &command, &pane, &ingest_socket_path, &payload)
@@ -431,7 +427,6 @@ where
                         continue;
                     }
                     mirror_state = MirrorState::Active;
-                    #[cfg(debug_assertions)]
                     eprintln!("[target-host] mirror activated, sending emit_bootstrap");
                     if let Err(error) = transport
                         .send_open_mirror_accepted(

@@ -449,7 +449,7 @@ mod tests {
         ControlPlanePayload, ProtocolEnvelope, TargetOutputPayload,
     };
     use crate::infra::remote_transport_codec::{
-        write_control_plane_envelope, write_registration_frame,
+        read_control_plane_envelope, write_control_plane_envelope, write_registration_frame,
     };
     use crate::runtime::remote_transport_runtime::RemoteConnectionRegistry;
     use std::fs;
@@ -795,5 +795,102 @@ mod tests {
             "waitagent-test-authority-connection-{name}-{}-{millis}.sock",
             process::id()
         ))
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_authority_transport_rtt() {
+        // Run with: cargo test benchmark_authority_transport_rtt -- --nocapture --ignored
+        const ITERATIONS: usize = 10_000;
+
+        // --- Codec overhead (encode + decode) ---
+        let envelope = authority_target_output_envelope(1);
+        let mut buf = Vec::with_capacity(4096);
+        let mut decode_cursor = std::io::Cursor::new(Vec::new());
+
+        let codec_start = std::time::Instant::now();
+        for i in 0..ITERATIONS {
+            let mut env = envelope.clone();
+            if let ControlPlanePayload::TargetOutput(ref mut p) = env.payload {
+                p.output_seq = i as u64;
+            }
+            buf.clear();
+            write_control_plane_envelope(&mut buf, &env).expect("encode");
+            decode_cursor.get_mut().clear();
+            decode_cursor.get_mut().extend_from_slice(&buf);
+            decode_cursor.set_position(0);
+            let _decoded = read_control_plane_envelope(&mut decode_cursor).expect("decode");
+        }
+        let codec_ns = codec_start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+
+        // --- Authority transport RTT (Unix socket) ---
+        let registry = RemoteConnectionRegistry::new();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (mut client, server) = UnixStream::pair().expect("stream pair should open");
+        write_registration_frame(&mut client, "peer-a").expect("ok");
+        register_authority_stream(server, registry.clone(), "peer-a".to_string(), event_tx)
+            .expect("ok");
+        event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("connected");
+
+        let rtt_start = std::time::Instant::now();
+        for i in 0..ITERATIONS {
+            let mut env = authority_target_output_envelope(i as u64);
+            write_control_plane_envelope(&mut client, &env).expect("encode");
+            match event_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(AuthorityTransportEvent::Envelope(_)) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        let rtt_ns = rtt_start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+
+        // --- Throughput (send batched then recv batched) ---
+        let env = authority_target_output_envelope(1);
+        let send_start = std::time::Instant::now();
+        for i in 0..ITERATIONS {
+            let mut e = env.clone();
+            if let ControlPlanePayload::TargetOutput(ref mut p) = e.payload {
+                p.output_seq = i as u64;
+            }
+            write_control_plane_envelope(&mut client, &e).expect("encode");
+        }
+        let send_ns = send_start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+
+        let recv_start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            match event_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(AuthorityTransportEvent::Envelope(_)) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        let recv_ns = recv_start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+
+        println!("=== Authority Transport Benchmark ({ITERATIONS} iters) ===");
+        println!(
+            "Codec encode+decode:       {:.0} ns  ({:.3} µs)",
+            codec_ns,
+            codec_ns / 1000.0
+        );
+        println!(
+            "Send-only (encode+write):  {:.0} ns  ({:.3} µs)",
+            send_ns,
+            send_ns / 1000.0
+        );
+        println!(
+            "Receive-only (read+decode): {:.0} ns  ({:.3} µs)",
+            recv_ns,
+            recv_ns / 1000.0
+        );
+        println!(
+            "Authority transport RTT:    {:.0} ns  ({:.3} µs)",
+            rtt_ns,
+            rtt_ns / 1000.0
+        );
+        println!("========================================");
+        println!("For reference:");
+        println!("  Tmux send-keys subprocess:  ~3 ms   (3000 µs)");
+        println!("  Direct pty write:           ~1.5 µs");
+        println!("  Network RTT (this link):    avg ~90 ms");
     }
 }
