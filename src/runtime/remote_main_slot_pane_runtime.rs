@@ -36,6 +36,7 @@ const HIDE_CURSOR_ESCAPE: &str = "\x1b[?25l";
 const SHOW_CURSOR_ESCAPE: &str = "\x1b[?25h";
 const TARGET_PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TARGET_PRESENCE_MISS_GRACE_POLLS: usize = 4;
+const REMOTE_RAW_PTY_ENV: &str = "WAITAGENT_REMOTE_RAW_PTY";
 
 static REMOTE_PANE_SIGWINCH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static REMOTE_DRAW_DEBUG_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -268,6 +269,7 @@ impl RemoteMainSlotPaneRuntime {
         let mut console_seq = 0u64;
         let mut input_signal_decoder = RemoteInteractInputSignalDecoder::default();
         let mut input_translator = RemoteTerminalInputTranslator::default();
+        let raw_pty_passthrough = remote_raw_pty_passthrough_enabled();
         let mut binding = None;
         let mut authority_status = if remote_runtime.has_connection(target.address.authority_id()) {
             AuthorityTransportStatus::Connected
@@ -275,23 +277,32 @@ impl RemoteMainSlotPaneRuntime {
             waiting_authority_status.clone()
         };
         if matches!(authority_status, AuthorityTransportStatus::Connected) {
-            binding = activate_surface_target(
+            let activated = activate_surface_target_with_mode(
                 &remote_runtime,
                 &target,
                 &spec,
                 &initial_size,
                 &mut observer,
+                raw_pty_passthrough,
             )
             .map(Some)?;
+            if let Some((activated_binding, raw)) = activated {
+                if raw_pty_passthrough {
+                    write_remote_raw_output(&raw)?;
+                }
+                binding = Some(activated_binding);
+            }
         }
         let run_result = (|| -> Result<(), LifecycleError> {
-            draw_remote_snapshot(
-                &terminal,
-                &target,
-                binding.as_ref(),
-                &observer.snapshot(),
-                &authority_status,
-            )?;
+            if should_draw_remote_snapshot(raw_pty_passthrough, binding.as_ref()) {
+                draw_remote_snapshot(
+                    &terminal,
+                    &target,
+                    binding.as_ref(),
+                    &observer.snapshot(),
+                    &authority_status,
+                )?;
+            }
 
             loop {
                 match event_rx.recv() {
@@ -302,25 +313,29 @@ impl RemoteMainSlotPaneRuntime {
                         if raw.is_empty() {
                             continue;
                         }
-                        let mut stdout = io::stdout().lock();
-                        stdout.write_all(&raw).map_err(|error| {
-                            LifecycleError::Io(
-                                "failed to write remote raw output".to_string(),
-                                error,
-                            )
-                        })?;
-                        let snapshot = observer.snapshot();
-                        if snapshot.has_visible_output
-                            && matches!(authority_status, AuthorityTransportStatus::Connected)
-                        {
-                            render_remote_cursor(&mut stdout, snapshot.active_screen())?;
+                        if raw_pty_passthrough {
+                            write_remote_raw_output(&raw)?;
+                        } else {
+                            let mut stdout = io::stdout().lock();
+                            stdout.write_all(&raw).map_err(|error| {
+                                LifecycleError::Io(
+                                    "failed to write remote raw output".to_string(),
+                                    error,
+                                )
+                            })?;
+                            let snapshot = observer.snapshot();
+                            if snapshot.has_visible_output
+                                && matches!(authority_status, AuthorityTransportStatus::Connected)
+                            {
+                                render_remote_cursor(&mut stdout, snapshot.active_screen())?;
+                            }
+                            stdout.flush().map_err(|error| {
+                                LifecycleError::Io(
+                                    "failed to flush remote raw output".to_string(),
+                                    error,
+                                )
+                            })?;
                         }
-                        stdout.flush().map_err(|error| {
-                            LifecycleError::Io(
-                                "failed to flush remote raw output".to_string(),
-                                error,
-                            )
-                        })?;
                     }
                     Ok(RemotePaneEvent::Resize) => {
                         if let Ok(Some(size)) = terminal.capture_resize() {
@@ -333,13 +348,15 @@ impl RemoteMainSlotPaneRuntime {
                                 )?;
                             }
                         }
-                        draw_remote_snapshot(
-                            &terminal,
-                            &target,
-                            binding.as_ref(),
-                            &observer.snapshot(),
-                            &authority_status,
-                        )?;
+                        if should_draw_remote_snapshot(raw_pty_passthrough, binding.as_ref()) {
+                            draw_remote_snapshot(
+                                &terminal,
+                                &target,
+                                binding.as_ref(),
+                                &observer.snapshot(),
+                                &authority_status,
+                            )?;
+                        }
                     }
                     Ok(RemotePaneEvent::AuthorityTransport(event)) => match event {
                         AuthorityTransportEvent::Connected => {
@@ -352,15 +369,19 @@ impl RemoteMainSlotPaneRuntime {
                             if binding.is_none()
                                 && matches!(authority_status, AuthorityTransportStatus::Connected)
                             {
-                                match activate_surface_target(
+                                match activate_surface_target_with_mode(
                                     &remote_runtime,
                                     &target,
                                     &spec,
                                     &terminal.current_size_or_default(),
                                     &mut observer,
+                                    raw_pty_passthrough,
                                 ) {
                                     Ok(activated) => {
-                                        binding = Some(activated);
+                                        if raw_pty_passthrough {
+                                            write_remote_raw_output(&activated.1)?;
+                                        }
+                                        binding = Some(activated.0);
                                     }
                                     Err(error) => {
                                         authority_status =
@@ -368,13 +389,15 @@ impl RemoteMainSlotPaneRuntime {
                                     }
                                 }
                             }
-                            draw_remote_snapshot(
-                                &terminal,
-                                &target,
-                                binding.as_ref(),
-                                &observer.snapshot(),
-                                &authority_status,
-                            )?;
+                            if should_draw_remote_snapshot(raw_pty_passthrough, binding.as_ref()) {
+                                draw_remote_snapshot(
+                                    &terminal,
+                                    &target,
+                                    binding.as_ref(),
+                                    &observer.snapshot(),
+                                    &authority_status,
+                                )?;
+                            }
                         }
                         AuthorityTransportEvent::Disconnected => {
                             authority_status = authority_status_from_runtime(
@@ -417,13 +440,15 @@ impl RemoteMainSlotPaneRuntime {
                             is_present,
                             &waiting_authority_status,
                         );
-                        draw_remote_snapshot(
-                            &terminal,
-                            &target,
-                            binding.as_ref(),
-                            &observer.snapshot(),
-                            &authority_status,
-                        )?;
+                        if should_draw_remote_snapshot(raw_pty_passthrough, binding.as_ref()) {
+                            draw_remote_snapshot(
+                                &terminal,
+                                &target,
+                                binding.as_ref(),
+                                &observer.snapshot(),
+                                &authority_status,
+                            )?;
+                        }
                     }
                     Ok(RemotePaneEvent::Input(bytes)) => {
                         for signal in input_signal_decoder.feed(&spec, &bytes) {
@@ -433,8 +458,12 @@ impl RemoteMainSlotPaneRuntime {
                             return Ok(());
                         }
                         if let Some(binding) = binding.as_ref() {
-                            let normalized = input_translator
-                                .translate(&bytes, observer.application_cursor_keys());
+                            let normalized = if raw_pty_passthrough {
+                                bytes
+                            } else {
+                                input_translator
+                                    .translate(&bytes, observer.application_cursor_keys())
+                            };
                             if normalized.is_empty() {
                                 continue;
                             }
@@ -482,6 +511,7 @@ impl RemoteMainSlotPaneRuntime {
     }
 }
 
+#[cfg(test)]
 fn activate_surface_target(
     remote_runtime: &RemoteMainSlotRuntime,
     target: &ManagedSessionRecord,
@@ -489,6 +519,18 @@ fn activate_surface_target(
     size: &TerminalSize,
     observer: &mut RemoteObserverRuntime,
 ) -> Result<RemoteAttachmentBinding, LifecycleError> {
+    activate_surface_target_with_mode(remote_runtime, target, spec, size, observer, false)
+        .map(|(binding, _)| binding)
+}
+
+fn activate_surface_target_with_mode(
+    remote_runtime: &RemoteMainSlotRuntime,
+    target: &ManagedSessionRecord,
+    spec: &RemoteInteractSurfaceSpec,
+    size: &TerminalSize,
+    observer: &mut RemoteObserverRuntime,
+    raw_pty_passthrough: bool,
+) -> Result<(RemoteAttachmentBinding, Vec<u8>), LifecycleError> {
     observer.begin_bootstrap();
     let binding = remote_runtime.activate_target(
         target,
@@ -500,8 +542,46 @@ fn activate_surface_target(
         usize::from(size.cols),
         usize::from(size.rows),
     )?;
-    observer.sync().map_err(remote_protocol_error)?;
-    Ok(binding)
+    let raw = if raw_pty_passthrough {
+        observer
+            .sync_and_collect_raw()
+            .map_err(remote_protocol_error)?
+    } else {
+        observer.sync().map_err(remote_protocol_error)?;
+        Vec::new()
+    };
+    Ok((binding, raw))
+}
+
+fn remote_raw_pty_passthrough_enabled() -> bool {
+    std::env::var(REMOTE_RAW_PTY_ENV)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn should_draw_remote_snapshot(
+    raw_pty_passthrough: bool,
+    binding: Option<&RemoteAttachmentBinding>,
+) -> bool {
+    !raw_pty_passthrough || binding.is_none()
+}
+
+fn write_remote_raw_output(bytes: &[u8]) -> Result<(), LifecycleError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(bytes).map_err(|error| {
+        LifecycleError::Io("failed to write remote raw output".to_string(), error)
+    })?;
+    stdout
+        .flush()
+        .map_err(|error| LifecycleError::Io("failed to flush remote raw output".to_string(), error))
 }
 
 fn should_exit_surface_locally(spec: &RemoteInteractSurfaceSpec, bytes: &[u8]) -> bool {
@@ -1299,12 +1379,14 @@ extern "C" fn remote_pane_sigwinch_handler(_signal: c_int) {
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_surface_target, apply_authority_envelope, authority_status_from_runtime,
-        authority_transport_event_sender, encode_base64, main_slot_console_id,
-        main_slot_surface_spec, placeholder_lines, should_exit_surface_for_target_presence,
-        should_exit_surface_locally, spawn_mailbox_watcher, AuthorityTransportStatus,
-        RemoteInteractInputSignalDecoder, RemoteInteractSignal, RemoteInteractSurfaceSpec,
-        RemoteMainSlotPaneRuntime, RemotePaneEvent, RemoteTerminalInputTranslator,
+        activate_surface_target, activate_surface_target_with_mode, apply_authority_envelope,
+        authority_status_from_runtime, authority_transport_event_sender, encode_base64,
+        main_slot_console_id, main_slot_surface_spec, placeholder_lines,
+        remote_raw_pty_passthrough_enabled, should_draw_remote_snapshot,
+        should_exit_surface_for_target_presence, should_exit_surface_locally,
+        spawn_mailbox_watcher, AuthorityTransportStatus, RemoteInteractInputSignalDecoder,
+        RemoteInteractSignal, RemoteInteractSurfaceSpec, RemoteMainSlotPaneRuntime,
+        RemotePaneEvent, RemoteTerminalInputTranslator, REMOTE_RAW_PTY_ENV,
     };
     use crate::application::target_registry_service::{
         DefaultTargetCatalogGateway, TargetRegistryService,
@@ -1385,6 +1467,36 @@ mod tests {
         assert!(!should_exit_surface_locally(&main_slot, &[0x1d]));
         assert!(should_exit_surface_locally(&server_console, &[0x1d]));
         assert!(!should_exit_surface_locally(&server_console, b"hello"));
+    }
+
+    #[test]
+    fn remote_raw_pty_passthrough_env_is_opt_in() {
+        std::env::remove_var(REMOTE_RAW_PTY_ENV);
+        assert!(!remote_raw_pty_passthrough_enabled());
+
+        std::env::set_var(REMOTE_RAW_PTY_ENV, "1");
+        assert!(remote_raw_pty_passthrough_enabled());
+
+        std::env::set_var(REMOTE_RAW_PTY_ENV, "true");
+        assert!(remote_raw_pty_passthrough_enabled());
+
+        std::env::set_var(REMOTE_RAW_PTY_ENV, "0");
+        assert!(!remote_raw_pty_passthrough_enabled());
+        std::env::remove_var(REMOTE_RAW_PTY_ENV);
+    }
+
+    #[test]
+    fn raw_passthrough_draws_placeholder_until_target_is_bound() {
+        let binding = RemoteAttachmentBinding {
+            session_id: "shell-1".to_string(),
+            target_id: "remote-peer:peer-a:shell-1".to_string(),
+            attachment_id: "attach-1".to_string(),
+            console_id: "console-a".to_string(),
+        };
+
+        assert!(should_draw_remote_snapshot(true, None));
+        assert!(!should_draw_remote_snapshot(true, Some(&binding)));
+        assert!(should_draw_remote_snapshot(false, Some(&binding)));
     }
 
     #[test]
@@ -1982,6 +2094,57 @@ mod tests {
         assert_eq!(
             observer.snapshot().attachment_id.as_deref(),
             Some("attach-1")
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_activation_leaves_future_bootstrap_bytes_collectable() {
+        let runtime = RemoteMainSlotRuntime::with_registry(RemoteConnectionRegistry::new());
+        let mailbox = runtime
+            .ensure_local_observer_connection("observer-a")
+            .expect("observer loopback registration should succeed");
+        runtime.ensure_local_connection("peer-a");
+        let target = remote_target();
+        let mut observer = RemoteObserverRuntime::new(mailbox, 80, 24);
+        let spec = RemoteInteractSurfaceSpec {
+            socket_name: "wa-1".to_string(),
+            surface_scope: "workspace-1".to_string(),
+            target: target.address.qualified_target(),
+            console_id: "workspace-main-slot:wa-1:workspace-1".to_string(),
+            console_host_id: "observer-a".to_string(),
+            console_location: ConsoleLocation::LocalWorkspace,
+        };
+
+        let (binding, raw) = activate_surface_target_with_mode(
+            &runtime,
+            &target,
+            &spec,
+            &TerminalSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            &mut observer,
+            true,
+        )
+        .expect("raw activation should succeed");
+
+        assert_eq!(binding.attachment_id, "attach-1");
+        assert!(raw.is_empty());
+
+        runtime
+            .send_mirror_bootstrap_chunk(&target, 1, "pty", b"prompt$ ".to_vec())
+            .expect("bootstrap should fan out after activation");
+        runtime
+            .send_mirror_bootstrap_complete(&target, 1, false, false, true)
+            .expect("bootstrap complete should fan out");
+
+        assert_eq!(
+            observer
+                .sync_and_collect_raw()
+                .expect("raw bootstrap should collect"),
+            b"prompt$ \x1b[?25h"
         );
     }
 
