@@ -388,7 +388,6 @@ where
                     if payload.target_id != command.target_id
                         || payload.session_id != command.transport_session_id
                     {
-                        #[cfg(debug_assertions)]
                         eprintln!(
                             "[target-host] ID mismatch: target_id={} session_id={}",
                             payload.target_id != command.target_id,
@@ -411,7 +410,6 @@ where
                     if let Err(error) =
                         activate_mirror(self, &command, &pane, &ingest_socket_path, &payload)
                     {
-                        #[cfg(debug_assertions)]
                         eprintln!("[target-host] activate_mirror failed: {error}");
                         if transport
                             .send_open_mirror_rejected(

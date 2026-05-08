@@ -17,7 +17,8 @@ use crate::infra::remote_transport_codec::{
     read_control_plane_envelope, write_control_plane_envelope,
 };
 use crate::infra::tmux::{
-    EmbeddedTmuxBackend, TmuxChromeGateway, TmuxSessionName, TmuxSocketName, TmuxWorkspaceHandle,
+    EmbeddedTmuxBackend, TmuxChromeGateway, TmuxSessionGateway, TmuxSessionName, TmuxSocketName,
+    TmuxWorkspaceHandle,
 };
 use crate::lifecycle::LifecycleError;
 use crate::runtime::remote_authority_target_host_runtime::{
@@ -278,13 +279,14 @@ impl SessionSyncAuthorityManager {
 
     fn handle_event(
         &mut self,
-        gateway: &impl LocalSessionCatalog,
         session_handle: &RemoteNodeSessionHandle,
         event: GrpcAuthorityEvent,
     ) {
         match event {
             GrpcAuthorityEvent::Command(command) => {
-                let _ = self.ensure_and_send_command(gateway, session_handle, command);
+                if let Err(error) = self.ensure_and_send_command(session_handle, command) {
+                    eprintln!("[session-sync] failed to handle authority command: {error}");
+                }
             }
             GrpcAuthorityEvent::MirrorAccepted
             | GrpcAuthorityEvent::MirrorRejected(_)
@@ -295,23 +297,23 @@ impl SessionSyncAuthorityManager {
 
     fn ensure_and_send_command(
         &mut self,
-        gateway: &impl LocalSessionCatalog,
         session_handle: &RemoteNodeSessionHandle,
         command: RemoteAuthorityCommand,
     ) -> Result<(), LifecycleError> {
         let target_id = authority_command_target_id(&command).to_string();
         if !self.running_hosts.contains_key(&target_id) {
             let session_name = target_session_name_from_target_id(&target_id).ok_or_else(|| {
+                eprintln!("[session-sync] failed to extract session from target id `{target_id}`");
                 LifecycleError::Protocol(format!(
                     "failed to derive local session from target id `{target_id}`"
                 ))
             })?;
-            let socket_name =
-                find_socket_name_for_session(gateway, &session_name).ok_or_else(|| {
-                    LifecycleError::Protocol(format!(
-                        "no local workspace socket owns session `{session_name}` for `{target_id}`"
-                    ))
-                })?;
+            let socket_name = find_socket_for_session(&session_name).ok_or_else(|| {
+                eprintln!("[session-sync] no local socket owns session `{session_name}` for `{target_id}`");
+                LifecycleError::Protocol(format!(
+                    "no local workspace socket owns session `{session_name}` for `{target_id}`"
+                ))
+            })?;
             let authority_socket_path =
                 live_authority_session_socket_path(&socket_name, &session_name);
             let transport_socket_path = remote_session_sync_owner_socket_path(&socket_name);
@@ -443,19 +445,11 @@ fn run_remote_session_sync_loop<G, T>(
 
         while !should_reconnect {
             if let Ok(event) = event_rx.recv_timeout(poll_interval) {
-                should_reconnect |= handle_transport_event(
-                    event,
-                    &mut active_session,
-                    &gateway,
-                    &mut authority_manager,
-                );
+                should_reconnect |=
+                    handle_transport_event(event, &mut active_session, &mut authority_manager);
                 while let Ok(event) = event_rx.try_recv() {
-                    should_reconnect |= handle_transport_event(
-                        event,
-                        &mut active_session,
-                        &gateway,
-                        &mut authority_manager,
-                    );
+                    should_reconnect |=
+                        handle_transport_event(event, &mut active_session, &mut authority_manager);
                 }
             }
 
@@ -487,7 +481,6 @@ fn run_remote_session_sync_loop<G, T>(
 fn handle_transport_event(
     event: RemoteNodeTransportEvent,
     active_session: &mut Option<RemoteNodeSessionHandle>,
-    gateway: &impl LocalSessionCatalog,
     authority_manager: &mut SessionSyncAuthorityManager,
 ) -> bool {
     match event {
@@ -500,7 +493,7 @@ fn handle_transport_event(
                 return false;
             };
             if let Some(event) = map_inbound_grpc_authority_event(envelope) {
-                authority_manager.handle_event(gateway, session_handle, event);
+                authority_manager.handle_event(session_handle, event);
             }
             false
         }
@@ -781,16 +774,19 @@ fn target_session_name_from_target_id(target_id: &str) -> Option<String> {
     }
 }
 
-fn find_socket_name_for_session(
-    gateway: &impl LocalSessionCatalog,
-    target_session_name: &str,
-) -> Option<String> {
-    gateway
-        .list_local_sessions()
-        .ok()?
-        .into_iter()
-        .find(|session| session.address.session_id() == target_session_name)
-        .map(|session| session.address.server_id().to_string())
+fn find_socket_for_session(target_session_name: &str) -> Option<String> {
+    let backend = EmbeddedTmuxBackend::from_build_env().ok()?;
+    let sockets = backend.discover_waitagent_sockets().ok()?;
+    for socket_name in &sockets {
+        let sessions = backend.list_sessions_on_socket(socket_name).ok()?;
+        if sessions
+            .iter()
+            .any(|s| s.address.session_id() == target_session_name)
+        {
+            return Some(socket_name.as_str().to_string());
+        }
+    }
+    None
 }
 
 fn spawn_in_process_authority_target_host(
