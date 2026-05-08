@@ -14,8 +14,9 @@ use crate::runtime::remote_target_publication_runtime::{
     signal_publication_sender_live_session_unregistered, RemoteTargetPublicationRuntime,
 };
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,15 +55,6 @@ pub trait RemoteTargetPtyGateway: Send + Sync + Clone + 'static {
         socket_name: &str,
         target_session_name: &str,
     ) -> Result<TmuxPaneId, Self::Error>;
-
-    fn send_input(
-        &self,
-        socket_name: &str,
-        pane: &TmuxPaneId,
-        bytes: &[u8],
-    ) -> Result<(), Self::Error>;
-
-    fn pane_tty_path(&self, socket_name: &str, pane: &TmuxPaneId) -> Result<String, Self::Error>;
 
     fn resize_pty(
         &self,
@@ -109,19 +101,6 @@ impl RemoteTargetPtyGateway for EmbeddedTmuxBackend {
         target_session_name: &str,
     ) -> Result<TmuxPaneId, Self::Error> {
         self.target_presentation_pane_on_socket(socket_name, target_session_name)
-    }
-
-    fn send_input(
-        &self,
-        socket_name: &str,
-        pane: &TmuxPaneId,
-        bytes: &[u8],
-    ) -> Result<(), Self::Error> {
-        self.send_input_to_pane_on_socket(socket_name, pane, bytes)
-    }
-
-    fn pane_tty_path(&self, socket_name: &str, pane: &TmuxPaneId) -> Result<String, Self::Error> {
-        self.pane_tty_path_on_socket(socket_name, pane)
     }
 
     fn resize_pty(
@@ -244,6 +223,7 @@ where
     socket_name: String,
     pane: TmuxPaneId,
     ingest_socket_path: PathBuf,
+    input_fifo_path: PathBuf,
 }
 
 pub struct RemoteAuthorityOutputPumpRuntime;
@@ -300,13 +280,17 @@ where
         );
         let ingest_socket_path =
             authority_output_ingest_socket_path(&command.transport_socket_path, &command.target_id);
+        let input_fifo_path =
+            authority_input_fifo_path(&command.transport_socket_path, &command.target_id);
         let listener =
             bind_output_ingest_listener(&ingest_socket_path).map_err(remote_authority_error)?;
+        create_input_fifo(&input_fifo_path).map_err(remote_authority_error)?;
         let _output_guard = OutputPipeGuard {
             gateway: self.gateway.clone(),
             socket_name: command.socket_name.clone(),
             pane: pane.clone(),
             ingest_socket_path: ingest_socket_path.clone(),
+            input_fifo_path: input_fifo_path.clone(),
         };
 
         eprintln!(
@@ -337,13 +321,11 @@ where
         let mut output_seq = 0_u64;
         let mut mirror_state = MirrorState::Inactive;
 
-        // Open pty for direct write (bypassing tmux send-keys subprocess)
-        let mut pty_file = self
-            .gateway
-            .pane_tty_path(&command.socket_name, &pane)
-            .ok()
-            .and_then(|path| std::fs::OpenOptions::new().write(true).open(&path).ok());
-        let _has_fast_input = pty_file.is_some();
+        let mut input_fifo = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input_fifo_path)
+            .map_err(remote_authority_error)?;
 
         let loop_result = loop {
             match event_rx.recv() {
@@ -456,18 +438,11 @@ where
                         Ok(bytes) => bytes,
                         Err(error) => break Err(error),
                     };
-                    // Write directly to pty when possible (bypasses tmux send-keys subprocess)
-                    let direct_ok = pty_file
-                        .as_mut()
-                        .map_or(false, |f| f.write_all(&bytes).is_ok());
-                    if !direct_ok {
-                        if let Err(error) = self
-                            .gateway
-                            .send_input(&command.socket_name, &pane, &bytes)
-                            .map_err(remote_authority_error)
-                        {
-                            break Err(error);
-                        }
+                    if let Err(error) = input_fifo
+                        .write_all(&bytes)
+                        .and_then(|_| input_fifo.flush())
+                    {
+                        break Err(remote_authority_error(error));
                     }
                 }
                 Ok(AuthorityHostEvent::TransportCommand(RemoteAuthorityCommand::ApplyResize(
@@ -573,9 +548,29 @@ pub(crate) fn remote_authority_target_host_args(
 
 impl RemoteAuthorityOutputPumpRuntime {
     pub fn run(command: RemoteAuthorityOutputPumpCommand) -> Result<(), LifecycleError> {
+        let input_fifo_path = command.input_fifo_path.clone();
+        let input_thread = thread::spawn(move || -> Result<(), RemoteAuthorityHostError> {
+            let mut fifo = OpenOptions::new().read(true).open(input_fifo_path)?;
+            let mut stdout = io::stdout().lock();
+            io::copy(&mut fifo, &mut stdout)?;
+            stdout.flush()?;
+            Ok(())
+        });
+
         let stdin = io::stdin();
-        pump_reader_to_ingest_socket(stdin.lock(), &command.ingest_socket_path)
-            .map_err(remote_authority_error)
+        let pump_result = pump_reader_to_ingest_socket(stdin.lock(), &command.ingest_socket_path);
+        match input_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if pump_result.is_ok() => return Err(remote_authority_error(error)),
+            Ok(Err(_)) => {}
+            Err(_) if pump_result.is_ok() => {
+                return Err(remote_authority_error(RemoteAuthorityHostError::new(
+                    "remote authority input pump panicked",
+                )))
+            }
+            Err(_) => {}
+        }
+        pump_result.map_err(remote_authority_error)
     }
 }
 
@@ -588,6 +583,7 @@ where
             .gateway
             .clear_output_pipe(&self.socket_name, &self.pane);
         let _ = fs::remove_file(&self.ingest_socket_path);
+        let _ = fs::remove_file(&self.input_fifo_path);
     }
 }
 
@@ -600,6 +596,23 @@ fn bind_output_ingest_listener(
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+fn create_input_fifo(fifo_path: &Path) -> Result<(), RemoteAuthorityHostError> {
+    if fifo_path.exists() {
+        let _ = fs::remove_file(fifo_path);
+    }
+    let c_path = std::ffi::CString::new(fifo_path.as_os_str().as_bytes())
+        .map_err(|_| RemoteAuthorityHostError::new("input fifo path contains interior NUL"))?;
+    let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    if result == -1 {
+        return Err(RemoteAuthorityHostError::new(format!(
+            "failed to create input fifo {}: {}",
+            fifo_path.display(),
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 fn spawn_output_ingest_thread(
@@ -675,15 +688,23 @@ pub fn authority_output_ingest_socket_path(
     std::env::temp_dir().join(format!("waitagent-authority-output-{hash}.sock"))
 }
 
+pub fn authority_input_fifo_path(transport_socket_path: &str, target_id: &str) -> PathBuf {
+    let hash = stable_socket_hash(&[transport_socket_path, target_id]);
+    std::env::temp_dir().join(format!("waitagent-authority-input-{hash}.fifo"))
+}
+
 fn remote_authority_output_pump_shell_command(
     executable: &str,
     ingest_socket_path: &Path,
+    input_fifo_path: &Path,
 ) -> String {
     [
         shell_escape(executable),
         shell_escape("__remote-authority-output-pump"),
         shell_escape("--ingest-socket-path"),
         shell_escape(&ingest_socket_path.display().to_string()),
+        shell_escape("--input-fifo-path"),
+        shell_escape(&input_fifo_path.display().to_string()),
     ]
     .join(" ")
 }
@@ -702,6 +723,7 @@ where
     let pipe_command = remote_authority_output_pump_shell_command(
         runtime.current_executable.to_string_lossy().as_ref(),
         ingest_socket_path,
+        &authority_input_fifo_path(&command.transport_socket_path, &command.target_id),
     );
     runtime
         .gateway
@@ -875,15 +897,15 @@ fn wait_for_ready_socket(socket_path: &Path) -> Result<(), LifecycleError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        authority_output_ingest_socket_path, pump_reader_to_ingest_socket, read_output_chunk_frame,
-        remote_authority_error, remote_authority_output_pump_shell_command,
-        remote_authority_target_host_args, render_bootstrap_replay, write_output_chunk_frame,
-        LifecycleError, RemoteAuthorityPublicationGateway, RemoteAuthorityTargetHostRuntime,
+        authority_input_fifo_path, authority_output_ingest_socket_path,
+        pump_reader_to_ingest_socket, read_output_chunk_frame, remote_authority_error,
+        remote_authority_output_pump_shell_command, remote_authority_target_host_args,
+        render_bootstrap_replay, write_output_chunk_frame, LifecycleError,
+        RemoteAuthorityPublicationGateway, RemoteAuthorityTargetHostRuntime,
         RemoteTargetPtyGateway, RemoteTargetTerminalFlags,
     };
     use crate::cli::RemoteAuthorityTargetHostCommand;
     use crate::cli::RemoteNetworkConfig;
-    use crate::infra::base64::decode_base64;
     use crate::infra::remote_protocol::{
         ApplyResizePayload, ClientHelloPayload, ControlPlanePayload, NodeSessionChannel,
         NodeSessionEnvelope, OpenMirrorRequestPayload, ProtocolEnvelope, TargetInputPayload,
@@ -899,7 +921,9 @@ mod tests {
     use crate::runtime::remote_node_session_runtime::RemoteNodeSessionRuntime;
     use crate::runtime::remote_node_transport_runtime::write_server_hello;
     use std::fs;
+    use std::fs::OpenOptions;
     use std::io::Cursor;
+    use std::io::Read;
     use std::net::Shutdown;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -911,7 +935,6 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct FakeGateway {
-        input_calls: Arc<Mutex<Vec<Vec<u8>>>>,
         resize_calls: Arc<Mutex<Vec<(usize, usize)>>>,
         pipe_calls: Arc<Mutex<Vec<String>>>,
         clear_calls: Arc<Mutex<usize>>,
@@ -929,27 +952,6 @@ mod tests {
             _target_session_name: &str,
         ) -> Result<TmuxPaneId, Self::Error> {
             Ok(TmuxPaneId::new("%7"))
-        }
-
-        fn send_input(
-            &self,
-            _socket_name: &str,
-            _pane: &TmuxPaneId,
-            bytes: &[u8],
-        ) -> Result<(), Self::Error> {
-            self.input_calls
-                .lock()
-                .expect("input calls mutex should not be poisoned")
-                .push(bytes.to_vec());
-            Ok(())
-        }
-
-        fn pane_tty_path(
-            &self,
-            _socket_name: &str,
-            _pane: &TmuxPaneId,
-        ) -> Result<String, Self::Error> {
-            Ok("/dev/pts/99".to_string())
         }
 
         fn resize_pty(
@@ -1096,11 +1098,12 @@ mod tests {
         let command = remote_authority_output_pump_shell_command(
             "/tmp/wait agent",
             Path::new("/tmp/output path.sock"),
+            Path::new("/tmp/input path.fifo"),
         );
 
         assert_eq!(
             command,
-            "'/tmp/wait agent' '__remote-authority-output-pump' '--ingest-socket-path' '/tmp/output path.sock'"
+            "'/tmp/wait agent' '__remote-authority-output-pump' '--ingest-socket-path' '/tmp/output path.sock' '--input-fifo-path' '/tmp/input path.fifo'"
         );
     }
 
@@ -1196,8 +1199,24 @@ mod tests {
             command.transport_socket_path.as_str(),
             &command.target_id,
         );
+        let input_fifo_path =
+            authority_input_fifo_path(command.transport_socket_path.as_str(), &command.target_id);
         let server_ingest_socket_path = ingest_socket_path.clone();
         let (server_tx, server_rx) = std::sync::mpsc::channel();
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let input_reader_path = input_fifo_path.clone();
+        thread::spawn(move || {
+            wait_for_socket(&input_reader_path);
+            let mut fifo = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&input_reader_path)
+                .expect("input fifo should open");
+            let mut bytes = [0_u8; 1];
+            fifo.read_exact(&mut bytes)
+                .expect("input fifo should receive target input");
+            let _ = input_tx.send(bytes.to_vec());
+        });
         thread::spawn(move || {
             let (mut stream, _) = transport_listener
                 .accept()
@@ -1316,12 +1335,10 @@ mod tests {
             .expect("runtime should finish cleanly");
 
         assert_eq!(
-            fake_gateway
-                .input_calls
-                .lock()
-                .expect("input calls mutex should not be poisoned")
-                .clone(),
-            vec![b"a".to_vec()]
+            input_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("input fifo should receive target input"),
+            b"a".to_vec()
         );
         assert_eq!(
             fake_gateway
