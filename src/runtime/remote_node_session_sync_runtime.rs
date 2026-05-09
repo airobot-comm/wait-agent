@@ -40,10 +40,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SESSION_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SESSION_SYNC_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const SESSION_SYNC_RAW_INPUT_QUIET_WINDOW: Duration = Duration::from_millis(750);
 const REMOTE_SESSION_SYNC_OWNER_READY_RETRIES: usize = 20;
 const REMOTE_SESSION_SYNC_OWNER_READY_SLEEP: Duration = Duration::from_millis(25);
 const SESSION_SYNC_AUTHORITY_ID: &str = "waitagent-session-sync-authority";
@@ -442,14 +443,27 @@ fn run_remote_session_sync_loop<G, T>(
         let mut synced_sessions = HashMap::<String, ManagedSessionRecord>::new();
         let mut authority_manager = SessionSyncAuthorityManager::new();
         let mut should_reconnect = false;
+        let mut next_sync_at = Instant::now() + poll_interval;
+        let mut raw_input_quiet_until: Option<Instant> = None;
 
         while !should_reconnect {
-            if let Ok(event) = event_rx.recv_timeout(poll_interval) {
-                should_reconnect |=
+            let wait_duration = next_sync_at.saturating_duration_since(Instant::now());
+            if let Ok(event) = event_rx.recv_timeout(wait_duration) {
+                let outcome =
                     handle_transport_event(event, &mut active_session, &mut authority_manager);
+                should_reconnect |= outcome.should_reconnect;
+                if outcome.raw_pty_input {
+                    raw_input_quiet_until =
+                        Some(Instant::now() + SESSION_SYNC_RAW_INPUT_QUIET_WINDOW);
+                }
                 while let Ok(event) = event_rx.try_recv() {
-                    should_reconnect |=
+                    let outcome =
                         handle_transport_event(event, &mut active_session, &mut authority_manager);
+                    should_reconnect |= outcome.should_reconnect;
+                    if outcome.raw_pty_input {
+                        raw_input_quiet_until =
+                            Some(Instant::now() + SESSION_SYNC_RAW_INPUT_QUIET_WINDOW);
+                    }
                 }
             }
 
@@ -458,8 +472,19 @@ fn run_remote_session_sync_loop<G, T>(
             }
 
             let Some(session_handle) = active_session.as_ref() else {
+                next_sync_at = Instant::now() + poll_interval;
                 continue;
             };
+            if Instant::now() < next_sync_at {
+                continue;
+            }
+            if raw_input_quiet_until
+                .map(|quiet_until| Instant::now() < quiet_until)
+                .unwrap_or(false)
+            {
+                next_sync_at = raw_input_quiet_until.unwrap_or_else(Instant::now);
+                continue;
+            }
             if let Err(_) = sync_local_sessions(
                 &gateway,
                 &node_id,
@@ -469,6 +494,7 @@ fn run_remote_session_sync_loop<G, T>(
             ) {
                 should_reconnect = true;
             }
+            next_sync_at = Instant::now() + poll_interval;
         }
 
         if wait_or_stop(&stop_rx, reconnect_delay) {
@@ -478,30 +504,43 @@ fn run_remote_session_sync_loop<G, T>(
     }
 }
 
+#[derive(Debug, Default)]
+struct TransportEventOutcome {
+    should_reconnect: bool,
+    raw_pty_input: bool,
+}
+
 fn handle_transport_event(
     event: RemoteNodeTransportEvent,
     active_session: &mut Option<RemoteNodeSessionHandle>,
     authority_manager: &mut SessionSyncAuthorityManager,
-) -> bool {
+) -> TransportEventOutcome {
     match event {
         RemoteNodeTransportEvent::SessionOpened { session } => {
             *active_session = Some(session);
-            false
+            TransportEventOutcome::default()
         }
         RemoteNodeTransportEvent::EnvelopeReceived { envelope, .. } => {
             let Some(session_handle) = active_session.as_ref() else {
-                return false;
+                return TransportEventOutcome::default();
             };
+            let raw_pty_input = matches!(envelope.body.as_ref(), Some(Body::RawPtyInput(_)));
             if let Some(event) = map_inbound_grpc_authority_event(envelope) {
                 authority_manager.handle_event(session_handle, event);
             }
-            false
+            TransportEventOutcome {
+                should_reconnect: false,
+                raw_pty_input,
+            }
         }
         RemoteNodeTransportEvent::SessionClosed { .. }
         | RemoteNodeTransportEvent::TransportFailed { .. } => {
             authority_manager.shutdown();
             *active_session = None;
-            true
+            TransportEventOutcome {
+                should_reconnect: true,
+                raw_pty_input: false,
+            }
         }
     }
 }
@@ -699,7 +738,10 @@ fn compute_session_sync_delta(
     let publish = current
         .iter()
         .filter_map(|(local_id, session)| {
-            if previous.get(local_id) == Some(session) {
+            if previous
+                .get(local_id)
+                .is_some_and(|previous| session_records_equivalent_for_sync(previous, session))
+            {
                 None
             } else {
                 Some(session.clone())
@@ -717,6 +759,29 @@ fn compute_session_sync_delta(
         })
         .collect::<Vec<_>>();
     SessionSyncDelta { publish, exit }
+}
+
+fn session_records_equivalent_for_sync(
+    previous: &ManagedSessionRecord,
+    current: &ManagedSessionRecord,
+) -> bool {
+    let mut previous = previous.clone();
+    let mut current = current.clone();
+    if is_interactive_shell_state(&previous) && is_interactive_shell_state(&current) {
+        previous.task_state = ManagedSessionTaskState::Input;
+        current.task_state = ManagedSessionTaskState::Input;
+    }
+    previous == current
+}
+
+fn is_interactive_shell_state(session: &ManagedSessionRecord) -> bool {
+    matches!(
+        session.command_name.as_deref(),
+        Some("bash" | "zsh" | "fish" | "sh")
+    ) && matches!(
+        session.task_state,
+        ManagedSessionTaskState::Input | ManagedSessionTaskState::Running
+    )
 }
 
 fn authority_command_target_id(command: &RemoteAuthorityCommand) -> &str {
@@ -1154,6 +1219,55 @@ mod tests {
         assert_eq!(delta.publish.len(), 2);
         assert_eq!(delta.exit.len(), 1);
         assert_eq!(delta.exit[0].address.session_id(), "shell-old");
+    }
+
+    #[test]
+    fn session_sync_delta_ignores_interactive_shell_input_running_flaps() {
+        let mut previous_session = session("wa-1", "shell-1");
+        previous_session.command_name = Some("bash".to_string());
+        previous_session.task_state = ManagedSessionTaskState::Input;
+        let mut current_session = previous_session.clone();
+        current_session.task_state = ManagedSessionTaskState::Running;
+        let previous = local_sessions_by_local_id(vec![previous_session]);
+        let current = local_sessions_by_local_id(vec![current_session]);
+
+        let delta = compute_session_sync_delta(&previous, &current);
+
+        assert!(delta.publish.is_empty());
+        assert!(delta.exit.is_empty());
+    }
+
+    #[test]
+    fn session_sync_delta_publishes_non_shell_state_changes() {
+        let mut previous_session = session("wa-1", "shell-1");
+        previous_session.command_name = Some("codex".to_string());
+        previous_session.task_state = ManagedSessionTaskState::Input;
+        let mut current_session = previous_session.clone();
+        current_session.task_state = ManagedSessionTaskState::Running;
+        let previous = local_sessions_by_local_id(vec![previous_session]);
+        let current = local_sessions_by_local_id(vec![current_session]);
+
+        let delta = compute_session_sync_delta(&previous, &current);
+
+        assert_eq!(delta.publish.len(), 1);
+        assert!(delta.exit.is_empty());
+    }
+
+    #[test]
+    fn session_sync_delta_publishes_interactive_shell_non_state_changes() {
+        let mut previous_session = session("wa-1", "shell-1");
+        previous_session.command_name = Some("bash".to_string());
+        previous_session.task_state = ManagedSessionTaskState::Input;
+        let mut current_session = previous_session.clone();
+        current_session.current_path = Some(PathBuf::from("/tmp/other"));
+        current_session.task_state = ManagedSessionTaskState::Running;
+        let previous = local_sessions_by_local_id(vec![previous_session]);
+        let current = local_sessions_by_local_id(vec![current_session]);
+
+        let delta = compute_session_sync_delta(&previous, &current);
+
+        assert_eq!(delta.publish.len(), 1);
+        assert!(delta.exit.is_empty());
     }
 
     #[test]

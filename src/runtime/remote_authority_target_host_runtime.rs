@@ -292,14 +292,6 @@ where
             input_fifo_path: input_fifo_path.clone(),
         };
 
-        eprintln!(
-            "[target-host] started: socket={} session={} target_id={} transport_session_id={}",
-            command.socket_name,
-            command.target_session_name,
-            command.target_id,
-            command.transport_session_id,
-        );
-
         let (event_tx, event_rx) = mpsc::channel();
         let reader_transport = transport.clone();
         let reader_tx = event_tx.clone();
@@ -332,7 +324,6 @@ where
                     payload,
                 ))) => {
                     if matches!(mirror_state, MirrorState::Active { .. }) {
-                        eprintln!("[target-host] re-mirror request (mirror already active)");
                         if let Err(error) = self
                             .gateway
                             .resize_pty(&command.socket_name, &pane, payload.cols, payload.rows)
@@ -362,18 +353,9 @@ where
                         }
                         continue;
                     }
-                    eprintln!(
-                        "[target-host] OpenMirrorRequest: payload.target_id={} payload.session_id={} cmd.target_id={} cmd.transport_session_id={}",
-                        payload.target_id, payload.session_id, command.target_id, command.transport_session_id,
-                    );
                     if payload.target_id != command.target_id
                         || payload.session_id != command.transport_session_id
                     {
-                        eprintln!(
-                            "[target-host] ID mismatch: target_id={} session_id={}",
-                            payload.target_id != command.target_id,
-                            payload.session_id != command.transport_session_id,
-                        );
                         if let Err(error) = transport
                             .send_open_mirror_rejected(
                                 &payload.session_id,
@@ -387,11 +369,9 @@ where
                         }
                         continue;
                     }
-                    eprintln!("[target-host] activating mirror");
                     if let Err(error) =
                         activate_mirror(self, &command, &pane, &ingest_socket_path, &payload)
                     {
-                        eprintln!("[target-host] activate_mirror failed: {error}");
                         if transport
                             .send_open_mirror_rejected(
                                 &payload.session_id,
@@ -408,7 +388,6 @@ where
                     mirror_state = MirrorState::Active {
                         raw_pty_passthrough: payload.raw_pty_passthrough,
                     };
-                    eprintln!("[target-host] mirror activated, sending emit_bootstrap");
                     if let Err(error) = transport
                         .send_open_mirror_accepted(
                             &payload.session_id,

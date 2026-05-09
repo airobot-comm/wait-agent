@@ -13,6 +13,7 @@ use crate::infra::remote_protocol::{
     ControlPlanePayload, ProtocolEnvelope, TargetExitedPayload, TargetPublishedPayload,
     REMOTE_PROTOCOL_VERSION,
 };
+use crate::infra::tmux::EmbeddedTmuxBackend;
 use crate::lifecycle::LifecycleError;
 use crate::runtime::remote_authority_transport_runtime::{
     authority_target_component, RemoteAuthorityCommand, RemoteAuthorityTransportRuntime,
@@ -83,7 +84,7 @@ impl RemoteNodeIngressServerRuntime {
             .set_nonblocking(true)
             .map_err(remote_node_ingress_error)?;
         let _guard = self.start()?;
-        while any_live_workspace_exists(&self.publication_runtime)? {
+        while any_live_workspace_exists()? {
             let _ = drain_owner_ping(&listener);
             thread::sleep(BRIDGE_REFRESH_INTERVAL);
         }
@@ -180,12 +181,14 @@ fn drain_owner_ping(listener: &std::os::unix::net::UnixListener) -> io::Result<(
     }
 }
 
-fn any_live_workspace_exists(
-    publication_runtime: &RemoteTargetPublicationRuntime,
-) -> Result<bool, LifecycleError> {
-    Ok(!publication_runtime
-        .live_workspace_socket_names()?
-        .is_empty())
+fn any_live_workspace_exists() -> Result<bool, LifecycleError> {
+    let backend = EmbeddedTmuxBackend::from_build_env().map_err(remote_node_ingress_error)?;
+    let sockets = backend
+        .discover_waitagent_sockets()
+        .map_err(remote_node_ingress_error)?;
+    Ok(sockets
+        .iter()
+        .any(|socket_name| backend.socket_is_live(socket_name)))
 }
 
 impl Drop for RemoteNodeIngressServerGuard {
