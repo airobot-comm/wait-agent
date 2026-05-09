@@ -101,7 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/kikakkz/wait-agent/main/scripts/ins
 To install to a different directory or pin a specific version:
 
 ```bash
-INSTALL_DIR=~/.local/bin VERSION=0.0.9 curl -fsSL https://raw.githubusercontent.com/kikakkz/wait-agent/main/scripts/install.sh | bash
+INSTALL_DIR=~/.local/bin VERSION=0.0.10 curl -fsSL https://raw.githubusercontent.com/kikakkz/wait-agent/main/scripts/install.sh | bash
 ```
 
 Pre-built packages are also available from the [GitHub Releases](https://github.com/kikakkz/wait-agent/releases) page.
