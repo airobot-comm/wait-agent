@@ -191,6 +191,7 @@ Current focus:
 
 - add explicit session-scoped live-mirror control on the accepted remote path so opening a remote session yields the client session's real visible screen rather than placeholder-only transport state
 - close the three real remote Codex fidelity defects now confirmed in end-to-end use: application-cursor-aware remote input forwarding, reopen-safe remote terminal bootstrap parity, and prompt command-name freshness for remote sidebar rows
+- close the SSH-parity raw PTY optimization queue now captured in `docs/raw-pty-tunnel-design.md`: local input must not block on transport writes, the authority side should stop using FIFO/output-pump bridging as the normal data plane, raw PTY frames should be lightweight, authority bridge discovery should become event-driven, and remote attach should reduce tmux bootstrap capture cost
 
 Accepted local architecture direction:
 
@@ -219,7 +220,12 @@ Remaining remote queue for phase completion:
 1. `task.t5-08c4d3b` Implement explicit remote mirror open or close protocol messages and server-side session-route ownership
 2. `task.t5-08c4d3c` Implement PTY-owner session mirror lifecycle and reuse on the connected client node
 3. `task.t5-08c4d3d` Bind bootstrap replay plus live output into visible parity and close cross-host acceptance
-4. `T3-07` Implement narrow-terminal compaction rules for the fixed-chrome workspace layout only if acceptance evidence proves compact layout is blocking
+4. `task.t5-08c4d3e` Decouple local raw PTY input from synchronous transport writes
+5. `task.t5-08c4d3f` Replace FIFO and output-pump bridging with direct remote PTY ownership
+6. `task.t5-08c4d3g` Introduce a lightweight raw PTY authority frame path
+7. `task.t5-08c4d3h` Make authority bridge discovery event-driven
+8. `task.t5-08c4d3i` Reduce remote attach bootstrap capture cost
+9. `T3-07` Implement narrow-terminal compaction rules for the fixed-chrome workspace layout only if acceptance evidence proves compact layout is blocking
 
 The exact machine ordering for that queue lives in `.agents/tasks/backlog.yaml`.
 

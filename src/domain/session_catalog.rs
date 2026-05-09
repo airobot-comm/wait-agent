@@ -356,11 +356,12 @@ fn looks_like_shell_prompt(command_name: &str, line: &str) -> bool {
 }
 
 fn looks_like_agent_input(command_name: &str, line: &str) -> bool {
+    let lowered = line.to_ascii_lowercase();
     matches!(command_name, "codex" | "claude")
         && (line.starts_with('›')
             || line.starts_with("> ")
-            || line.contains("type your message")
-            || line.contains("send a message"))
+            || lowered.contains("type your message")
+            || lowered.contains("send a message"))
 }
 
 #[cfg(test)]
@@ -553,6 +554,23 @@ mod tests {
         let state = ManagedSessionTaskState::infer(Some("codex"), "Tip\n› ");
 
         assert_eq!(state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn task_state_infers_input_from_claude_prompt_line_case_insensitively() {
+        let state = ManagedSessionTaskState::infer(Some("claude"), "Ready\nType your message");
+
+        assert_eq!(state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn task_state_does_not_infer_input_from_stale_agent_prompt_line() {
+        let state = ManagedSessionTaskState::infer(
+            Some("claude"),
+            "Claude\nType your message\n\nRunning tool call",
+        );
+
+        assert_eq!(state, ManagedSessionTaskState::Running);
     }
 
     #[test]

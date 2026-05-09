@@ -218,6 +218,21 @@ next:
   - id: task.t5-08c4d3d
     title: bind bootstrap replay and live remote output into visible parity and close cross-host acceptance
     status: done
+  - id: task.t5-08c4d3e
+    title: decouple local raw PTY input from synchronous transport writes
+    status: ready
+  - id: task.t5-08c4d3f
+    title: replace FIFO and output-pump bridging with direct remote PTY ownership
+    status: ready
+  - id: task.t5-08c4d3g
+    title: introduce a lightweight raw PTY authority frame path
+    status: ready
+  - id: task.t5-08c4d3h
+    title: make authority bridge discovery event-driven
+    status: ready
+  - id: task.t5-08c4d3i
+    title: reduce remote attach bootstrap capture cost
+    status: ready
   - id: task.t3-07
     title: implement narrow-terminal compaction rules for the fixed-chrome workspace layout
     status: deferred
@@ -276,6 +291,7 @@ notes:
   - 2026-04-30 correction: the previously landed `task.t5-08c1` discovered-target slice is no longer the accepted end state because the remote product model is `node -> sessions -> attachments`, so active work is now re-split into `task.t5-08c2 -> task.t5-08c4`.
   - 2026-05-02 refinement: the old `task.t5-08c4d` validation umbrella is now split again into `task.t5-08c4d1 -> task.t5-08c4d3` because correcting the backend-scoped local session export boundary must land before detach or reattach and cross-host acceptance can be trusted.
   - 2026-05-02 refinement: the old `task.t5-08c4d3` cross-host validation umbrella is now split again into `task.t5-08c4d3a -> task.t5-08c4d3d` because the latest review exposed a missing session-scoped live-mirror design and runtime lifecycle rather than a single validation-only gap.
+  - 2026-05-09 refinement: raw PTY is now the accepted remote interactive baseline, but the SSH-parity review split remaining latency work into `task.t5-08c4d3e -> task.t5-08c4d3i` covering local input write decoupling, direct PTY ownership, lightweight raw frames, event-driven bridge discovery, and faster attach bootstrap.
   - The old gutter-scroll direction remains retired.
   - The old custom fullscreen-history direction is now also retired as the primary architecture because Codex-like live TUIs do not reliably repaint under the mixed narrow-PTY then widened-fullscreen model.
   - `task.architecture-1` is intentionally parked as deferred cleanup so it stays visible without silently becoming the next in-progress delivery slice.

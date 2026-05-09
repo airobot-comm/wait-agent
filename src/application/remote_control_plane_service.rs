@@ -45,7 +45,6 @@ impl RemoteControlPlaneService {
         Self::default()
     }
 
-    #[allow(dead_code)]
     pub fn record_mirror_accepted(&mut self, session_id: &str) {
         if let Some(state) = self.session_states.get_mut(session_id) {
             if state.mirror_route == MirrorRouteState::Pending {
@@ -54,18 +53,16 @@ impl RemoteControlPlaneService {
         }
     }
 
-    #[allow(dead_code)]
     pub fn record_mirror_rejected(&mut self, session_id: &str, reason: String) {
         if let Some(state) = self.session_states.get_mut(session_id) {
             state.mirror_route = MirrorRouteState::Rejected(reason);
         }
     }
 
-    #[allow(dead_code)]
     pub fn handle_authority_disconnect(&mut self, authority_node_id: &str) {
         let mut sessions_to_remove = Vec::new();
         for (session_id, state) in &self.session_states {
-            if state.mirror_route.is_active()
+            if !matches!(state.mirror_route, MirrorRouteState::None)
                 && state.authority_node_id.as_deref() == Some(authority_node_id)
             {
                 sessions_to_remove.push(session_id.clone());

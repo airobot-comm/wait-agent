@@ -391,6 +391,8 @@ impl RemoteMainSlotPaneRuntime {
                             }
                         }
                         AuthorityTransportEvent::Disconnected => {
+                            remote_runtime
+                                .handle_authority_disconnect(target.address.authority_id());
                             authority_status = authority_status_from_runtime(
                                 &remote_runtime,
                                 &target,
@@ -943,10 +945,16 @@ fn spawn_input_thread(tx: mpsc::Sender<RemotePaneEvent>, raw_input: RawInputMode
                 Ok(0) => break,
                 Ok(read) => {
                     let bytes = buffer[..read].to_vec();
-                    let raw_forwarded = raw_input
-                        .route
-                        .send(&raw_input.registry, bytes.clone())
-                        .unwrap_or(false);
+                    let raw_forwarded =
+                        match raw_input.route.send(&raw_input.registry, bytes.clone()) {
+                            Ok(forwarded) => forwarded,
+                            Err(_) => {
+                                let _ = tx.send(RemotePaneEvent::AuthorityTransport(
+                                    AuthorityTransportEvent::Disconnected,
+                                ));
+                                true
+                            }
+                        };
                     if tx
                         .send(RemotePaneEvent::Input {
                             bytes,
@@ -1061,8 +1069,12 @@ pub(crate) fn apply_authority_envelope(
     envelope: &ProtocolEnvelope<ControlPlanePayload>,
 ) -> Result<(), RemoteSocketTransportError> {
     match &envelope.payload {
-        ControlPlanePayload::OpenMirrorAccepted(_) => Ok(()),
+        ControlPlanePayload::OpenMirrorAccepted(payload) => {
+            remote_runtime.record_mirror_accepted(&payload.session_id);
+            Ok(())
+        }
         ControlPlanePayload::OpenMirrorRejected(payload) => {
+            remote_runtime.record_mirror_rejected(&payload.session_id, payload.message.clone());
             Err(RemoteSocketTransportError::new(format!(
                 "remote mirror open rejected for `{}`: {}",
                 payload.target_id, payload.message

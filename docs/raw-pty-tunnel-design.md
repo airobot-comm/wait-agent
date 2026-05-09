@@ -90,6 +90,91 @@ Remaining cleanup:
 - retire mirror bootstrap from the active interactive attach path
 - document any remaining observer-only consumers
 
+## SSH Parity Optimization Backlog
+
+The raw PTY path is now functionally correct enough to replace the legacy
+remote input route, but the current implementation still contains several
+latency sources that make it feel different from direct SSH. These are tracked
+as bounded follow-up tasks rather than ad hoc patches.
+
+### `task.t5-08c4d3e`: Decouple Local Input From Synchronous Transport Writes
+
+The local stdin reader currently forwards each input chunk synchronously into
+the authority transport. That keeps the UI event loop out of the keystroke
+path, but the stdin thread can still block on route lookup, writer mutex
+contention, socket backpressure, frame encoding, and `flush()`.
+
+Target state:
+
+- stdin reads enqueue bytes into a dedicated raw-input writer queue
+- the stdin reader never blocks on network or authority-transport writes
+- the writer may coalesce immediately-available burst bytes, but must not add a
+  fixed sleep before sending
+- backpressure is explicit and observable instead of silently stalling terminal
+  input
+
+### `task.t5-08c4d3f`: Replace FIFO And Output-Pump Bridging With Direct PTY Ownership
+
+The authority host still reaches the target PTY through tmux `pipe-pane` plus a
+separate output-pump process and FIFO-backed input. That adds process,
+filesystem, framing, and flush boundaries that SSH does not have.
+
+Target state:
+
+- the authority host owns a direct read/write PTY handle or an equivalent tmux
+  primitive that avoids a FIFO input hop
+- input bytes are written directly to the remote PTY path from the authority
+  host
+- output bytes are read directly by the authority host without an extra
+  output-pump process where practical
+- teardown removes temporary sockets and FIFOs only as compatibility fallback,
+  not as the normal data plane
+
+### `task.t5-08c4d3g`: Use A Lightweight Raw PTY Frame Path
+
+Raw PTY input and output still travel through payload structs that carry full
+control-plane identity and message metadata on every chunk. Each frame is
+flushed immediately.
+
+Target state:
+
+- raw input/output use a compact binary frame on the authority transport
+- stable attachment/session/target route state is negotiated at mirror open and
+  not repeated on every byte chunk unless needed for recovery
+- per-frame allocation and string cloning in the hot path are minimized
+- flush behavior is tuned for interactive latency without forcing one full
+  metadata frame per typed character
+
+### `task.t5-08c4d3h`: Make Authority Bridge Discovery Event-Driven
+
+The ingress server still performs periodic authority-socket refresh scans. Raw
+input events skip the refresh path, but the 250 ms timeout scan remains
+background work that can create periodic jitter under many sessions.
+
+Target state:
+
+- authority sockets register and unregister through explicit lifecycle events
+- ingress refresh no longer scans the temp directory on a fixed interval during
+  steady-state interaction
+- stale bridge cleanup remains reliable on disconnect or process death
+- raw input/output routing does not compete with bridge discovery work
+
+### `task.t5-08c4d3i`: Reduce Attach Bootstrap Capture Cost
+
+Remote attach still performs multiple tmux queries to capture screen, cursor
+position, and terminal flags before live bytes take over. That affects the
+perceived speed of switching to a remote session.
+
+Target state:
+
+- attach uses the smallest bootstrap needed before live raw output starts
+- tmux capture, cursor, and flag queries are batched or removed from the active
+  interactive path
+- placeholder-to-bash transition does not redraw through a stale local terminal
+  model once the raw PTY stream is available
+- cross-host validation compares attach latency and first-keystroke latency
+  against SSH on the same machines
+
 ## Base64 Rule
 
 Base64 must not be used as an internal raw PTY representation.

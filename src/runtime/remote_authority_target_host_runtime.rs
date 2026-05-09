@@ -782,10 +782,6 @@ where
 }
 
 fn render_bootstrap_replay(screen: &str, cursor_x: usize, cursor_y: usize) -> String {
-    if screen.is_empty() {
-        return String::new();
-    }
-
     let mut replay = String::from("\x1b[2J\x1b[H");
     for (index, line) in screen.lines().enumerate() {
         replay.push_str(&format!("\x1b[{};1H{}", index + 1, line));
@@ -1351,14 +1347,25 @@ mod tests {
                 }
             )
         );
-        assert_eq!(bootstrap_chunk, None);
+        assert_eq!(
+            bootstrap_chunk,
+            Some(ControlPlanePayload::MirrorBootstrapChunk(
+                crate::infra::remote_protocol::MirrorBootstrapChunkPayload {
+                    session_id: "target-1".to_string(),
+                    target_id: "remote-peer:peer-a:target-1".to_string(),
+                    chunk_seq: 1,
+                    stream: "pty",
+                    output_bytes: b"\x1b[2J\x1b[H\x1b[1;1H".to_vec(),
+                }
+            ))
+        );
         assert_eq!(
             bootstrap_complete,
             ControlPlanePayload::MirrorBootstrapComplete(
                 crate::infra::remote_protocol::MirrorBootstrapCompletePayload {
                     session_id: "target-1".to_string(),
                     target_id: "remote-peer:peer-a:target-1".to_string(),
-                    last_chunk_seq: 0,
+                    last_chunk_seq: 1,
                     alternate_screen_active: false,
                     application_cursor_keys: false,
                     cursor_visible: true,

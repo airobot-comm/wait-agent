@@ -111,6 +111,24 @@ impl RemoteMainSlotRuntime {
             .unwrap_or(false)
     }
 
+    pub fn record_mirror_accepted(&self, session_id: &str) {
+        self.control_plane
+            .borrow_mut()
+            .record_mirror_accepted(session_id);
+    }
+
+    pub fn record_mirror_rejected(&self, session_id: &str, reason: String) {
+        self.control_plane
+            .borrow_mut()
+            .record_mirror_rejected(session_id, reason);
+    }
+
+    pub fn handle_authority_disconnect(&self, authority_node_id: &str) {
+        self.control_plane
+            .borrow_mut()
+            .handle_authority_disconnect(authority_node_id);
+    }
+
     #[cfg(test)]
     pub fn activate_target(
         &self,
@@ -467,6 +485,32 @@ mod tests {
         assert_eq!(envelopes.len(), 2);
         assert_eq!(envelopes[0].message_type, "open_mirror_request");
         assert_eq!(envelopes[1].message_type, "close_mirror_request");
+    }
+
+    #[test]
+    fn authority_disconnect_allows_same_console_to_reopen_mirror() {
+        let runtime = RemoteMainSlotRuntime::with_registry(RemoteConnectionRegistry::new());
+        runtime.ensure_local_connection("observer-a");
+        let authority_mailbox = runtime
+            .ensure_local_connection("peer-a")
+            .expect("registry-backed runtime should expose authority registration");
+        let target = remote_target("peer-a", "shell-1");
+
+        runtime
+            .activate_target(&target, console("console-a", "observer-a"), 120, 40)
+            .expect("first activation should succeed");
+        runtime.record_mirror_accepted("shell-1");
+        runtime.handle_authority_disconnect("peer-a");
+        runtime
+            .activate_target(&target, console("console-a", "observer-a"), 120, 40)
+            .expect("reconnect activation should succeed");
+
+        let mirror_requests = authority_mailbox
+            .snapshot()
+            .into_iter()
+            .filter(|envelope| envelope.message_type == "open_mirror_request")
+            .count();
+        assert_eq!(mirror_requests, 2);
     }
 
     #[test]

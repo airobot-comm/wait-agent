@@ -11,7 +11,7 @@ use crate::runtime::remote_transport_runtime::{
 };
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,8 @@ use std::thread;
 use std::time::Duration;
 
 const QUEUED_AUTHORITY_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const AUTHORITY_TRANSPORT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+const AUTHORITY_TRANSPORT_WRITE_RETRIES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorityTransportEvent {
@@ -209,6 +211,7 @@ pub fn register_authority_stream(
     }
 
     let writer = stream.try_clone()?;
+    writer.set_write_timeout(Some(AUTHORITY_TRANSPORT_WRITE_TIMEOUT))?;
     let connected = Arc::new(AtomicBool::new(true));
     let reader_tx = tx.clone();
     registry.register_connection(
@@ -417,8 +420,14 @@ impl RemoteControlPlaneConnection for SocketRemoteControlPlaneConnection {
             .writer
             .lock()
             .expect("authority transport writer mutex should not be poisoned");
-        write_control_plane_envelope(&mut *writer, envelope)
-            .map_err(|error| RemoteControlPlaneTransportError::new(error.to_string()))
+        let mut encoded = Vec::new();
+        if let Err(error) = write_control_plane_envelope(&mut encoded, envelope) {
+            return Err(RemoteControlPlaneTransportError::new(error.to_string()));
+        }
+        write_transport_bytes_with_retries(&mut writer, &encoded).map_err(|error| {
+            self.connected.store(false, Ordering::Relaxed);
+            RemoteControlPlaneTransportError::new(error.to_string())
+        })
     }
 
     fn send_raw_pty_input(
@@ -434,12 +443,49 @@ impl RemoteControlPlaneConnection for SocketRemoteControlPlaneConnection {
             .writer
             .lock()
             .expect("authority transport writer mutex should not be poisoned");
-        write_authority_transport_frame(
-            &mut *writer,
+        let mut encoded = Vec::new();
+        if let Err(error) = write_authority_transport_frame(
+            &mut encoded,
             &AuthorityTransportFrame::RawPtyInput(payload.clone()),
-        )
-        .map_err(|error| RemoteControlPlaneTransportError::new(error.to_string()))
+        ) {
+            return Err(RemoteControlPlaneTransportError::new(error.to_string()));
+        }
+        write_transport_bytes_with_retries(&mut writer, &encoded).map_err(|error| {
+            self.connected.store(false, Ordering::Relaxed);
+            RemoteControlPlaneTransportError::new(error.to_string())
+        })
     }
+}
+
+fn write_transport_bytes_with_retries(writer: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
+    let mut written = 0usize;
+    let mut retries = 0usize;
+    while written < bytes.len() {
+        match writer.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "authority transport write returned zero bytes",
+                ));
+            }
+            Ok(count) => {
+                written += count;
+                retries = 0;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                ) && retries < AUTHORITY_TRANSPORT_WRITE_RETRIES =>
+            {
+                retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,7 +530,8 @@ mod tests {
         RemoteAuthorityConnectionRuntime,
     };
     use crate::infra::remote_protocol::{
-        ControlPlanePayload, ProtocolEnvelope, RawPtyOutputPayload, TargetOutputPayload,
+        ControlPlanePayload, ProtocolEnvelope, RawPtyInputPayload, RawPtyOutputPayload,
+        TargetOutputPayload,
     };
     use crate::infra::remote_transport_codec::{
         read_control_plane_envelope, write_authority_transport_frame, write_control_plane_envelope,
@@ -568,6 +615,40 @@ mod tests {
                     output_bytes: b"raw".to_vec(),
                 },
             }
+        );
+    }
+
+    #[test]
+    fn authority_connection_marks_closed_after_raw_input_write_failure() {
+        let registry = RemoteConnectionRegistry::new();
+        let (tx, rx) = mpsc::channel();
+        let (mut client, server) = UnixStream::pair().expect("stream pair should open");
+
+        write_registration_frame(&mut client, "peer-a").expect("registration frame should encode");
+        register_authority_stream(server, registry.clone(), "peer-a".to_string(), tx)
+            .expect("authority stream should register");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("connected event should arrive"),
+            AuthorityTransportEvent::Connected
+        );
+
+        drop(client);
+        let connection = registry
+            .connection_for("peer-a")
+            .expect("authority connection should be registered");
+
+        let first_error = connection
+            .send_raw_pty_input(&raw_pty_input_payload())
+            .expect_err("closed peer should fail raw input write");
+        assert!(!first_error.to_string().is_empty());
+
+        let second_error = connection
+            .send_raw_pty_input(&raw_pty_input_payload())
+            .expect_err("failed write should mark connection closed");
+        assert_eq!(
+            second_error.to_string(),
+            "authority transport connection is closed"
         );
     }
 
@@ -863,6 +944,18 @@ mod tests {
                 stream: "pty",
                 output_bytes: b"a".to_vec(),
             }),
+        }
+    }
+
+    fn raw_pty_input_payload() -> RawPtyInputPayload {
+        RawPtyInputPayload {
+            attachment_id: "attach-1".to_string(),
+            session_id: "shell-1".to_string(),
+            target_id: "remote-peer:peer-a:shell-1".to_string(),
+            console_id: "console-a".to_string(),
+            console_host_id: "observer-a".to_string(),
+            input_seq: 1,
+            input_bytes: b"a".to_vec(),
         }
     }
 
