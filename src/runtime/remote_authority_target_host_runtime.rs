@@ -561,8 +561,15 @@ impl RemoteAuthorityOutputPumpRuntime {
         let input_thread = thread::spawn(move || -> Result<(), RemoteAuthorityHostError> {
             let mut fifo = OpenOptions::new().read(true).open(input_fifo_path)?;
             let mut stdout = io::stdout().lock();
-            io::copy(&mut fifo, &mut stdout)?;
-            stdout.flush()?;
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = fifo.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                stdout.write_all(&buffer[..read])?;
+                stdout.flush()?;
+            }
             Ok(())
         });
 
