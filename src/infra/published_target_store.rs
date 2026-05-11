@@ -2,8 +2,8 @@ use crate::domain::session_catalog::{
     ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState, SessionAvailability,
 };
 use crate::domain::workspace::WorkspaceSessionRole;
-use crate::infra::base64::{decode_base64, encode_base64};
 use crate::infra::tmux::TmuxError;
+use base64::Engine;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -423,11 +423,12 @@ fn validate_published_remote_target(target: &ManagedSessionRecord) -> Result<(),
 }
 
 fn encode_string_field(value: &str) -> String {
-    encode_base64(value.as_bytes())
+    base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
 }
 
 fn decode_string_field(value: &str) -> Result<String, TmuxError> {
-    let decoded = decode_base64(value)
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
         .map_err(|error| TmuxError::new(format!("invalid base64 field `{value}`: {error}")))?;
     String::from_utf8(decoded).map_err(|error| {
         TmuxError::new(format!(

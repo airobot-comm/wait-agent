@@ -21,6 +21,7 @@ summary = "Terminal-native interaction scheduler for multi-agent workflows"
 requires = "libevent, ncurses-libs"
 
 [dependencies]
+base64 = "0.22"
 libc = "0.2"
 prost = "0.13"
 prost-types = "0.13"

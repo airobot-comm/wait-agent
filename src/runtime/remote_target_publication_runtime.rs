@@ -9,7 +9,6 @@ use crate::domain::session_catalog::{
     SessionTransport,
 };
 use crate::domain::workspace::WorkspaceSessionRole;
-use crate::infra::base64::{decode_base64, encode_base64};
 use crate::infra::published_target_store::{PublishedTargetSourceBinding, PublishedTargetStore};
 use crate::infra::remote_protocol::{
     ControlPlanePayload, NodeSessionChannel, ProtocolEnvelope, TargetPublishedPayload,
@@ -23,6 +22,7 @@ use crate::runtime::remote_node_transport_runtime::{read_client_hello, write_ser
 use crate::runtime::remote_runtime_owner_runtime::RemoteRuntimeOwnerRuntime;
 use crate::runtime::remote_target_publication_transport_runtime::remote_target_publication_socket_path;
 use crate::runtime::sidecar_process_runtime::spawn_waitagent_sidecar;
+use base64::Engine;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
@@ -1350,7 +1350,7 @@ fn render_publication_agent_command(command: &PublicationAgentCommand) -> String
         PublicationAgentCommand::FullReconcile => "full_reconcile\n".to_string(),
         PublicationAgentCommand::PublishSession { session_name } => format!(
             "publish_session\t{}\n",
-            encode_base64(session_name.as_bytes())
+            base64::engine::general_purpose::STANDARD.encode(session_name.as_bytes())
         ),
         PublicationAgentCommand::ExitTarget {
             authority_id,
@@ -1358,8 +1358,8 @@ fn render_publication_agent_command(command: &PublicationAgentCommand) -> String
             source_session_name,
         } => format!(
             "exit_target\t{}\t{}\t{}\n",
-            encode_base64(authority_id.as_bytes()),
-            encode_base64(transport_session_id.as_bytes()),
+            base64::engine::general_purpose::STANDARD.encode(authority_id.as_bytes()),
+            base64::engine::general_purpose::STANDARD.encode(transport_session_id.as_bytes()),
             encode_optional_agent_field(source_session_name.as_deref())
         ),
     }
@@ -1374,16 +1374,16 @@ pub(crate) fn render_publication_sender_command(command: &PublicationSenderComma
             transport_socket_path,
         } => format!(
             "register_live_session\t{}\t{}\t{}\t{}\n",
-            encode_base64(target_session_name.as_bytes()),
-            encode_base64(authority_id.as_bytes()),
-            encode_base64(target_id.as_bytes()),
-            encode_base64(transport_socket_path.as_bytes())
+            base64::engine::general_purpose::STANDARD.encode(target_session_name.as_bytes()),
+            base64::engine::general_purpose::STANDARD.encode(authority_id.as_bytes()),
+            base64::engine::general_purpose::STANDARD.encode(target_id.as_bytes()),
+            base64::engine::general_purpose::STANDARD.encode(transport_socket_path.as_bytes())
         ),
         PublicationSenderCommand::UnregisterLiveSession {
             target_session_name,
         } => format!(
             "unregister_live_session\t{}\n",
-            encode_base64(target_session_name.as_bytes())
+            base64::engine::general_purpose::STANDARD.encode(target_session_name.as_bytes())
         ),
         PublicationSenderCommand::PublishTarget {
             authority_id,
@@ -1400,8 +1400,8 @@ pub(crate) fn render_publication_sender_command(command: &PublicationSenderComma
             task_state,
         } => format!(
             "publish_target\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            encode_base64(authority_id.as_bytes()),
-            encode_base64(transport_session_id.as_bytes()),
+            base64::engine::general_purpose::STANDARD.encode(authority_id.as_bytes()),
+            base64::engine::general_purpose::STANDARD.encode(transport_session_id.as_bytes()),
             encode_optional_agent_field(source_session_name.as_deref()),
             encode_optional_agent_field(selector.as_deref()),
             availability,
@@ -1419,8 +1419,8 @@ pub(crate) fn render_publication_sender_command(command: &PublicationSenderComma
             source_session_name,
         } => format!(
             "exit_target\t{}\t{}\t{}\n",
-            encode_base64(authority_id.as_bytes()),
-            encode_base64(transport_session_id.as_bytes()),
+            base64::engine::general_purpose::STANDARD.encode(authority_id.as_bytes()),
+            base64::engine::general_purpose::STANDARD.encode(transport_session_id.as_bytes()),
             encode_optional_agent_field(source_session_name.as_deref())
         ),
     }
@@ -1707,19 +1707,21 @@ fn parse_publication_sender_command(
 }
 
 fn decode_publication_agent_string_field(value: &str) -> Result<String, LifecycleError> {
-    let bytes = decode_base64(value).map_err(remote_target_publication_error)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(remote_target_publication_error)?;
     String::from_utf8(bytes).map_err(remote_target_publication_error)
 }
 
 fn encode_optional_agent_field(value: Option<&str>) -> String {
     value
-        .map(|value| encode_base64(value.as_bytes()))
+        .map(|value| base64::engine::general_purpose::STANDARD.encode(value.as_bytes()))
         .unwrap_or_else(|| "~".to_string())
 }
 
 fn encode_optional_static_agent_field(value: Option<&'static str>) -> String {
     value
-        .map(|value| encode_base64(value.as_bytes()))
+        .map(|value| base64::engine::general_purpose::STANDARD.encode(value.as_bytes()))
         .unwrap_or_else(|| "~".to_string())
 }
 

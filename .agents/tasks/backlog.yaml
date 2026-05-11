@@ -260,6 +260,33 @@ next:
   - id: task.ux-4
     title: embed web UI bundle inside waitagent binary
     status: ready
+  - id: task.refactor-1
+    title: replace custom base64 implementation with the mature base64 crate
+    status: ready
+  - id: task.refactor-2
+    title: clean up dead code annotations and unused API surface
+    status: ready
+  - id: task.refactor-3
+    title: extract semantic agent detection into a plugin-based AgentDetector trait
+    status: ready
+  - id: task.refactor-4
+    title: cluster runtime modules into sub-directories by concept
+    status: ready
+  - id: task.refactor-5
+    title: split oversized source files to stay at or below 1000 lines each
+    status: ready
+  - id: task.refactor-6
+    title: refine fullscreen history UX so users can browse scrollback naturally
+    status: ready
+  - id: task.refactor-7
+    title: decouple remote publication and session sync from direct tmux backend coupling
+    status: ready
+  - id: task.bug-sidebar-switch-lag
+    title: fix severe lag on first sidebar switch while main pane is running
+    status: ready
+  - id: task.bug-local-session-freeze-after-connect
+    title: fix local session switching freeze after connecting to remote server
+    status: ready
 templates:
   - id: task-template.local-acceptance-cycle
     title: local acceptance rerun or bug-fix slice
@@ -294,5 +321,10 @@ notes:
   - 2026-05-09 refinement: raw PTY is now the accepted remote interactive baseline, but the SSH-parity review split remaining latency work into `task.t5-08c4d3e -> task.t5-08c4d3i` covering local input write decoupling, direct PTY ownership, lightweight raw frames, event-driven bridge discovery, and faster attach bootstrap.
   - The old gutter-scroll direction remains retired.
   - The old custom fullscreen-history direction is now also retired as the primary architecture because Codex-like live TUIs do not reliably repaint under the mixed narrow-PTY then widened-fullscreen model.
-  - `task.architecture-1` is intentionally parked as deferred cleanup so it stays visible without silently becoming the next in-progress delivery slice.
+  - `task.architecture-1` is now superseded by the `task.refactor-1` through `task.refactor-7` queue which covers the same ground with finer granularity.
+  - 2026-05-11 refactor queue: `task.refactor-1 -> task.refactor-2 -> task.refactor-3 -> task.refactor-4 -> task.refactor-5 -> task.refactor-6 -> task.refactor-7` is the codebase cleanup and architecture refinement batch on branch `feat/refactor-codebase-cleanup`.
+  - Refactor constraint: every refactor slice must preserve all existing functionality and performance characteristics. No behavioral regressions are acceptable. Each task must pass cargo test and cargo build --release before closing.
+  - Refactor constraint: refactor-1 and refactor-2 are independent and can land in either order. refactor-3 depends on refactor-2. refactor-4 depends on refactor-3. refactor-5 depends on refactor-4. refactor-6 and refactor-7 depend on refactor-5 but are independent of each other.
+  - The refactor queue does not block the existing remote PTY latency queue (task.t5-08c4d3e through task.t5-08c4d3i). Both queues can proceed in parallel on their respective branches.
   - The original `task.tmux-1` through `task.tmux-6` split is preserved as historical planning only and is superseded by the rewrite queue after review found that the bridge-heavy path would preserve too much of the legacy lifecycle structure.
+  - 2026-05-11 bugs: `task.bug-sidebar-switch-lag` and `task.bug-local-session-freeze-after-connect` are reported UX bugs. They are independent of the refactor queue and can be investigated in parallel.
