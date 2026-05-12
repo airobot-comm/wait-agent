@@ -287,6 +287,15 @@ next:
   - id: task.bug-local-session-freeze-after-connect
     title: fix local session switching freeze after connecting to remote server
     status: ready
+  - id: task.bug-multi-remote-switch-lag
+    title: fix severe lag switching to second remote session after the first
+    status: ready
+  - id: task.bug-remote-session-lost-after-idle
+    title: fix remote session content not showing in main pane and sidebar becoming unswitchable after idling
+    status: ready
+  - id: task.bug-status-recognition-inaccurate
+    title: improve session state recognition accuracy in catalog and sidebar
+    status: ready
 templates:
   - id: task-template.local-acceptance-cycle
     title: local acceptance rerun or bug-fix slice

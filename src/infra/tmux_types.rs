@@ -75,6 +75,7 @@ pub struct TmuxPaneInfo {
     pub current_command: Option<String>,
     pub current_path: Option<PathBuf>,
     pub is_dead: bool,
+    pub in_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

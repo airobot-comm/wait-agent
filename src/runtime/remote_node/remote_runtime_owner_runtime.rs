@@ -243,21 +243,39 @@ impl RemoteRuntimeOwnerRuntime {
             }
             Err(error) => return Err(remote_runtime_owner_error(error)),
         };
-        stream
-            .write_all(
-                render_remote_runtime_owner_command(&RemoteRuntimeOwnerCommandEnvelope::Snapshot)
-                    .as_bytes(),
-            )
-            .map_err(remote_runtime_owner_error)?;
-        stream.flush().map_err(remote_runtime_owner_error)?;
-        stream
-            .shutdown(Shutdown::Write)
-            .map_err(remote_runtime_owner_error)?;
+        // Prevent indefinite blocking if the remote runtime owner process
+        // is stuck (e.g., blocked on a gRPC or tmux operation after a
+        // network interruption). Without this, every caller in the local
+        // session switch path — sidebar refresh, __activate-target, etc. —
+        // freezes when the owner cannot respond.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        // Gracefully degrade: if the owner is unresponsive, return an empty
+        // snapshot so local session switching can continue without remote
+        // sessions visible.
+        let _ = stream.write_all(
+            render_remote_runtime_owner_command(&RemoteRuntimeOwnerCommandEnvelope::Snapshot)
+                .as_bytes(),
+        );
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Write);
         let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .map_err(remote_runtime_owner_error)?;
-        parse_remote_runtime_owner_snapshot(&response)
+        match stream.read_to_string(&mut response) {
+            Ok(_) => match parse_remote_runtime_owner_snapshot(&response) {
+                Ok(snapshot) => Ok(snapshot),
+                Err(_) => {
+                    let _ = fs::remove_file(&socket_path);
+                    Ok(RemoteRuntimeOwnerSnapshot {
+                        sessions: Vec::new(),
+                    })
+                }
+            },
+            Err(_) => {
+                let _ = fs::remove_file(&socket_path);
+                Ok(RemoteRuntimeOwnerSnapshot {
+                    sessions: Vec::new(),
+                })
+            }
+        }
     }
 }
 

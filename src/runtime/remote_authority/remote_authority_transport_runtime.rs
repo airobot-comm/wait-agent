@@ -18,11 +18,12 @@ use std::fs;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const AUTHORITY_TRANSPORT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const AUTHORITY_TRANSPORT_SERVER_ID: &str = "waitagent-main-slot";
 pub struct RemoteAuthorityTransportRuntime {
     node_id: String,
@@ -407,6 +408,7 @@ fn bridge_authority_transport(
     mut transport_stream: UnixStream,
     sink: QueuedAuthorityStreamSink,
 ) -> Result<(), RemoteAuthorityTransportError> {
+    transport_stream.set_read_timeout(Some(AUTHORITY_TRANSPORT_READ_TIMEOUT))?;
     let node_id = read_client_hello(&mut transport_stream)?;
 
     let (mut local_reader, pane_stream) = UnixStream::pair()?;
@@ -418,10 +420,20 @@ fn bridge_authority_transport(
     let mut transport_writer = transport_stream.try_clone()?;
     write_server_hello(&mut transport_writer, AUTHORITY_TRANSPORT_SERVER_ID)?;
     let local_writer = local_reader.try_clone()?;
+    // Give local_reader a short timeout so we can check the shutdown flag
+    local_reader
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .ok();
+    let running = Arc::new(AtomicBool::new(true));
+    let net_running = running.clone();
     let forward_network = thread::spawn(move || {
-        forward_authority_frames_to_control_plane(transport_stream, local_writer)
+        let result = forward_authority_frames_to_control_plane(transport_stream, local_writer);
+        net_running.store(false, Ordering::Relaxed);
+        result
     });
-    let forward_local = forward_control_plane_to_authority_frames(local_reader, transport_writer);
+    let forward_local =
+        forward_control_plane_to_authority_frames(local_reader, transport_writer, &running);
+    running.store(false, Ordering::Relaxed);
     let _ = forward_network.join();
     forward_local
 }
@@ -451,17 +463,25 @@ fn forward_authority_frames_to_control_plane(
 fn forward_control_plane_to_authority_frames(
     mut reader: UnixStream,
     mut writer: UnixStream,
+    running: &AtomicBool,
 ) -> Result<(), RemoteAuthorityTransportError> {
-    while let Ok(frame) = read_authority_transport_frame(&mut reader) {
-        match frame {
-            AuthorityTransportFrame::ControlPlane(envelope) => {
-                write_control_plane_envelope(&mut writer, &envelope)?;
-            }
-            AuthorityTransportFrame::RawPtyInput(payload) => {
-                write_control_plane_envelope(&mut writer, &raw_pty_input_envelope(payload))?;
-            }
-            AuthorityTransportFrame::RawPtyOutput(payload) => {
-                write_control_plane_envelope(&mut writer, &raw_pty_output_envelope(payload))?;
+    while running.load(Ordering::Relaxed) {
+        match read_authority_transport_frame(&mut reader) {
+            Ok(frame) => match frame {
+                AuthorityTransportFrame::ControlPlane(envelope) => {
+                    write_control_plane_envelope(&mut writer, &envelope)?;
+                }
+                AuthorityTransportFrame::RawPtyInput(payload) => {
+                    write_control_plane_envelope(&mut writer, &raw_pty_input_envelope(payload))?;
+                }
+                AuthorityTransportFrame::RawPtyOutput(payload) => {
+                    write_control_plane_envelope(&mut writer, &raw_pty_output_envelope(payload))?;
+                }
+            },
+            Err(_) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
             }
         }
     }

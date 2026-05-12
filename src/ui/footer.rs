@@ -136,7 +136,7 @@ fn left_status_text(
     let base = match projection {
         FooterProjection::Pane => "keys: ^N new  ^O fullscreen  C-b s menu".to_string(),
         FooterProjection::FullscreenStatus => {
-            "keys: [Ctrl-o] fullscreen off  [Ctrl-n] new  C-b [ page  [PgUp/PgDn] scroll  [Up/Down] line  [q] exit-page".to_string()
+            "keys: [Ctrl-o] fullscreen off  [PgUp/PgDn] scroll  [Up/Down] line  [q] exit-page  [Ctrl-n] new".to_string()
         }
     };
     let mut parts: Vec<&str> = Vec::new();
@@ -275,11 +275,10 @@ mod tests {
         );
 
         assert!(output.contains("[Ctrl-o] fullscreen off"));
-        assert!(output.contains("[Ctrl-n] new"));
-        assert!(output.contains("C-b [ page"));
         assert!(output.contains("[PgUp/PgDn] scroll"));
         assert!(output.contains("[Up/Down] line"));
         assert!(output.contains("[q] exit-page"));
+        assert!(output.contains("[Ctrl-n] new"));
         assert!(!output.contains("listen:"));
         assert!(!output.contains("total:"));
         assert!(!output.contains("R:0"));
