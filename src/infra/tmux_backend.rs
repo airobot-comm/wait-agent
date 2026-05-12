@@ -945,6 +945,25 @@ impl EmbeddedTmuxBackend {
         .map(|_| ())
     }
 
+    pub(crate) fn send_keys_copy_mode_on_socket(
+        &self,
+        socket_name: &str,
+        pane_target: &str,
+        key: &str,
+    ) -> Result<(), TmuxError> {
+        self.run_on_socket(
+            &TmuxSocketName::new(socket_name),
+            &[
+                "send-keys".to_string(),
+                "-X".to_string(),
+                "-t".to_string(),
+                pane_target.to_string(),
+                key.to_string(),
+            ],
+        )
+        .map(|_| ())
+    }
+
     pub fn window_zoomed_on_socket(
         &self,
         socket_name: &str,

@@ -93,6 +93,13 @@ impl NativePaneFullscreenRuntime {
                 self.backend
                     .enter_copy_mode(&workspace, &main_pane)
                     .map_err(fullscreen_error)?;
+                self.backend
+                    .send_keys_copy_mode_on_socket(
+                        workspace.socket_name.as_str(),
+                        main_pane.as_str(),
+                        "page-up",
+                    )
+                    .map_err(fullscreen_error)?;
             }
             self.apply_fullscreen_status_line(&workspace)?;
             self.layout_runtime
