@@ -158,45 +158,6 @@ impl ManagedSessionTaskState {
             Self::Unknown => "U",
         }
     }
-
-    pub fn infer(command_name: Option<&str>, pane_text: &str) -> Self {
-        let normalized_lines = pane_text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>();
-        if normalized_lines.is_empty() {
-            return Self::Unknown;
-        }
-
-        if normalized_lines
-            .iter()
-            .map(|line| line.to_ascii_lowercase())
-            .any(|line| {
-                line.contains("approve")
-                    || line.contains("approval")
-                    || line.contains("confirm")
-                    || line.contains("continue?")
-                    || line.contains("allow")
-                    || line.contains("permission")
-                    || line.contains("[y/n]")
-                    || line.contains("(y/n)")
-                    || line.contains("yes/no")
-            })
-        {
-            return Self::Confirm;
-        }
-
-        let command_name = command_name.unwrap_or_default();
-        let last_line = normalized_lines.last().copied().unwrap_or_default();
-        if looks_like_shell_prompt(command_name, last_line)
-            || looks_like_agent_input(command_name, last_line)
-        {
-            return Self::Input;
-        }
-
-        Self::Running
-    }
 }
 
 impl Default for ManagedSessionTaskState {
@@ -205,7 +166,6 @@ impl Default for ManagedSessionTaskState {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionAvailability {
     Online,
@@ -236,7 +196,6 @@ impl SessionAvailability {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleLocation {
     LocalWorkspace,
@@ -350,26 +309,13 @@ impl ManagedSessionRecord {
     }
 }
 
-fn looks_like_shell_prompt(command_name: &str, line: &str) -> bool {
-    matches!(command_name, "" | "bash" | "zsh" | "fish" | "sh")
-        && matches!(line.chars().last(), Some('$' | '#' | '%'))
-}
-
-fn looks_like_agent_input(command_name: &str, line: &str) -> bool {
-    let lowered = line.to_ascii_lowercase();
-    matches!(command_name, "codex" | "claude")
-        && (line.starts_with('›')
-            || line.starts_with("> ")
-            || lowered.contains("type your message")
-            || lowered.contains("send a message"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ConsoleAttachment, ConsoleLocation, ManagedSessionAddress, ManagedSessionRecord,
         ManagedSessionTaskState, SessionAvailability, SessionTransport,
     };
+    use crate::domain::agent_detector::DetectorRegistry;
     use crate::domain::workspace::WorkspaceSessionRole;
     use std::path::PathBuf;
 
@@ -541,31 +487,30 @@ mod tests {
 
     #[test]
     fn task_state_infers_confirm_from_visible_prompt_text() {
-        let state = ManagedSessionTaskState::infer(
-            Some("codex"),
-            "Allow this action?\nType yes/no to continue",
-        );
+        let state = DetectorRegistry::default()
+            .infer_task_state(Some("codex"), "Allow this action?\nType yes/no to continue");
 
         assert_eq!(state, ManagedSessionTaskState::Confirm);
     }
 
     #[test]
     fn task_state_infers_input_from_codex_prompt_line() {
-        let state = ManagedSessionTaskState::infer(Some("codex"), "Tip\n› ");
+        let state = DetectorRegistry::default().infer_task_state(Some("codex"), "Tip\n› ");
 
         assert_eq!(state, ManagedSessionTaskState::Input);
     }
 
     #[test]
     fn task_state_infers_input_from_claude_prompt_line_case_insensitively() {
-        let state = ManagedSessionTaskState::infer(Some("claude"), "Ready\nType your message");
+        let state = DetectorRegistry::default()
+            .infer_task_state(Some("claude"), "Ready\nType your message");
 
         assert_eq!(state, ManagedSessionTaskState::Input);
     }
 
     #[test]
     fn task_state_does_not_infer_input_from_stale_agent_prompt_line() {
-        let state = ManagedSessionTaskState::infer(
+        let state = DetectorRegistry::default().infer_task_state(
             Some("claude"),
             "Claude\nType your message\n\nRunning tool call",
         );
@@ -575,7 +520,7 @@ mod tests {
 
     #[test]
     fn task_state_infers_input_from_shell_prompt_line() {
-        let state = ManagedSessionTaskState::infer(Some("bash"), "k@host:/tmp$");
+        let state = DetectorRegistry::default().infer_task_state(Some("bash"), "k@host:/tmp$");
 
         assert_eq!(state, ManagedSessionTaskState::Input);
     }

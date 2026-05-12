@@ -354,6 +354,7 @@ mod tests {
                 current_command: Some("waitagent".to_string()),
                 current_path: None,
                 is_dead: false,
+                in_mode: false,
             });
             Ok(pane)
         }
@@ -375,6 +376,7 @@ mod tests {
                 current_command: Some("waitagent".to_string()),
                 current_path: None,
                 is_dead: false,
+                in_mode: false,
             });
             Ok(pane)
         }
@@ -549,6 +551,7 @@ mod tests {
             current_command: Some("bash".to_string()),
             current_path: None,
             is_dead: false,
+            in_mode: false,
         }]);
         let service = LayoutService::new(gateway.clone());
         let program = TmuxProgram::new("/tmp/waitagent");
@@ -589,6 +592,7 @@ mod tests {
                 current_command: Some("bash".to_string()),
                 current_path: None,
                 is_dead: false,
+                in_mode: false,
             },
             TmuxPaneInfo {
                 pane_id: TmuxPaneId::new("%2"),
@@ -597,6 +601,7 @@ mod tests {
                 current_command: Some("waitagent".to_string()),
                 current_path: None,
                 is_dead: true,
+                in_mode: false,
             },
             TmuxPaneInfo {
                 pane_id: TmuxPaneId::new("%3"),
@@ -605,6 +610,7 @@ mod tests {
                 current_command: Some("waitagent".to_string()),
                 current_path: None,
                 is_dead: true,
+                in_mode: false,
             },
         ]);
         let service = LayoutService::new(gateway.clone());
@@ -643,6 +649,7 @@ mod tests {
                 current_command: Some("bash".to_string()),
                 current_path: None,
                 is_dead: false,
+                in_mode: false,
             },
             TmuxPaneInfo {
                 pane_id: TmuxPaneId::new("%2"),
@@ -651,6 +658,7 @@ mod tests {
                 current_command: Some("waitagent".to_string()),
                 current_path: None,
                 is_dead: false,
+                in_mode: false,
             },
             TmuxPaneInfo {
                 pane_id: TmuxPaneId::new("%3"),
@@ -659,6 +667,7 @@ mod tests {
                 current_command: Some("waitagent".to_string()),
                 current_path: None,
                 is_dead: false,
+                in_mode: false,
             },
         ])
         .with_current_pane("%3");

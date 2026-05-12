@@ -2,7 +2,7 @@ id: task.t5-08c4d3f
 kind: task
 version: 1
 title: replace FIFO and output-pump bridging with direct remote PTY ownership
-status: ready
+status: superseded
 priority: high
 design_ref:
   doc: docs/raw-pty-tunnel-design.md

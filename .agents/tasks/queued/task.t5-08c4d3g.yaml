@@ -2,7 +2,7 @@ id: task.t5-08c4d3g
 kind: task
 version: 1
 title: introduce a lightweight raw PTY authority frame path
-status: ready
+status: superseded
 priority: high
 design_ref:
   doc: docs/raw-pty-tunnel-design.md

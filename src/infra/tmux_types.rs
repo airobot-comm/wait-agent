@@ -75,11 +75,13 @@ pub struct TmuxPaneInfo {
     pub current_command: Option<String>,
     pub current_path: Option<PathBuf>,
     pub is_dead: bool,
+    pub in_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TmuxSplitSize {
     Cells(u16),
+    #[allow(dead_code)]
     Percent(u8),
 }
 
@@ -124,6 +126,7 @@ impl TmuxProgram {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_environment(
         mut self,
         environment: impl IntoIterator<Item = (String, String)>,
@@ -137,6 +140,7 @@ impl TmuxProgram {
         self
     }
 
+    #[allow(dead_code)]
     pub fn binary_name(&self) -> &str {
         self.program
             .rsplit('/')
@@ -153,12 +157,14 @@ pub trait TmuxGateway {
         config: &WorkspaceInstanceConfig,
     ) -> Result<TmuxWorkspaceHandle, Self::Error>;
 
+    #[allow(dead_code)]
     fn create_window(
         &self,
         workspace: &TmuxWorkspaceHandle,
         window_name: &str,
     ) -> Result<TmuxWindowHandle, Self::Error>;
 
+    #[allow(dead_code)]
     fn split_pane_right(
         &self,
         workspace: &TmuxWorkspaceHandle,
@@ -166,6 +172,7 @@ pub trait TmuxGateway {
         width_percent: u8,
     ) -> Result<TmuxPaneId, Self::Error>;
 
+    #[allow(dead_code)]
     fn split_pane_bottom(
         &self,
         workspace: &TmuxWorkspaceHandle,
@@ -173,6 +180,7 @@ pub trait TmuxGateway {
         height_percent: u8,
     ) -> Result<TmuxPaneId, Self::Error>;
 
+    #[allow(dead_code)]
     fn select_window(
         &self,
         workspace: &TmuxWorkspaceHandle,
@@ -200,6 +208,7 @@ pub trait TmuxSessionGateway: TmuxGateway {
         socket_name: &TmuxSocketName,
     ) -> Result<Vec<ManagedSessionRecord>, Self::Error>;
 
+    #[allow(dead_code)]
     fn find_session(&self, target: &str) -> Result<Option<ManagedSessionRecord>, Self::Error>;
 
     fn attach_workspace(&self, workspace: &TmuxWorkspaceHandle) -> Result<(), Self::Error>;
@@ -213,6 +222,28 @@ pub trait TmuxSessionGateway: TmuxGateway {
     fn current_client_session(&self) -> Result<Option<ManagedSessionRecord>, Self::Error>;
 
     fn kill_server(&self, socket_name: &TmuxSocketName) -> Result<(), Self::Error>;
+
+    fn set_session_environment(
+        &self,
+        socket: &TmuxSocketName,
+        session: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), Self::Error>;
+
+    fn unset_session_environment(
+        &self,
+        socket: &TmuxSocketName,
+        session: &str,
+        key: &str,
+    ) -> Result<(), Self::Error>;
+
+    /// Returns all session environment variables as (key, value) pairs.
+    fn show_session_environment(
+        &self,
+        socket: &TmuxSocketName,
+        session: &str,
+    ) -> Result<Vec<(String, String)>, Self::Error>;
 }
 
 pub trait TmuxChromeGateway: TmuxSessionGateway {
@@ -294,6 +325,7 @@ pub trait TmuxLayoutGateway: TmuxGateway {
         height: u16,
     ) -> Result<(), Self::Error>;
 
+    #[allow(dead_code)]
     fn set_pane_style(
         &self,
         workspace: &TmuxWorkspaceHandle,
@@ -331,6 +363,7 @@ pub trait TmuxLayoutGateway: TmuxGateway {
         hook_name: &str,
     ) -> Result<(), Self::Error>;
 
+    #[allow(dead_code)]
     fn set_global_hook(
         &self,
         workspace: &TmuxWorkspaceHandle,

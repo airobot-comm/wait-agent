@@ -2,7 +2,7 @@ id: task.t5-08c4d3i
 kind: task
 version: 1
 title: reduce remote attach bootstrap capture cost
-status: ready
+status: superseded
 priority: medium
 design_ref:
   doc: docs/raw-pty-tunnel-design.md

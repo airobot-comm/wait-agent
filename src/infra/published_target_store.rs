@@ -2,8 +2,8 @@ use crate::domain::session_catalog::{
     ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState, SessionAvailability,
 };
 use crate::domain::workspace::WorkspaceSessionRole;
-use crate::infra::base64::{decode_base64, encode_base64};
 use crate::infra::tmux::TmuxError;
+use base64::Engine;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -43,6 +43,7 @@ impl PublishedTargetStore {
         Self { path: path.into() }
     }
 
+    #[allow(dead_code)]
     pub fn list_targets(&self) -> Result<Vec<ManagedSessionRecord>, TmuxError> {
         Ok(self
             .list_records()?
@@ -189,6 +190,7 @@ impl PublishedTargetStore {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub fn remove_source_socket_targets_except(
         &self,
         socket_name: &str,
@@ -423,11 +425,12 @@ fn validate_published_remote_target(target: &ManagedSessionRecord) -> Result<(),
 }
 
 fn encode_string_field(value: &str) -> String {
-    encode_base64(value.as_bytes())
+    base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
 }
 
 fn decode_string_field(value: &str) -> Result<String, TmuxError> {
-    let decoded = decode_base64(value)
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
         .map_err(|error| TmuxError::new(format!("invalid base64 field `{value}`: {error}")))?;
     String::from_utf8(decoded).map_err(|error| {
         TmuxError::new(format!(
@@ -440,17 +443,6 @@ fn encode_optional_string_field(value: Option<&str>) -> String {
     value
         .map(encode_string_field)
         .unwrap_or_else(|| OPTIONAL_NONE_SENTINEL.to_string())
-}
-
-fn encode_string_list_field(values: &BTreeSet<String>) -> String {
-    if values.is_empty() {
-        return OPTIONAL_NONE_SENTINEL.to_string();
-    }
-    values
-        .iter()
-        .map(|value| encode_string_field(value))
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 fn encode_source_binding_list_field(values: &BTreeSet<PublishedTargetSourceBinding>) -> String {

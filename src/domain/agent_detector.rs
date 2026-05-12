@@ -1,0 +1,192 @@
+use crate::domain::session_catalog::ManagedSessionTaskState;
+use std::fmt;
+
+/// Shared list of shell program names used across agent detection and overlay logic.
+pub const SHELL_NAMES: &[&str] = &["bash", "zsh", "fish", "sh"];
+
+/// A detector that identifies a specific agent (Claude, Codex, etc.)
+/// and infers its task state from process info and pane text.
+pub trait AgentDetector: Send + Sync {
+    /// Human-readable agent name (e.g. "claude", "codex", "shell").
+    #[allow(dead_code)]
+    fn name(&self) -> &'static str;
+
+    /// Agent-specific process-name detection.
+    /// Returns Some(agent_name) if the running process belongs to this agent.
+    fn detect_from_process(
+        &self,
+        current_command: &str,
+        argv: Option<&[String]>,
+    ) -> Option<&'static str>;
+
+    /// Agent-specific pane-text detection (used when the shell is a known shell).
+    /// Returns Some(agent_name) if the pane text reveals this agent.
+    fn detect_from_pane_text(&self, current_command: &str, pane_text: &str)
+        -> Option<&'static str>;
+
+    /// Infer the agent-specific task state from command name and pane text.
+    /// Returns None if this detector does not handle the given context.
+    fn infer_task_state(
+        &self,
+        command_name: Option<&str>,
+        pane_text: &str,
+    ) -> Option<ManagedSessionTaskState>;
+}
+
+/// Registry of all known agent detectors.
+/// Dispatches detection queries to registered detectors in priority order.
+pub struct DetectorRegistry {
+    /// Priority-ordered detectors. Earlier entries take precedence.
+    detectors: Vec<Box<dyn AgentDetector>>,
+}
+
+impl fmt::Debug for DetectorRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DetectorRegistry")
+            .field("detectors", &self.detectors.len())
+            .finish()
+    }
+}
+
+impl PartialEq for DetectorRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        self.detectors.len() == other.detectors.len()
+    }
+}
+
+impl Eq for DetectorRegistry {}
+
+impl DetectorRegistry {
+    pub fn new() -> Self {
+        Self {
+            detectors: Vec::new(),
+        }
+    }
+
+    pub fn register(&mut self, detector: Box<dyn AgentDetector>) {
+        self.detectors.push(detector);
+    }
+
+    /// Runs process-level detection across all registered detectors.
+    /// Highest-priority (first) match wins.
+    pub fn detect_from_process(
+        &self,
+        current_command: &str,
+        argv: Option<&[String]>,
+    ) -> Option<&'static str> {
+        for detector in &self.detectors {
+            if let Some(name) = detector.detect_from_process(current_command, argv) {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Runs pane-text detection across all registered detectors.
+    /// Highest-priority (first) match wins.
+    pub fn detect_from_pane_text(
+        &self,
+        current_command: &str,
+        pane_text: &str,
+    ) -> Option<&'static str> {
+        for detector in &self.detectors {
+            if let Some(name) = detector.detect_from_pane_text(current_command, pane_text) {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Full detection: process first, then pane text, then normalize.
+    /// Returns the normalized command name.
+    pub fn detect_command_name(
+        &self,
+        current_command: &str,
+        argv: Option<&[String]>,
+        pane_text: &str,
+    ) -> String {
+        // 1. Process-level detection
+        if let Some(name) = self.detect_from_process(current_command, argv) {
+            return name.to_string();
+        }
+        // 2. Pane-text detection (only when running under a shell)
+        if SHELL_NAMES.contains(&current_command) {
+            if let Some(name) = self.detect_from_pane_text(current_command, pane_text) {
+                return name.to_string();
+            }
+        }
+        // 3. Fall back to the original command name
+        current_command.to_string()
+    }
+
+    /// Infer task state using registered detectors.
+    /// Process/text detection is not re-run here; the caller provides the resolved command_name.
+    pub fn infer_task_state(
+        &self,
+        command_name: Option<&str>,
+        pane_text: &str,
+    ) -> ManagedSessionTaskState {
+        let normalized_lines: Vec<&str> = pane_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        if normalized_lines.is_empty() {
+            return ManagedSessionTaskState::Unknown;
+        }
+
+        // 1. Check Confirm keywords on the last few non-empty lines
+        //    (restricted to avoid false positives from log output or docs)
+        {
+            let recent_lines: Vec<_> = normalized_lines
+                .iter()
+                .rev()
+                .take(3)
+                .map(|line| line.to_ascii_lowercase())
+                .collect();
+            if recent_lines.iter().any(|line| {
+                line.contains("approve")
+                    || line.contains("approval")
+                    || line.contains("confirm")
+                    || line.contains("continue?")
+                    || line.contains("allow")
+                    || line.contains("permission")
+                    || line.contains("[y/n]")
+                    || line.contains("(y/n)")
+                    || line.contains("yes/no")
+            }) {
+                return ManagedSessionTaskState::Confirm;
+            }
+        }
+
+        let command_name = command_name.unwrap_or_default();
+        let _last_line = normalized_lines.last().copied().unwrap_or_default();
+
+        // 2. Try each detector's task state inference
+        for detector in &self.detectors {
+            if let Some(state) = detector.infer_task_state(command_name.into(), pane_text) {
+                return state;
+            }
+        }
+
+        // 3. Fallback to Running
+        ManagedSessionTaskState::Running
+    }
+
+    /// Returns true if the given name is a known shell program.
+    #[allow(dead_code)]
+    pub fn is_shell_name(&self, name: &str) -> bool {
+        SHELL_NAMES.contains(&name)
+    }
+}
+
+impl Default for DetectorRegistry {
+    fn default() -> Self {
+        let mut registry = Self::new();
+        registry.register(Box::new(super::agent_detector_claude::ClaudeDetector));
+        registry.register(Box::new(super::agent_detector_codex::CodexDetector));
+        registry.register(Box::new(super::agent_detector_shell::ShellDetector));
+        registry
+    }
+}

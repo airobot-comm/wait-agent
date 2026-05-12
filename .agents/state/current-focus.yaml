@@ -1,7 +1,13 @@
 kind: state
 version: 1
 current_task: null
-focus_statement: the full remote session foundation phase (t5-08) is now complete — protocol, server-side mirror-route ownership, PTY-owner mirror lifecycle, bootstrap replay, live output binding, and cross-host acceptance are all implemented and verified. No remaining queued tasks in backlog.
+focus_statement: >
+  Current batch done: bug-multi-remote-switch-lag (BRIDGE_REFRESH_INTERVAL
+  reduction) and t5-08c4d3h (event-driven authority bridge discovery via inotify).
+  All refactor tasks (refactor-1 through refactor-7) and the three reported bugs
+  are now resolved. Future deferred work: feature-agent-status-recognition
+  (sidebar state sync + AgentDetector plugin integration) and ux-3 (workspace
+  snapshot persistence). No active tasks remaining in this batch.
 last_updated_from:
   file: .agents/tasks/backlog.yaml
-  reference: active
+  reference: next

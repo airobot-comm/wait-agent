@@ -220,22 +220,22 @@ next:
     status: done
   - id: task.t5-08c4d3e
     title: decouple local raw PTY input from synchronous transport writes
-    status: ready
+    status: superseded
   - id: task.t5-08c4d3f
     title: replace FIFO and output-pump bridging with direct remote PTY ownership
-    status: ready
+    status: superseded
   - id: task.t5-08c4d3g
     title: introduce a lightweight raw PTY authority frame path
-    status: ready
+    status: superseded
   - id: task.t5-08c4d3h
     title: make authority bridge discovery event-driven
-    status: ready
+    status: done
   - id: task.t5-08c4d3i
     title: reduce remote attach bootstrap capture cost
-    status: ready
+    status: superseded
   - id: task.t3-07
     title: implement narrow-terminal compaction rules for the fixed-chrome workspace layout
-    status: deferred
+    status: cancelled
   - id: task.architecture-1
     title: refactor the runtime and module architecture for clearer boundaries and cleaner code
     status: superseded
@@ -250,16 +250,52 @@ next:
     status: superseded
   - id: task.ux-1
     title: sync sidebar item status with main pane output so sidebar reflects real pane state
-    status: ready
+    status: superseded
   - id: task.ux-2
     title: show last user input line at top of main pane area like VS Code
-    status: ready
+    status: cancelled
+  - id: task.feature-agent-status-recognition
+    title: improve session state recognition accuracy in catalog and sidebar with agent plugin
+    status: deferred
   - id: task.ux-3
     title: implement workspace snapshot persistence and auto-load on startup
-    status: ready
+    status: deferred
   - id: task.ux-4
     title: embed web UI bundle inside waitagent binary
-    status: ready
+    status: cancelled
+  - id: task.refactor-1
+    title: replace custom base64 implementation with the mature base64 crate
+    status: done
+  - id: task.refactor-2
+    title: clean up dead code annotations and unused API surface
+    status: done
+  - id: task.refactor-3
+    title: extract semantic agent detection into a plugin-based AgentDetector trait
+    status: done
+  - id: task.refactor-4
+    title: cluster runtime modules into sub-directories by concept
+    status: done
+  - id: task.refactor-5
+    title: split oversized source files to stay at or below 1000 lines each
+    status: done
+  - id: task.refactor-6
+    title: refine fullscreen history UX so users can browse scrollback naturally
+    status: done
+  - id: task.refactor-7
+    title: decouple remote publication and session sync from direct tmux backend coupling
+    status: done
+  - id: task.bug-sidebar-switch-lag
+    title: fix severe lag on first sidebar switch while main pane is running
+    status: done
+  - id: task.bug-local-session-freeze-after-connect
+    title: fix local session switching freeze after connecting to remote server
+    status: done
+  - id: task.bug-multi-remote-switch-lag
+    title: fix severe lag switching to second remote session after the first
+    status: done
+  - id: task.bug-remote-session-lost-after-idle
+    title: fix remote session content not showing in main pane and sidebar becoming unswitchable after idling
+    status: wontfix
 templates:
   - id: task-template.local-acceptance-cycle
     title: local acceptance rerun or bug-fix slice
@@ -294,5 +330,12 @@ notes:
   - 2026-05-09 refinement: raw PTY is now the accepted remote interactive baseline, but the SSH-parity review split remaining latency work into `task.t5-08c4d3e -> task.t5-08c4d3i` covering local input write decoupling, direct PTY ownership, lightweight raw frames, event-driven bridge discovery, and faster attach bootstrap.
   - The old gutter-scroll direction remains retired.
   - The old custom fullscreen-history direction is now also retired as the primary architecture because Codex-like live TUIs do not reliably repaint under the mixed narrow-PTY then widened-fullscreen model.
-  - `task.architecture-1` is intentionally parked as deferred cleanup so it stays visible without silently becoming the next in-progress delivery slice.
+  - `task.architecture-1` is now superseded by the `task.refactor-1` through `task.refactor-7` queue which covers the same ground with finer granularity.
+  - 2026-05-11 refactor queue: `task.refactor-1 -> task.refactor-2 -> task.refactor-3 -> task.refactor-4 -> task.refactor-5 -> task.refactor-6 -> task.refactor-7` is the codebase cleanup and architecture refinement batch on branch `feat/refactor-codebase-cleanup`.
+  - Refactor constraint: every refactor slice must preserve all existing functionality and performance characteristics. No behavioral regressions are acceptable. Each task must pass cargo test and cargo build --release before closing.
+  - Refactor constraint: refactor-1 and refactor-2 are independent and can land in either order. refactor-3 depends on refactor-2. refactor-4 depends on refactor-3. refactor-5 depends on refactor-4. refactor-6 and refactor-7 depend on refactor-5 but are independent of each other.
+  - The refactor queue does not block the existing remote PTY latency queue (task.t5-08c4d3e through task.t5-08c4d3i). Both queues can proceed in parallel on their respective branches.
   - The original `task.tmux-1` through `task.tmux-6` split is preserved as historical planning only and is superseded by the rewrite queue after review found that the bridge-heavy path would preserve too much of the legacy lifecycle structure.
+  - 2026-05-11 bugs: `task.bug-sidebar-switch-lag` and `task.bug-local-session-freeze-after-connect` are reported UX bugs. They are independent of the refactor queue and can be investigated in parallel.
+  - 2026-05-12 refactor queue update: refactor-1 through refactor-4 are done and committed. refactor-5 and refactor-6 are in_progress. refactor-7 remains ready.
+  - 2026-05-12 bug update: `task.bug-sidebar-switch-lag` and `task.bug-local-session-freeze-after-connect` fixed and committed. `task.bug-remote-session-lost-after-idle` marked wontfix (cannot reproduce). `task.bug-status-recognition-inaccurate` converted to feature and deferred to before workspace snapshot.
