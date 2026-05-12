@@ -2,7 +2,7 @@ id: task.t5-08c4d3e
 kind: task
 version: 1
 title: decouple local raw PTY input from synchronous transport writes
-status: ready
+status: superseded
 priority: high
 design_ref:
   doc: docs/raw-pty-tunnel-design.md

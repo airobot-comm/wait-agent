@@ -1,14 +1,13 @@
 mod tests {
     use super::super::{
-        discover_authority_socket_paths, extract_target_component,
-        is_high_frequency_authority_input, route_transport_envelope, ActiveAuthoritySocketBridge,
-        ActiveNodeIngressSession, RemoteNodeIngressServerRuntime,
+        discover_authority_socket_paths, extract_target_component, route_transport_envelope,
+        ActiveAuthoritySocketBridge, ActiveNodeIngressSession, RemoteNodeIngressServerRuntime,
     };
     use crate::cli::RemoteNetworkConfig;
     use crate::infra::remote_grpc_proto::v1::node_session_envelope::Body;
     use crate::infra::remote_grpc_proto::v1::{
-        MirrorBootstrapChunk, MirrorBootstrapComplete, NodeSessionEnvelope, RawPtyInput,
-        RouteContext, TargetOutput,
+        MirrorBootstrapChunk, MirrorBootstrapComplete, NodeSessionEnvelope, RouteContext,
+        TargetOutput,
     };
     use crate::infra::remote_grpc_transport::RemoteNodeSessionHandle;
     use crate::runtime::remote_authority_transport_runtime::RemoteAuthorityTransportRuntime;
@@ -76,41 +75,6 @@ mod tests {
         let _ = fs::remove_file(matching_b);
         let _ = fs::remove_file(matching_scoped);
         let _ = fs::remove_file(different_authority);
-    }
-
-    #[test]
-    fn high_frequency_authority_input_skips_bridge_refresh() {
-        assert!(is_high_frequency_authority_input(&NodeSessionEnvelope {
-            message_id: "raw-input".to_string(),
-            sent_at: None,
-            session_instance_id: "session-1".to_string(),
-            correlation_id: None,
-            route: None,
-            body: Some(Body::RawPtyInput(RawPtyInput {
-                attachment_id: "attach-1".to_string(),
-                target_id: "remote-peer:peer-a:shell-1".to_string(),
-                console_id: "console-a".to_string(),
-                console_host_id: "observer-a".to_string(),
-                input_seq: 1,
-                session_id: "shell-1".to_string(),
-                input_bytes: b"x".to_vec(),
-            })),
-        }));
-
-        assert!(!is_high_frequency_authority_input(&NodeSessionEnvelope {
-            message_id: "output".to_string(),
-            sent_at: None,
-            session_instance_id: "session-1".to_string(),
-            correlation_id: None,
-            route: None,
-            body: Some(Body::TargetOutput(TargetOutput {
-                target_id: "remote-peer:peer-a:shell-1".to_string(),
-                output_seq: 1,
-                stream: "pty".to_string(),
-                session_id: "shell-1".to_string(),
-                output_bytes: b"x".to_vec(),
-            })),
-        }));
     }
 
     #[test]

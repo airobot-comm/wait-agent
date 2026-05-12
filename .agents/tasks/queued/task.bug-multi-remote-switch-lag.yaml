@@ -2,7 +2,7 @@ id: task.bug-multi-remote-switch-lag
 kind: task
 version: 1
 title: fix severe lag switching to second remote session after the first
-status: ready
+status: done
 priority: high
 design_ref:
   doc: investigation

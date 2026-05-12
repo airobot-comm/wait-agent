@@ -2,7 +2,7 @@ id: task.t5-08c4d3h
 kind: task
 version: 1
 title: make authority bridge discovery event-driven
-status: ready
+status: done
 priority: medium
 design_ref:
   doc: docs/raw-pty-tunnel-design.md

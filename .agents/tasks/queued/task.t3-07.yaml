@@ -2,7 +2,7 @@ id: task.t3-07
 kind: task
 version: 1
 title: implement narrow-terminal compaction rules for the fixed-chrome workspace layout
-status: deferred
+status: cancelled
 priority: low
 target_task_reference: task.t3-07
 source_of_truth:

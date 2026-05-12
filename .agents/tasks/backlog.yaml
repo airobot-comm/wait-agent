@@ -220,22 +220,22 @@ next:
     status: done
   - id: task.t5-08c4d3e
     title: decouple local raw PTY input from synchronous transport writes
-    status: ready
+    status: superseded
   - id: task.t5-08c4d3f
     title: replace FIFO and output-pump bridging with direct remote PTY ownership
-    status: ready
+    status: superseded
   - id: task.t5-08c4d3g
     title: introduce a lightweight raw PTY authority frame path
-    status: ready
+    status: superseded
   - id: task.t5-08c4d3h
     title: make authority bridge discovery event-driven
-    status: ready
+    status: done
   - id: task.t5-08c4d3i
     title: reduce remote attach bootstrap capture cost
-    status: ready
+    status: superseded
   - id: task.t3-07
     title: implement narrow-terminal compaction rules for the fixed-chrome workspace layout
-    status: deferred
+    status: cancelled
   - id: task.architecture-1
     title: refactor the runtime and module architecture for clearer boundaries and cleaner code
     status: superseded
@@ -250,19 +250,19 @@ next:
     status: superseded
   - id: task.ux-1
     title: sync sidebar item status with main pane output so sidebar reflects real pane state
-    status: ready
+    status: superseded
   - id: task.ux-2
     title: show last user input line at top of main pane area like VS Code
-    status: ready
+    status: cancelled
   - id: task.feature-agent-status-recognition
     title: improve session state recognition accuracy in catalog and sidebar with agent plugin
     status: deferred
   - id: task.ux-3
     title: implement workspace snapshot persistence and auto-load on startup
-    status: ready
+    status: deferred
   - id: task.ux-4
     title: embed web UI bundle inside waitagent binary
-    status: ready
+    status: cancelled
   - id: task.refactor-1
     title: replace custom base64 implementation with the mature base64 crate
     status: done
@@ -277,7 +277,7 @@ next:
     status: done
   - id: task.refactor-5
     title: split oversized source files to stay at or below 1000 lines each
-    status: in_progress
+    status: done
   - id: task.refactor-6
     title: refine fullscreen history UX so users can browse scrollback naturally
     status: done
@@ -292,7 +292,7 @@ next:
     status: done
   - id: task.bug-multi-remote-switch-lag
     title: fix severe lag switching to second remote session after the first
-    status: ready
+    status: done
   - id: task.bug-remote-session-lost-after-idle
     title: fix remote session content not showing in main pane and sidebar becoming unswitchable after idling
     status: wontfix

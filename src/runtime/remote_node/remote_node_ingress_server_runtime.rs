@@ -29,7 +29,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const BRIDGE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const BRIDGE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const WATCHER_SLEEP_ON_EMPTY: Duration = Duration::from_millis(200);
 const REMOTE_NODE_INGRESS_OWNER_READY_RETRIES: usize = 20;
 const REMOTE_NODE_INGRESS_OWNER_READY_SLEEP: Duration = Duration::from_millis(25);
 
@@ -58,6 +59,7 @@ enum InternalEvent {
         node_id: String,
         socket_path: PathBuf,
     },
+    SocketDirChanged,
 }
 
 impl RemoteNodeIngressServerRuntime {
@@ -191,6 +193,69 @@ fn any_live_workspace_exists() -> Result<bool, LifecycleError> {
         .any(|socket_name| backend.socket_is_live(socket_name)))
 }
 
+/// Watches the temp directory with inotify for new authority socket files and sends
+/// [`InternalEvent::SocketDirChanged`] through the channel when one appears. Replaces
+/// the previous periodic polling of `/tmp/` for socket discovery.
+fn start_socket_watcher(
+    internal_tx: mpsc::Sender<InternalEvent>,
+) -> io::Result<thread::JoinHandle<()>> {
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let dir = std::env::temp_dir();
+    let dir_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::other("temp_dir contains interior null byte"))?;
+
+    let wd = unsafe {
+        libc::inotify_add_watch(fd, dir_path.as_ptr(), libc::IN_CREATE | libc::IN_MOVED_TO)
+    };
+    if wd == -1 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(thread::spawn(move || {
+        let event_size = std::mem::size_of::<libc::inotify_event>();
+        let mut buf = [0u8; 4096];
+
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    thread::sleep(WATCHER_SLEEP_ON_EMPTY);
+                    continue;
+                }
+                break;
+            }
+
+            let mut off = 0;
+            while off + event_size <= n as usize {
+                // SAFETY: kernel wrote valid inotify_event into the buffer
+                let event = unsafe { &*(buf[off..].as_ptr() as *const libc::inotify_event) };
+                let name_len = event.len as usize;
+                let name_off = off + event_size;
+                if name_len > 0 && name_off + name_len <= n as usize {
+                    let end = buf[name_off..name_off + name_len]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(name_len);
+                    if let Ok(name) = std::str::from_utf8(&buf[name_off..name_off + end]) {
+                        if name.starts_with("waitagent-remote-") && name.ends_with(".sock") {
+                            let _ = internal_tx.send(InternalEvent::SocketDirChanged);
+                        }
+                    }
+                }
+                off += event_size + name_len;
+            }
+        }
+
+        unsafe { libc::close(fd) };
+    }))
+}
+
 impl Drop for RemoteNodeIngressServerGuard {
     fn drop(&mut self) {
         let _ = self.transport_guard.take();
@@ -208,8 +273,11 @@ fn run_node_ingress_server_loop(
 ) {
     let mut sessions = HashMap::<String, ActiveNodeIngressSession>::new();
 
+    // Start the inotify watcher to detect new authority socket files without polling.
+    let _watcher = start_socket_watcher(internal_tx.clone()).ok();
+
     loop {
-        match transport_rx.recv_timeout(BRIDGE_REFRESH_INTERVAL) {
+        match transport_rx.recv() {
             Ok(event) => match event {
                 RemoteNodeTransportEvent::SessionOpened { session } => {
                     let node_id = session.node_id().to_string();
@@ -221,11 +289,6 @@ fn run_node_ingress_server_loop(
                     sessions.insert(node_id, active);
                 }
                 RemoteNodeTransportEvent::EnvelopeReceived { node_id, envelope } => {
-                    if !is_high_frequency_authority_input(&envelope) {
-                        if let Some(active) = sessions.get_mut(&node_id) {
-                            refresh_authority_bridges(&node_id, active, internal_tx.clone());
-                        }
-                    }
                     let _ = route_transport_envelope(
                         &publication_runtime,
                         &node_id,
@@ -246,12 +309,7 @@ fn run_node_ingress_server_loop(
                     }
                 }
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                for (node_id, active) in &mut sessions {
-                    refresh_authority_bridges(node_id, active, internal_tx.clone());
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvError) => return,
         }
 
         while let Ok(event) = internal_rx.try_recv() {
@@ -264,13 +322,14 @@ fn run_node_ingress_server_loop(
                         active.bridges.remove(&socket_path);
                     }
                 }
+                InternalEvent::SocketDirChanged => {
+                    for (node_id, active) in &mut sessions {
+                        refresh_authority_bridges(node_id, active, internal_tx.clone());
+                    }
+                }
             }
         }
     }
-}
-
-fn is_high_frequency_authority_input(envelope: &GrpcNodeSessionEnvelope) -> bool {
-    matches!(envelope.body.as_ref(), Some(Body::RawPtyInput(_)))
 }
 
 fn route_transport_envelope(

@@ -2,7 +2,7 @@ id: task.refactor-5
 kind: task
 version: 1
 title: split oversized source files to stay at or below 1000 lines each
-status: ready
+status: done
 priority: high
 design_ref:
   doc: docs/architecture.md
