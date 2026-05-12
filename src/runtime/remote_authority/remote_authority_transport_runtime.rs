@@ -59,6 +59,12 @@ impl RemoteAuthorityTransportRuntime {
         write_client_hello(&mut stream, &node_id)?;
         let _server_hello = read_server_hello(&mut stream)?;
         let writer = stream.try_clone()?;
+        // Reader/Writer timeouts prevent indefinite blocking under network jitter:
+        // the reader may be stranded during a gRPC reconnect window on the authority
+        // node, and a slow or broken FIFO reader on the output-pump side must not
+        // freeze the event loop by back-pressuring the transport writer.
+        stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
+        writer.set_write_timeout(Some(Duration::from_secs(5))).ok();
         Ok(Self {
             node_id,
             reader: Mutex::new(stream),

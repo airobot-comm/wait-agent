@@ -541,10 +541,22 @@ fn start_shared_authority_command_dispatcher(shared_session: SharedAuthoritySess
                 shared_session.network.connect_endpoint_uri().as_deref(),
             ) {
                 Ok(session) => {
+                    if reconnect_attempt > 0 {
+                        eprintln!(
+                            "[waitagent-diag] authority session reconnected after {} attempt(s) for {}",
+                            reconnect_attempt, shared_session.authority_id,
+                        );
+                    }
                     reconnect_attempt = 0;
                     Arc::new(session)
                 }
-                Err(_) => {
+                Err(error) => {
+                    if reconnect_attempt == 0 || reconnect_attempt % 5 == 0 {
+                        eprintln!(
+                            "[waitagent-diag] authority session connect failed (attempt={}) for {}: {}",
+                            reconnect_attempt, shared_session.authority_id, error,
+                        );
+                    }
                     thread::sleep(shared_authority_reconnect_delay(reconnect_attempt));
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
                     continue;
@@ -554,6 +566,10 @@ fn start_shared_authority_command_dispatcher(shared_session: SharedAuthoritySess
             if (reconnect_attempt > 0 || shared_session.has_pending_exits())
                 && !restore_shared_authority_state(&shared_session, &session)
             {
+                eprintln!(
+                    "[waitagent-diag] authority state restore failed, retrying (attempt={}) for {}",
+                    reconnect_attempt, shared_session.authority_id,
+                );
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 thread::sleep(shared_authority_reconnect_delay(reconnect_attempt));
                 continue;
@@ -569,7 +585,11 @@ fn start_shared_authority_command_dispatcher(shared_session: SharedAuthoritySess
                             &command,
                         );
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        eprintln!(
+                            "[waitagent-diag] authority command stream error for {}: {}",
+                            shared_session.authority_id, error,
+                        );
                         shared_session.disconnect_session(&session);
                         mark_live_routes_offline(
                             &shared_session.publication_runtime,
@@ -581,6 +601,12 @@ fn start_shared_authority_command_dispatcher(shared_session: SharedAuthoritySess
                     }
                 }
             }
+        }
+        if reconnect_attempt > 0 {
+            eprintln!(
+                "[waitagent-diag] authority session dispatcher exiting after {} reconnect attempts for {}",
+                reconnect_attempt, shared_session.authority_id,
+            );
         }
         shutdown_live_routes(&shared_session.routes);
         shared_session.replace_session(None);
@@ -809,7 +835,12 @@ pub(super) fn bridge_shared_live_authority_stream(
         if let Some(previous) = writer_guard.take() {
             let _ = previous.shutdown(Shutdown::Both);
         }
-        *writer_guard = Some(host_stream.try_clone()?);
+        let writer_clone = host_stream.try_clone()?;
+        // 5s write timeout prevents indefinite blocking when the target-host
+        // sub-process dies (e.g. after a WiFi blip tears down the bridge) but
+        // the route is not yet cleaned up on the owner side.
+        let _ = writer_clone.set_write_timeout(Some(Duration::from_secs(5)));
+        *writer_guard = Some(writer_clone);
     }
     flush_pending_live_route_commands(&route)?;
     let forward_result =

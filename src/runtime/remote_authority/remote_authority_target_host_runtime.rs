@@ -16,17 +16,135 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MirrorState {
     Inactive,
     Active { raw_pty_passthrough: bool },
+}
+
+/// Tracks event-loop health and transport/FIFO stalls for diagnostic output.
+/// Writes a stall summary to a temp file when a stall is detected so that
+/// operators can inspect it after the session becomes unresponsive.
+struct EventLoopHealth {
+    last_event_time: Mutex<SystemTime>,
+    events_processed: AtomicU64,
+    total_input_bytes: AtomicU64,
+    total_output_chunks: AtomicU64,
+    fifo_stall_count: AtomicU64,
+    fifo_stalled_bytes: AtomicU64,
+    mirror_active: AtomicBool,
+    started_at: SystemTime,
+    last_stall_warn: Mutex<SystemTime>,
+}
+
+impl EventLoopHealth {
+    fn new() -> Self {
+        Self {
+            last_event_time: Mutex::new(SystemTime::now()),
+            events_processed: AtomicU64::new(0),
+            total_input_bytes: AtomicU64::new(0),
+            total_output_chunks: AtomicU64::new(0),
+            fifo_stall_count: AtomicU64::new(0),
+            fifo_stalled_bytes: AtomicU64::new(0),
+            mirror_active: AtomicBool::new(false),
+            started_at: SystemTime::now(),
+            last_stall_warn: Mutex::new(SystemTime::now()),
+        }
+    }
+
+    fn record_event(&self) {
+        self.events_processed.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut t) = self.last_event_time.lock() {
+            *t = SystemTime::now();
+        }
+    }
+
+    fn record_input(&self, n: u64) {
+        self.total_input_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn record_output(&self) {
+        self.total_output_chunks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_fifo_stall(&self, n: u64) {
+        self.fifo_stall_count.fetch_add(1, Ordering::Relaxed);
+        self.fifo_stalled_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn maybe_log_stall(&self, transport_socket_path: &str, target_id: &str) {
+        let now = SystemTime::now();
+        let should_warn = self
+            .last_stall_warn
+            .lock()
+            .map(|mut t| {
+                let elapsed = now.duration_since(*t).ok();
+                if elapsed.map_or(true, |d| d > Duration::from_secs(5)) {
+                    *t = now;
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if should_warn {
+            let diag_path = authority_diag_path(transport_socket_path, target_id);
+            let _ = self.write_diag(&diag_path);
+            eprintln!(
+                "[waitagent-diag] FIFO stall: count={} bytes={} path={}",
+                self.fifo_stall_count.load(Ordering::Relaxed),
+                self.fifo_stalled_bytes.load(Ordering::Relaxed),
+                diag_path.display(),
+            );
+        }
+    }
+
+    fn write_diag(&self, path: &Path) -> std::io::Result<()> {
+        let elapsed = |start: SystemTime| -> String {
+            SystemTime::now()
+                .duration_since(start)
+                .map(|d| format!("{}.{:03}s", d.as_secs(), d.subsec_millis()))
+                .unwrap_or_else(|_| "?".to_string())
+        };
+        let last_event = self
+            .last_event_time
+            .lock()
+            .map(|t| elapsed(*t))
+            .unwrap_or_else(|_| "?".to_string());
+        let uptime = elapsed(self.started_at);
+        let content = format!(
+            "\
+[waitagent-diag]
+pid={}
+uptime={}
+events_processed={}
+total_input_bytes={}
+total_output_chunks={}
+fifo_stall_count={}
+fifo_stalled_bytes={}
+mirror_active={}
+time_since_last_event={}
+",
+            std::process::id(),
+            uptime,
+            self.events_processed.load(Ordering::Relaxed),
+            self.total_input_bytes.load(Ordering::Relaxed),
+            self.total_output_chunks.load(Ordering::Relaxed),
+            self.fifo_stall_count.load(Ordering::Relaxed),
+            self.fifo_stalled_bytes.load(Ordering::Relaxed),
+            self.mirror_active.load(Ordering::Relaxed),
+            last_event,
+        );
+        std::fs::write(path, content)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,11 +436,14 @@ where
             .open(&input_fifo_path)
             .map_err(remote_authority_error)?;
 
+        let health = Arc::new(EventLoopHealth::new());
+
         let loop_result = loop {
             match event_rx.recv() {
                 Ok(AuthorityHostEvent::TransportCommand(RemoteAuthorityCommand::OpenMirror(
                     payload,
                 ))) => {
+                    health.record_event();
                     if matches!(mirror_state, MirrorState::Active { .. }) {
                         if let Err(error) = self
                             .gateway
@@ -388,6 +509,7 @@ where
                     mirror_state = MirrorState::Active {
                         raw_pty_passthrough: payload.raw_pty_passthrough,
                     };
+                    health.mirror_active.store(true, Ordering::Relaxed);
                     if let Err(error) = transport
                         .send_open_mirror_accepted(
                             &payload.session_id,
@@ -412,16 +534,36 @@ where
                 Ok(AuthorityHostEvent::TransportCommand(RemoteAuthorityCommand::RawPtyInput(
                     payload,
                 ))) => {
-                    if let Err(error) = input_fifo
-                        .write_all(&payload.input_bytes)
-                        .and_then(|_| input_fifo.flush())
-                    {
-                        break Err(remote_authority_error(error));
+                    health.record_event();
+                    // Non-blocking FIFO write: use poll() to check writability
+                    // before writing. Prevents the single-threaded event loop
+                    // from freezing when the output-pump reader stalls (e.g.
+                    // under network jitter where the pump process may lag).
+                    let fd = input_fifo.as_raw_fd();
+                    let mut pollfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let writable = unsafe { libc::poll(&mut pollfd, 1, 0) } > 0
+                        && (pollfd.revents & libc::POLLOUT) != 0;
+                    if writable {
+                        if let Err(error) = input_fifo
+                            .write_all(&payload.input_bytes)
+                            .and_then(|_| input_fifo.flush())
+                        {
+                            break Err(remote_authority_error(error));
+                        }
+                        health.record_input(payload.input_bytes.len() as u64);
+                    } else {
+                        health.record_fifo_stall(payload.input_bytes.len() as u64);
+                        health.maybe_log_stall(&command.transport_socket_path, &command.target_id);
                     }
                 }
                 Ok(AuthorityHostEvent::TransportCommand(RemoteAuthorityCommand::ApplyResize(
                     payload,
                 ))) => {
+                    health.record_event();
                     if let Err(error) = self
                         .gateway
                         .resize_pty(&command.socket_name, &pane, payload.cols, payload.rows)
@@ -433,14 +575,18 @@ where
                 Ok(AuthorityHostEvent::TransportCommand(RemoteAuthorityCommand::CloseMirror(
                     _payload,
                 ))) => {
+                    health.record_event();
                     if matches!(mirror_state, MirrorState::Active { .. }) {
                         if let Err(error) = deactivate_mirror(self, &command, &pane) {
                             break Err(error);
                         }
                         mirror_state = MirrorState::Inactive;
+                        health.mirror_active.store(false, Ordering::Relaxed);
                     }
                 }
                 Ok(AuthorityHostEvent::OutputChunk(bytes)) => {
+                    health.record_event();
+                    health.record_output();
                     let raw_pty_passthrough = match mirror_state {
                         MirrorState::Inactive => continue,
                         MirrorState::Active {
@@ -473,6 +619,7 @@ where
                     }
                 }
                 Ok(AuthorityHostEvent::TransportClosed) => {
+                    health.record_event();
                     if matches!(mirror_state, MirrorState::Active { .. }) {
                         if let Err(error) = deactivate_mirror(self, &command, &pane) {
                             break Err(error);
@@ -494,6 +641,12 @@ where
             .ensure_live_session_unregistered(&command.socket_name, &command.target_session_name);
         let _ = command_thread.join();
         let _ = output_thread.join();
+        // Write final diagnostics before exiting so the operator can inspect
+        // health counters after a freeze.
+        let _ = health.write_diag(&authority_diag_path(
+            &command.transport_socket_path,
+            &command.target_id,
+        ));
         loop_result
     }
 
@@ -682,6 +835,13 @@ pub fn authority_output_ingest_socket_path(
 pub fn authority_input_fifo_path(transport_socket_path: &str, target_id: &str) -> PathBuf {
     let hash = stable_socket_hash(&[transport_socket_path, target_id]);
     std::env::temp_dir().join(format!("waitagent-authority-input-{hash}.fifo"))
+}
+
+/// Path for the per-session diagnostic file written on FIFO stall.
+/// Survives the target-host process so it can be inspected after a freeze.
+pub fn authority_diag_path(transport_socket_path: &str, target_id: &str) -> PathBuf {
+    let hash = stable_socket_hash(&[transport_socket_path, target_id]);
+    std::env::temp_dir().join(format!("waitagent-diag-{hash}.diag"))
 }
 
 fn remote_authority_output_pump_shell_command(
