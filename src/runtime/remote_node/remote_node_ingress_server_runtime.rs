@@ -31,6 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BRIDGE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const WATCHER_SLEEP_ON_EMPTY: Duration = Duration::from_millis(200);
+const BRIDGE_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const REMOTE_NODE_INGRESS_OWNER_READY_RETRIES: usize = 20;
 const REMOTE_NODE_INGRESS_OWNER_READY_SLEEP: Duration = Duration::from_millis(25);
 
@@ -302,7 +303,7 @@ fn run_node_ingress_server_loop(
     let _watcher = start_socket_watcher(internal_tx.clone()).ok();
 
     loop {
-        match transport_rx.recv() {
+        match transport_rx.recv_timeout(BRIDGE_HEALTH_CHECK_INTERVAL) {
             Ok(event) => match event {
                 RemoteNodeTransportEvent::SessionOpened { session } => {
                     let node_id = session.node_id().to_string();
@@ -339,7 +340,12 @@ fn run_node_ingress_server_loop(
                     }
                 }
             },
-            Err(mpsc::RecvError) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                for (node_id, active) in &mut sessions {
+                    refresh_authority_bridges(node_id, active, internal_tx.clone());
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
         while let Ok(event) = internal_rx.try_recv() {
