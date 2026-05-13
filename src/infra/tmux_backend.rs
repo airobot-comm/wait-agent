@@ -1,20 +1,18 @@
 use crate::domain::agent_detector::DetectorRegistry;
-use crate::domain::session_catalog::{
-    ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState,
-};
+use crate::domain::session_catalog::{ManagedSessionAddress, ManagedSessionRecord};
 use crate::domain::workspace::{
     WorkspaceInstanceConfig, WorkspaceInstanceId, WorkspaceSessionRole,
 };
 use crate::infra::tmux_error::{
-    parse_tmux_id, parse_tmux_identifier, tmux_socket_dir, validate_percent, TmuxCommandOutput,
-    TmuxCommandRunner, TmuxError,
+    parse_tmux_identifier, tmux_socket_dir, validate_percent, TmuxCommandOutput, TmuxCommandRunner,
+    TmuxError,
 };
 use crate::infra::tmux_glue::{
     TmuxGlueArtifacts, TmuxGlueBuildConfig, TmuxGlueBuildStatus, VendoredTmuxSource,
 };
 use crate::infra::tmux_types::{
-    TmuxLayoutGateway, TmuxPaneId, TmuxPaneInfo, TmuxProgram, TmuxSessionGateway, TmuxSessionName,
-    TmuxSocketName, TmuxWorkspaceHandle,
+    TmuxLayoutGateway, TmuxProgram, TmuxSessionGateway, TmuxSessionName, TmuxSocketName,
+    TmuxWorkspaceHandle,
 };
 use crate::runtime::remote_authority_target_host_runtime::RemoteTargetTerminalFlags;
 use std::fs;
@@ -24,6 +22,7 @@ use std::sync::Arc;
 mod control;
 mod layout;
 mod remote;
+mod session_metadata;
 
 const WAITAGENT_SOCKET_PREFIX: &str = "wa-";
 const SYSTEM_TMUX_PROGRAM: &str = "tmux";
@@ -38,8 +37,8 @@ pub(crate) const WAITAGENT_REMOTE_PUBLICATION_TRANSPORT_SESSION_ID_ENV: &str =
     "WAITAGENT_REMOTE_PUBLICATION_TRANSPORT_SESSION_ID";
 pub(crate) const WAITAGENT_REMOTE_PUBLICATION_SELECTOR_ENV: &str =
     "WAITAGENT_REMOTE_PUBLICATION_SELECTOR";
-const WAITAGENT_SIDEBAR_PANE_TITLE: &str = "waitagent-sidebar";
-const WAITAGENT_FOOTER_PANE_TITLE: &str = "waitagent-footer";
+pub(crate) const WAITAGENT_SIDEBAR_PANE_TITLE: &str = "waitagent-sidebar";
+pub(crate) const WAITAGENT_FOOTER_PANE_TITLE: &str = "waitagent-footer";
 const WAITAGENT_CHROME_REFRESH_CHANNEL_PREFIX: &str = "waitagent-chrome-refresh";
 const WAITAGENT_SIDEBAR_READY_CHANNEL_PREFIX: &str = "waitagent-sidebar-ready";
 const WAITAGENT_FOOTER_READY_CHANNEL_PREFIX: &str = "waitagent-footer-ready";
@@ -64,14 +63,6 @@ struct TmuxSessionMetadata {
     remote_publication_authority_id: Option<String>,
     remote_publication_transport_session_id: Option<String>,
     remote_publication_selector: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TmuxSessionRuntimeMetadata {
-    command_name: Option<String>,
-    current_path: Option<PathBuf>,
-    task_state: ManagedSessionTaskState,
-    is_dead: bool,
 }
 
 impl EmbeddedTmuxBackend {
@@ -610,75 +601,6 @@ impl EmbeddedTmuxBackend {
         Ok(metadata)
     }
 
-    fn session_runtime_metadata(
-        &self,
-        socket_name: &TmuxSocketName,
-        session_name: &str,
-    ) -> Result<TmuxSessionRuntimeMetadata, TmuxError> {
-        let panes = self.list_panes_on_target(socket_name, session_name)?;
-        let Some(main_pane) = panes.iter().find(|pane| {
-            pane.title != WAITAGENT_SIDEBAR_PANE_TITLE && pane.title != WAITAGENT_FOOTER_PANE_TITLE
-        }) else {
-            return Ok(TmuxSessionRuntimeMetadata::default());
-        };
-        let pane_text = self.capture_pane_text(socket_name, &main_pane.pane_id)?;
-        let current_command = main_pane.current_command.as_deref().unwrap_or_default();
-        let foreground_argv = foreground_process_argv_for_pane_shell(main_pane.pane_pid);
-        let command_name = self.registry.detect_command_name(
-            current_command,
-            foreground_argv.as_deref(),
-            &pane_text,
-        );
-        let task_state = if main_pane.in_mode {
-            ManagedSessionTaskState::Running
-        } else {
-            self.registry
-                .infer_task_state(Some(&command_name), &pane_text)
-        };
-        Ok(TmuxSessionRuntimeMetadata {
-            command_name: Some(command_name.clone()),
-            current_path: main_pane.current_path.clone(),
-            task_state,
-            is_dead: main_pane.is_dead,
-        })
-    }
-
-    fn list_panes_on_target(
-        &self,
-        socket_name: &TmuxSocketName,
-        target: &str,
-    ) -> Result<Vec<TmuxPaneInfo>, TmuxError> {
-        let args = vec![
-            "list-panes".to_string(),
-            "-t".to_string(),
-            target.to_string(),
-            "-F".to_string(),
-            "#{pane_id}\t#{pane_pid}\t#{pane_title}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_dead}\t#{pane_in_mode}"
-                .to_string(),
-        ];
-        let output = self.run_on_socket(socket_name, &args)?;
-        output
-            .stdout
-            .lines()
-            .map(Self::pane_info_for_line)
-            .collect::<Result<Vec<_>, _>>()
-    }
-
-    fn capture_pane_text(
-        &self,
-        socket_name: &TmuxSocketName,
-        pane_id: &TmuxPaneId,
-    ) -> Result<String, TmuxError> {
-        let args = vec![
-            "capture-pane".to_string(),
-            "-p".to_string(),
-            "-t".to_string(),
-            pane_id.as_str().to_string(),
-        ];
-        let output = self.run_on_socket(socket_name, &args)?;
-        Ok(output.stdout)
-    }
-
     pub fn pane_dimensions_on_socket(
         &self,
         socket_name: &str,
@@ -831,6 +753,27 @@ impl EmbeddedTmuxBackend {
         Ok(output.stdout)
     }
 
+    /// Captures the full pane history from the earliest available scrollback
+    /// to the current content. When the pane is in alt-screen mode, the normal
+    /// (pre-alt-screen) buffer is captured; use `capture_pane_alt_history_on_socket`
+    /// for the alt-screen buffer.
+    pub fn capture_pane_full_history_on_socket(
+        &self,
+        socket_name: &str,
+        pane_target: &str,
+    ) -> Result<String, TmuxError> {
+        let args = vec![
+            "capture-pane".to_string(),
+            "-p".to_string(),
+            "-S".to_string(),
+            "-".to_string(),
+            "-t".to_string(),
+            pane_target.to_string(),
+        ];
+        let output = self.run_on_socket(&TmuxSocketName::new(socket_name), &args)?;
+        Ok(output.stdout)
+    }
+
     pub fn capture_pane_ansi_on_socket(
         &self,
         socket_name: &str,
@@ -886,6 +829,31 @@ impl EmbeddedTmuxBackend {
             application_cursor_keys: parts.next().unwrap_or("0") == "1",
             cursor_visible: parts.next().unwrap_or("1") == "1",
         })
+    }
+
+    /// Cheap query: returns (pane_bytes, pane_current_command, pane_title, session_name)
+    /// for every pane on the given socket. Used by PaneActivityWatcher.
+    pub(crate) fn pane_activity_on_socket(
+        &self,
+        socket_name: &TmuxSocketName,
+    ) -> Result<Vec<(u64, String, String, String)>, TmuxError> {
+        let args = vec![
+            "list-panes".to_string(),
+            "-s".to_string(),
+            "-F".to_string(),
+            "#{pane_bytes}\t#{pane_current_command}\t#{pane_title}\t#{session_name}".to_string(),
+        ];
+        let output = self.run_on_socket(socket_name, &args)?;
+        let mut results = Vec::new();
+        for line in output.stdout.lines() {
+            let mut parts = line.splitn(4, '\t');
+            let bytes = parts.next().unwrap_or_default().parse::<u64>().unwrap_or(0);
+            let command = parts.next().unwrap_or_default().to_string();
+            let title = parts.next().unwrap_or_default().to_string();
+            let session = parts.next().unwrap_or_default().to_string();
+            results.push((bytes, command, title, session));
+        }
+        Ok(results)
     }
 
     fn wait_for_workspace_channel_on_socket(
@@ -1014,31 +982,12 @@ impl EmbeddedTmuxBackend {
         args.extend(program.args.iter().cloned());
         args
     }
-
-    fn pane_info_for_line(line: &str) -> Result<TmuxPaneInfo, TmuxError> {
-        let mut parts = line.splitn(7, '\t');
-        let pane_id = parts.next().unwrap_or_default();
-        let pane_pid = parts.next().unwrap_or_default();
-        let title = parts.next().unwrap_or_default();
-        let current_command = parts.next().unwrap_or_default();
-        let current_path = parts.next().unwrap_or_default();
-        let dead = parts.next().unwrap_or_default();
-        let in_mode = parts.next().unwrap_or_default();
-
-        Ok(TmuxPaneInfo {
-            pane_id: TmuxPaneId::new(parse_tmux_id(pane_id, '%', "pane id")?),
-            pane_pid: pane_pid.parse::<u32>().ok(),
-            title: title.to_string(),
-            current_command: (!current_command.is_empty()).then(|| current_command.to_string()),
-            current_path: (!current_path.is_empty()).then(|| PathBuf::from(current_path)),
-            is_dead: dead == "1",
-            in_mode: in_mode == "1",
-        })
-    }
 }
 
 pub(crate) mod process_inspector;
 pub(crate) use process_inspector::foreground_process_argv_for_pane_shell;
+
+pub(crate) use crate::infra::tmux_error::parse_tmux_id;
 
 mod gateway;
 use gateway::{

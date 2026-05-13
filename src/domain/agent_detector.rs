@@ -136,32 +136,29 @@ impl DetectorRegistry {
             return ManagedSessionTaskState::Unknown;
         }
 
-        // 1. Check Confirm keywords on the last few non-empty lines
-        //    (restricted to avoid false positives from log output or docs)
+        // 1. Check Confirm on the last non-empty line only, using structural
+        //    choice indicators. Generic keywords (approve, confirm, allow) are
+        //    too broad for automated pane-text scanning and we avoid them here.
+        //    Agent-specific confirm detection lives in each detector's infer_task_state.
         {
-            let recent_lines: Vec<_> = normalized_lines
-                .iter()
-                .rev()
-                .take(3)
-                .map(|line| line.to_ascii_lowercase())
-                .collect();
-            if recent_lines.iter().any(|line| {
-                line.contains("approve")
-                    || line.contains("approval")
-                    || line.contains("confirm")
-                    || line.contains("continue?")
-                    || line.contains("allow")
-                    || line.contains("permission")
-                    || line.contains("[y/n]")
-                    || line.contains("(y/n)")
-                    || line.contains("yes/no")
-            }) {
+            let last = normalized_lines
+                .last()
+                .copied()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let trimmed = last.trim();
+            if trimmed.ends_with("[y/n]")
+                || trimmed.ends_with("(y/n)")
+                || trimmed.ends_with("[yes/no]")
+                || trimmed.ends_with("(yes/no)")
+                || trimmed.ends_with("[y/n]?")
+                || trimmed.ends_with("(y/n)?")
+            {
                 return ManagedSessionTaskState::Confirm;
             }
         }
 
         let command_name = command_name.unwrap_or_default();
-        let _last_line = normalized_lines.last().copied().unwrap_or_default();
 
         // 2. Try each detector's task state inference
         for detector in &self.detectors {

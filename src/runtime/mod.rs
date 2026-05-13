@@ -42,3 +42,5 @@ pub use workspace::workspace_runtime;
 // Standalone modules remaining in runtime root
 pub mod remote_observer_runtime;
 pub mod remote_server_console_runtime;
+
+pub(crate) mod session_state;

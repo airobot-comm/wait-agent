@@ -356,11 +356,16 @@ fn spawn_pane_event_stream(
     }
     let _resize_watcher = spawn_resize_watcher(tx.clone())?;
     spawn_chrome_refresh_watcher(
-        backend,
+        backend.clone(),
         command.socket_name.clone(),
         command.session_name.clone(),
         Arc::clone(&pending_refreshes),
         tx.clone(),
+    );
+    crate::runtime::session_state::spawn_pane_activity_watcher(
+        backend,
+        command.socket_name.clone(),
+        command.session_name.clone(),
     );
     thread::spawn(move || {
         let _keep_resize_watcher_alive = _resize_watcher;

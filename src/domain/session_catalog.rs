@@ -486,11 +486,32 @@ mod tests {
     }
 
     #[test]
-    fn task_state_infers_confirm_from_visible_prompt_text() {
+    fn task_state_infers_confirm_from_trailing_choice_indicator() {
         let state = DetectorRegistry::default()
-            .infer_task_state(Some("codex"), "Allow this action?\nType yes/no to continue");
+            .infer_task_state(Some("claude"), "Run this command?\nApprove? [y/N]");
 
         assert_eq!(state, ManagedSessionTaskState::Confirm);
+    }
+
+    #[test]
+    fn task_state_infers_confirm_from_claude_tool_approval() {
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("claude"),
+            "Claude wants to run:\n  ls -la\nAllow this command?",
+        );
+
+        assert_eq!(state, ManagedSessionTaskState::Confirm);
+    }
+
+    #[test]
+    fn task_state_does_not_infer_confirm_from_conversational_text() {
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("claude"),
+            "I confirm this is a good idea\nLet me run the tool now\nRunning tool call xyz",
+        );
+
+        // "confirm" in running output should NOT trigger Confirm
+        assert_eq!(state, ManagedSessionTaskState::Running);
     }
 
     #[test]

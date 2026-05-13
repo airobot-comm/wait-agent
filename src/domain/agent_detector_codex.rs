@@ -75,15 +75,23 @@ impl AgentDetector for CodexDetector {
         let last_line = normalized_lines.last().copied().unwrap_or_default();
         let last_lowered = last_line.to_ascii_lowercase();
 
+        // Confirm — Codex-specific confirmation prompts
+        if last_lowered.contains("run this command")
+            || last_lowered.contains("allow this")
+            || last_lowered.ends_with("[y/n]")
+            || last_lowered.ends_with("(y/n)")
+        {
+            return Some(ManagedSessionTaskState::Confirm);
+        }
+
+        // Input — structural prompt indicator or known patterns
         if last_line.starts_with('›')
             || last_line.starts_with("> ")
             || last_lowered.contains("type your message")
             || last_lowered.contains("send a message")
+            || last_lowered.contains("tip")
+            || last_lowered.contains("ask codex")
         {
-            return Some(ManagedSessionTaskState::Input);
-        }
-
-        if last_lowered.contains("tip") || last_lowered.contains("ask codex") {
             return Some(ManagedSessionTaskState::Input);
         }
 

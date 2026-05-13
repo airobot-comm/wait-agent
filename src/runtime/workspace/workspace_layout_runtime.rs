@@ -26,6 +26,7 @@ const WAITAGENT_MAIN_PANE_OPTION: &str = "@waitagent_main_pane_id";
 const WAITAGENT_MAIN_PANE_PIPE_OPTION: &str = "@waitagent_main_pane_pipe_id";
 const WAITAGENT_MAIN_PANE_OUTPUT_BRIDGE_OPTION: &str = "@waitagent_main_pane_output_bridge";
 const MAIN_PANE_OUTPUT_BRIDGE_DISABLED: &str = "disabled";
+#[allow(dead_code)]
 const MAIN_PANE_OUTPUT_BRIDGE_ENABLED: &str = "enabled";
 
 #[derive(Clone, Copy)]
@@ -173,6 +174,7 @@ impl WorkspaceLayoutRuntime {
         self.suspend_main_pane_output_bridge(workspace)
     }
 
+    #[allow(dead_code)]
     pub fn enable_main_pane_output_bridge(
         &self,
         workspace: &TmuxWorkspaceHandle,

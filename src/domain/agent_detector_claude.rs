@@ -69,11 +69,22 @@ impl AgentDetector for ClaudeDetector {
         let last_line = normalized_lines.last().copied().unwrap_or_default();
         let lowered = last_line.to_ascii_lowercase();
 
-        if lowered.contains("ready")
+        // Confirm — Claude-specific confirmation prompts
+        if lowered.contains("run this command")
+            || lowered.contains("allow this")
+            || lowered.contains("approve this")
+            || lowered.ends_with("[y/n]")
+            || lowered.ends_with("(y/n)")
+        {
+            return Some(ManagedSessionTaskState::Confirm);
+        }
+
+        // Input — visible prompt or structural indicator
+        if last_line.starts_with('›')
+            || last_line.starts_with("> ")
+            || lowered.contains("ready")
             || lowered.contains("type your message")
             || lowered.contains("send a message")
-            || last_line.starts_with('›')
-            || last_line.starts_with("> ")
         {
             return Some(ManagedSessionTaskState::Input);
         }

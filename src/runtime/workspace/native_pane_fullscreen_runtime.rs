@@ -11,6 +11,7 @@ use crate::infra::tmux::{
 };
 use crate::lifecycle::LifecycleError;
 use crate::runtime::workspace_layout_runtime::WorkspaceLayoutRuntime;
+use std::fs;
 use std::io;
 
 const WAITAGENT_MAIN_PANE_OPTION: &str = "@waitagent_main_pane_id";
@@ -65,11 +66,32 @@ impl NativePaneFullscreenRuntime {
             .backend
             .window_zoomed_on_socket(workspace.socket_name.as_str(), main_pane.as_str())
             .map_err(fullscreen_error)?;
+        let in_alternate_screen = !was_zoomed
+            && self
+                .backend
+                .pane_terminal_flags_on_socket(workspace.socket_name.as_str(), main_pane.as_str())
+                .map_or(false, |flags| flags.alternate_screen_active);
 
         if was_zoomed {
             self.exit_fullscreen_history(&workspace, &main_pane)?;
         } else {
             self.prepare_fullscreen_history_entry(&workspace, &main_pane)?;
+        }
+
+        if in_alternate_screen {
+            // The alt-screen buffer has no scrollback. Save the full pane
+            // history (main-screen scrollback) to a file so the user can
+            // reference it outside copy-mode.
+            if let Ok(history) = self.backend.capture_pane_full_history_on_socket(
+                workspace.socket_name.as_str(),
+                main_pane.as_str(),
+            ) {
+                let history_path = format!(
+                    "/tmp/waitagent-scrollback-{}.log",
+                    workspace.session_name.as_str()
+                );
+                let _ = fs::write(&history_path, &history);
+            }
         }
 
         self.backend
@@ -89,7 +111,7 @@ impl NativePaneFullscreenRuntime {
             .window_zoomed_on_socket(workspace.socket_name.as_str(), main_pane.as_str())
             .map_err(fullscreen_error)?;
         if zoomed {
-            if !was_zoomed {
+            if !was_zoomed && !in_alternate_screen {
                 self.backend
                     .enter_copy_mode(&workspace, &main_pane)
                     .map_err(fullscreen_error)?;

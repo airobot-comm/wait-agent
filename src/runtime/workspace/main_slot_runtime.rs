@@ -174,7 +174,7 @@ impl MainSlotRuntime {
         self.set_workspace_main_pane(workspace, &target_main_pane)?;
         self.set_active_target(workspace, Some(&target.address.qualified_target()))?;
         self.layout_runtime
-            .enable_main_pane_output_bridge(workspace)?;
+            .disable_main_pane_output_bridge(workspace)?;
         self.layout_runtime
             .sync_main_slot_bindings(workspace, workspace_dir)?;
         self.layout_runtime
@@ -279,7 +279,7 @@ impl MainSlotRuntime {
             == Some(target.address.qualified_target().as_str())
         {
             self.layout_runtime
-                .enable_main_pane_output_bridge(&workspace)?;
+                .disable_main_pane_output_bridge(&workspace)?;
             self.layout_runtime
                 .sync_main_slot_bindings(&workspace, &current_workspace.workspace_dir)?;
             return Ok(());
@@ -327,7 +327,7 @@ impl MainSlotRuntime {
         self.set_workspace_main_pane(&workspace, &target_main_pane)?;
         self.set_active_target(&workspace, Some(&target.address.qualified_target()))?;
         self.layout_runtime
-            .enable_main_pane_output_bridge(&workspace)?;
+            .disable_main_pane_output_bridge(&workspace)?;
         self.layout_runtime
             .sync_main_slot_bindings(&workspace, &current_workspace.workspace_dir)?;
         self.layout_runtime
@@ -422,7 +422,7 @@ impl MainSlotRuntime {
         self.set_workspace_main_pane(&workspace, &target_main_pane)?;
         self.set_active_target(&workspace, Some(&target.address.qualified_target()))?;
         self.layout_runtime
-            .enable_main_pane_output_bridge(&workspace)?;
+            .disable_main_pane_output_bridge(&workspace)?;
         self.layout_runtime
             .sync_main_slot_bindings(&workspace, &current_workspace.workspace_dir)?;
         self.layout_runtime
@@ -454,7 +454,7 @@ impl MainSlotRuntime {
                     Some(target.address.qualified_target().as_str()),
                 )?;
                 self.layout_runtime
-                    .enable_main_pane_output_bridge(workspace)?;
+                    .disable_main_pane_output_bridge(workspace)?;
             }
             None => {
                 self.backend
@@ -467,7 +467,7 @@ impl MainSlotRuntime {
                 self.set_workspace_main_pane(workspace, recovery_pane)?;
                 self.set_active_target(workspace, None)?;
                 self.layout_runtime
-                    .enable_main_pane_output_bridge(workspace)?;
+                    .disable_main_pane_output_bridge(workspace)?;
                 self.layout_runtime
                     .sync_main_slot_bindings(workspace, &current_workspace.workspace_dir)?;
                 self.layout_runtime
@@ -635,15 +635,12 @@ impl MainSlotRuntime {
     fn configure_main_pane_output_bridge_for_active_target(
         &self,
         workspace: &TmuxWorkspaceHandle,
-        target: Option<&str>,
+        _target: Option<&str>,
     ) -> Result<(), LifecycleError> {
-        if self.active_target_is_remote(workspace.socket_name.as_str(), target)? {
-            self.layout_runtime
-                .disable_main_pane_output_bridge(workspace)
-        } else {
-            self.layout_runtime
-                .enable_main_pane_output_bridge(workspace)
-        }
+        // PaneActivityWatcher handles refresh signaling now; the legacy
+        // per-output-line bridge is redundant and causes signal storms.
+        self.layout_runtime
+            .disable_main_pane_output_bridge(workspace)
     }
 
     fn infer_target_main_pane(&self, workspace: &TmuxWorkspaceHandle) -> Option<String> {
