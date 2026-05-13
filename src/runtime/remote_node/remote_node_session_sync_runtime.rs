@@ -151,6 +151,30 @@ impl RemoteNodeSessionSyncRuntime<SocketScopedLocalSessionCatalog<EmbeddedTmuxBa
         command: RemoteSessionSyncOwnerCommand,
         network: RemoteNetworkConfig,
     ) -> Result<(), LifecycleError> {
+        // Install a file-based panic hook so that panic messages are captured
+        // even when stderr goes to a deleted pts (the sidecar's original stderr
+        // fd may reference a dead pty). The hook chains to the original hook so
+        // stderr output is preserved when it is available.
+        let socket_name_for_hook = command.socket_name.clone();
+        let original_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let diag_path = std::env::temp_dir().join(format!(
+                "waitagent-sync-owner-panic-{}.log",
+                socket_name_for_hook
+                    .chars()
+                    .map(|ch| match ch {
+                        'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+                        _ => '_',
+                    })
+                    .collect::<String>()
+            ));
+            let _ = std::fs::write(
+                &diag_path,
+                format!("remote session sync owner panicked: {info}\n"),
+            );
+            original_hook(info);
+        }));
+
         let socket_path = remote_session_sync_owner_socket_path(&command.socket_name);
         if socket_path.exists() {
             let _ = fs::remove_file(&socket_path);
@@ -253,12 +277,14 @@ impl SessionSyncAuthorityManager {
     pub(super) fn shutdown(&mut self) {
         for (_, host) in self.running_hosts.drain() {
             host.running.store(false, Ordering::Relaxed);
-            if let Some(writer) = host
-                .writer
-                .lock()
-                .expect("authority writer mutex should not be poisoned")
-                .take()
-            {
+            let writer = match host.writer.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => {
+                    eprintln!("[session-sync] authority writer mutex poisoned, recovering");
+                    poisoned.into_inner().take()
+                }
+            };
+            if let Some(writer) = writer {
                 let _ = writer.shutdown(Shutdown::Both);
             }
         }

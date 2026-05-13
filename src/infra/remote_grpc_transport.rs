@@ -166,11 +166,12 @@ impl RemoteNodeTransport for GrpcRemoteNodeTransport {
         let endpoint = self.endpoint(&request.endpoint_uri)?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (started_tx, started_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let runtime = Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("grpc outbound node transport runtime should build");
+        let worker = thread::Builder::new()
+            .spawn(move || {
+                let runtime = Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("grpc outbound node transport runtime should build");
             runtime.block_on(async move {
                 let session_instance_id = format!("client-session-{}", now_millis());
                 let (outbound_tx, outbound_rx) = tokio_mpsc::unbounded_channel();
@@ -303,7 +304,9 @@ impl RemoteNodeTransport for GrpcRemoteNodeTransport {
                     node_id: request.node_id,
                 });
             });
-        });
+        }).map_err(|error| RemoteNodeTransportError::new(
+            format!("failed to spawn grpc outbound node-session thread: {error}")
+        ))?;
         match started_rx.recv() {
             Ok(Ok(())) => Ok(GrpcRemoteNodeTransportGuard {
                 shutdown_tx: Some(shutdown_tx),
@@ -339,45 +342,51 @@ impl RemoteNodeTransport for GrpcRemoteNodeTransport {
             .local_addr()
             .map_err(|error| RemoteNodeTransportError::new(error.to_string()))?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let worker = thread::spawn(move || {
-            let runtime = Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("grpc remote node transport runtime should build");
-            runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener)
-                    .expect("std listener should convert into tokio listener");
-                let incoming = TcpListenerStream::new(listener);
-                let failure_tx = event_tx.clone();
-                let session_shutdowns = Arc::new(Mutex::new(Vec::new()));
-                let shutdown_registry = session_shutdowns.clone();
-                let service = TransportNodeSessionService {
-                    event_tx,
-                    session_shutdowns,
-                };
-                let server = Server::builder()
-                    .tcp_nodelay(true)
-                    .tcp_keepalive(Some(TCP_KEEPALIVE_IDLE))
-                    .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
-                    .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
-                    .add_service(NodeSessionServiceServer::new(service))
-                    .serve_with_incoming_shutdown(incoming, async move {
-                        let _ = shutdown_rx.await;
-                        let mut guard = shutdown_registry.lock().expect(
+        let worker = thread::Builder::new()
+            .spawn(move || {
+                let runtime = Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("grpc remote node transport runtime should build");
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("std listener should convert into tokio listener");
+                    let incoming = TcpListenerStream::new(listener);
+                    let failure_tx = event_tx.clone();
+                    let session_shutdowns = Arc::new(Mutex::new(Vec::new()));
+                    let shutdown_registry = session_shutdowns.clone();
+                    let service = TransportNodeSessionService {
+                        event_tx,
+                        session_shutdowns,
+                    };
+                    let server = Server::builder()
+                        .tcp_nodelay(true)
+                        .tcp_keepalive(Some(TCP_KEEPALIVE_IDLE))
+                        .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
+                        .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+                        .add_service(NodeSessionServiceServer::new(service))
+                        .serve_with_incoming_shutdown(incoming, async move {
+                            let _ = shutdown_rx.await;
+                            let mut guard = shutdown_registry.lock().expect(
                             "grpc inbound session shutdown registry mutex should not be poisoned",
                         );
-                        for shutdown in guard.drain(..) {
-                            let _ = shutdown.send(());
-                        }
-                    });
-                if let Err(error) = server.await {
-                    let _ = failure_tx.send(RemoteNodeTransportEvent::TransportFailed {
-                        node_id: None,
-                        message: error.to_string(),
-                    });
-                }
-            });
-        });
+                            for shutdown in guard.drain(..) {
+                                let _ = shutdown.send(());
+                            }
+                        });
+                    if let Err(error) = server.await {
+                        let _ = failure_tx.send(RemoteNodeTransportEvent::TransportFailed {
+                            node_id: None,
+                            message: error.to_string(),
+                        });
+                    }
+                });
+            })
+            .map_err(|error| {
+                RemoteNodeTransportError::new(format!(
+                    "failed to spawn grpc listen_inbound thread: {error}"
+                ))
+            })?;
         Ok(GrpcRemoteNodeTransportGuard {
             shutdown_tx: Some(shutdown_tx),
             worker: Some(worker),

@@ -514,11 +514,16 @@ pub(super) fn spawn_in_process_authority_target_host(
     thread::spawn(move || {
         let _ = runtime.run_target_host(command);
         running.store(false, Ordering::Relaxed);
-        if let Some(writer) = writer
-            .lock()
-            .expect("authority writer mutex should not be poisoned")
-            .take()
-        {
+        let writer_val = match writer.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => {
+                eprintln!(
+                    "[session-sync] authority writer mutex poisoned during host cleanup, recovering"
+                );
+                poisoned.into_inner().take()
+            }
+        };
+        if let Some(writer) = writer_val {
             let _ = writer.shutdown(Shutdown::Both);
         }
         writer_ready.notify_all();
@@ -581,9 +586,13 @@ fn bridge_live_authority_stream(
         .map_err(remote_session_sync_error)?;
     let host_reader = host_stream.try_clone().map_err(remote_session_sync_error)?;
     {
-        let mut writer_guard = writer
-            .lock()
-            .expect("authority writer mutex should not be poisoned");
+        let mut writer_guard = match writer.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("[session-sync] authority writer mutex poisoned in bridge, recovering");
+                poisoned.into_inner()
+            }
+        };
         if let Some(previous) = writer_guard.take() {
             let _ = previous.shutdown(Shutdown::Both);
         }
@@ -592,10 +601,15 @@ fn bridge_live_authority_stream(
     writer_ready.notify_all();
     let result = forward_host_output_to_session(host_reader, session_handle, running.clone());
     let _ = host_stream.shutdown(Shutdown::Both);
-    let _ = writer
-        .lock()
-        .expect("authority writer mutex should not be poisoned")
-        .take();
+    let _ = match writer.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => {
+            eprintln!(
+                "[session-sync] authority writer mutex poisoned in bridge cleanup, recovering"
+            );
+            poisoned.into_inner().take()
+        }
+    };
     result
 }
 
@@ -624,19 +638,27 @@ pub(super) fn send_command_to_host(
     host: &SessionSyncAuthorityHost,
     command: RemoteAuthorityCommand,
 ) -> Result<(), LifecycleError> {
-    let mut guard = host
-        .writer
-        .lock()
-        .expect("authority writer mutex should not be poisoned");
+    let mut guard = match host.writer.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!("[session-sync] authority writer mutex poisoned, recovering");
+            poisoned.into_inner()
+        }
+    };
     while guard.is_none() {
         if !host.running.load(Ordering::Relaxed) {
             break;
         }
-        guard = host
+        guard = match host
             .writer_ready
             .wait_timeout(guard, Duration::from_secs(2))
-            .expect("authority writer condvar should not be poisoned")
-            .0;
+        {
+            Ok(result) => result.0,
+            Err(poisoned) => {
+                eprintln!("[session-sync] authority writer condvar poisoned, recovering");
+                poisoned.into_inner().0
+            }
+        };
     }
     if let Some(writer) = guard.as_mut() {
         write_control_plane_envelope(writer, &authority_command_envelope(command))
