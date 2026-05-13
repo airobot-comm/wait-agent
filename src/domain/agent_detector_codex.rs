@@ -16,10 +16,14 @@ impl AgentDetector for CodexDetector {
         if current_command == "codex" || current_command == "codex.js" {
             return Some("codex");
         }
-        // node wrapper
-        if current_command == "node" {
-            if let Some(argv) = argv {
-                let is_codex = argv.iter().skip(1).any(|arg| {
+        // check argv for any supported wrapper
+        if let Some(argv) = argv {
+            let is_codex = argv.first().and_then(|arg| {
+                std::path::Path::new(arg)
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+            }) == Some("codex")
+                || argv.iter().skip(1).any(|arg| {
                     std::path::Path::new(arg)
                         .file_name()
                         .and_then(std::ffi::OsStr::to_str)
@@ -29,9 +33,8 @@ impl AgentDetector for CodexDetector {
                             .and_then(std::ffi::OsStr::to_str)
                             == Some("codex.js")
                 });
-                if is_codex {
-                    return Some("codex");
-                }
+            if is_codex {
+                return Some("codex");
             }
         }
         None
@@ -86,6 +89,7 @@ impl AgentDetector for CodexDetector {
 
         // Input — structural prompt indicator or known patterns
         if last_line.starts_with('›')
+            || last_line.starts_with('❯')
             || last_line.starts_with("> ")
             || last_lowered.contains("type your message")
             || last_lowered.contains("send a message")

@@ -16,10 +16,14 @@ impl AgentDetector for ClaudeDetector {
         if current_command == "claude" || current_command == "claude.js" {
             return Some("claude");
         }
-        // node wrapper
-        if current_command == "node" {
-            if let Some(argv) = argv {
-                let is_claude = argv.iter().skip(1).any(|arg| {
+        // check argv for any supported wrapper
+        if let Some(argv) = argv {
+            let is_claude = argv.first().and_then(|arg| {
+                std::path::Path::new(arg)
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+            }) == Some("claude")
+                || argv.iter().skip(1).any(|arg| {
                     std::path::Path::new(arg)
                         .file_name()
                         .and_then(std::ffi::OsStr::to_str)
@@ -29,9 +33,8 @@ impl AgentDetector for ClaudeDetector {
                             .and_then(std::ffi::OsStr::to_str)
                             == Some("claude.js")
                 });
-                if is_claude {
-                    return Some("claude");
-                }
+            if is_claude {
+                return Some("claude");
             }
         }
         None
@@ -81,6 +84,7 @@ impl AgentDetector for ClaudeDetector {
 
         // Input — visible prompt or structural indicator
         if last_line.starts_with('›')
+            || last_line.starts_with('❯')
             || last_line.starts_with("> ")
             || lowered.contains("ready")
             || lowered.contains("type your message")
