@@ -111,7 +111,9 @@ pub(super) fn write_remote_raw_output_with_initial_clear(
     // Reset terminal state before each raw batch to prevent accumulated
     // escape sequences (scroll regions, wrapping, charsets) from
     // corrupting cursor placement and display during active interaction.
-    write_escape("\x1b[!p").map_err(remote_pane_error)?;
+    // DECSTR alone does NOT reliably reset G0/G1 character-set designations,
+    // so we explicitly reset them to US-ASCII after the soft reset.
+    write_escape("\x1b[!p\x1b(B\x1b)B").map_err(remote_pane_error)?;
     write_remote_raw_output(bytes)
 }
 
@@ -719,7 +721,7 @@ pub(super) fn draw_remote_snapshot(
     );
 
     let mut stdout = io::stdout().lock();
-    write!(stdout, "\x1b[!p\x1b[?25l\x1b[?7l").map_err(|error| {
+    write!(stdout, "\x1b[!p\x1b(B\x1b)B\x1b[?25l\x1b[?7l").map_err(|error| {
         LifecycleError::Io(
             "failed to hide remote main-slot cursor before redraw".to_string(),
             error,
