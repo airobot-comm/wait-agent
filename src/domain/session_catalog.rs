@@ -279,15 +279,23 @@ impl ManagedSessionRecord {
     }
 
     pub fn summary_line(&self) -> String {
+        let role_tag = if self.is_workspace_chrome() {
+            " [main]"
+        } else if self.is_target_host() {
+            " [target]"
+        } else {
+            ""
+        };
         format!(
-            "{}: {} windows ({})",
+            "{}: {} windows ({}){}",
             self.address.display_session_id(),
             self.window_count,
             if self.attached_clients > 0 {
                 "attached"
             } else {
                 "detached"
-            }
+            },
+            role_tag,
         )
     }
 
@@ -371,7 +379,7 @@ mod tests {
         };
 
         let line = record.summary_line();
-        assert_eq!(line, "1234: 3 windows (attached)");
+        assert_eq!(line, "1234: 3 windows (attached) [main]");
     }
 
     #[test]
