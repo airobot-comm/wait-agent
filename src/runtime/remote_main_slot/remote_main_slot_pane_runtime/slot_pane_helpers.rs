@@ -723,7 +723,13 @@ pub(super) fn draw_remote_snapshot(
     );
 
     let mut stdout = io::stdout().lock();
-    write!(stdout, "\x1b[!p\x1b(B\x1b)B\x1b[?25l\x1b[?7l").map_err(|error| {
+    // Reset G0/G1 charset designations and hide cursor before redraw.
+    // Avoid DECSTR (\x1b[!p) — it resets scroll regions, margins, and
+    // other terminal state that the raw output stream (Claude Code's
+    // cursor-positioning sequences, etc.) assumes to be in effect. The
+    // line-by-line redraw below restores visible content only; terminal
+    // state established by the original output is lost if we DECSTR.
+    write!(stdout, "\x1b(B\x1b)B\x1b[?25l\x1b[?7l").map_err(|error| {
         LifecycleError::Io(
             "failed to hide remote main-slot cursor before redraw".to_string(),
             error,
