@@ -126,7 +126,9 @@ pub(super) struct SessionSyncAuthorityManager {
 pub(super) struct SessionSyncAuthorityHost {
     pub(super) writer: Arc<Mutex<Option<UnixStream>>>,
     pub(super) running: Arc<AtomicBool>,
+    #[allow(dead_code)]
     pub(super) writer_ready: Arc<Condvar>,
+    pub(super) pending_commands: Arc<Mutex<Vec<RemoteAuthorityCommand>>>,
 }
 
 #[derive(Clone, Default)]
@@ -332,12 +334,15 @@ impl SessionSyncAuthorityManager {
         let running = Arc::new(AtomicBool::new(true));
         let writer = Arc::new(Mutex::new(None));
         let writer_ready = Arc::new(Condvar::new());
+        let pending_commands: Arc<Mutex<Vec<RemoteAuthorityCommand>>> =
+            Arc::new(Mutex::new(Vec::new()));
         spawn_live_authority_listener(
             authority_socket_path.clone(),
             session_handle.clone(),
             running.clone(),
             writer.clone(),
             writer_ready.clone(),
+            pending_commands.clone(),
         );
         spawn_in_process_authority_target_host(
             running.clone(),
@@ -362,6 +367,7 @@ impl SessionSyncAuthorityManager {
                 writer,
                 running,
                 writer_ready,
+                pending_commands,
             },
         );
         Ok(())
@@ -376,27 +382,19 @@ impl SessionSyncAuthorityManager {
         if !self.running_hosts.contains_key(&target_id) {
             self.ensure_authority_host(session_handle, &target_id)?;
         }
-        let host = self.running_hosts.get_mut(&target_id).ok_or_else(|| {
-            LifecycleError::Protocol("authority host cache lost entry".to_string())
-        })?;
-        // Retry a few times — the authority bridge may not have finished
-        // connecting yet (e.g. the live-authority listener accepted the
-        // connection but bridge_live_authority_stream hasn't signaled the
-        // writer condvar yet, or there was a brief transport glitch).
-        // Unlike the previous approach, we do NOT tear down and recreate
-        // the host on failure — that race with the old host's cleanup
-        // caused reconnection to silently fail.
-        let mut last_error = None;
-        for attempt in 0..3 {
-            match send_command_to_host(host, command.clone()) {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    last_error = Some(error);
-                    thread::sleep(Duration::from_millis(100 * (attempt + 1)));
-                }
-            }
+        let result = self
+            .running_hosts
+            .get(&target_id)
+            .map(|host| send_command_to_host(host, command.clone()))
+            .unwrap_or_else(|| {
+                Err(LifecycleError::Protocol(
+                    "authority host cache lost entry".to_string(),
+                ))
+            });
+        if result.is_err() {
+            self.running_hosts.remove(&target_id);
         }
-        Err(last_error.expect("retry loop should have produced an error"))
+        result
     }
 }
 
