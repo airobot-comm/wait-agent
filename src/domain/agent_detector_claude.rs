@@ -46,7 +46,17 @@ impl AgentDetector for ClaudeDetector {
         pane_text: &str,
     ) -> Option<&'static str> {
         let lowered = pane_text.to_ascii_lowercase();
-        if lowered.contains("claude") && lowered.contains("type your message") {
+        if !lowered.contains("claude") {
+            return None;
+        }
+        // "Type your message" is present in the initial welcome screen.
+        // After the first turn it scrolls away, so also accept the ❯/›
+        // prompt character which is present in every Claude TUI state
+        // (idle/input/confirm) but rare in non-Claude panes.
+        if lowered.contains("type your message")
+            || pane_text.contains('❯')
+            || pane_text.contains('›')
+        {
             return Some("claude");
         }
         None

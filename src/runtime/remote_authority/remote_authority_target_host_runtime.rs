@@ -16,7 +16,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -488,6 +488,7 @@ where
         let mut input_fifo = OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(&input_fifo_path)
             .map_err(remote_authority_error)?;
 
@@ -495,27 +496,29 @@ where
         let mut pending_input: Vec<u8> = Vec::new();
 
         let loop_result = loop {
-            // Drain any queued input bytes before processing the next event.
-            // When output congestion fills the PTY buffer, the FIFO becomes
-            // non-writable. The pending buffer prevents keystroke loss while
-            // the output pump drains.
+            // Drain queued input bytes without blocking the event loop.
+            // The FIFO is opened with O_NONBLOCK so `write()` returns a
+            // short count when the kernel buffer is congested, rather than
+            // blocking the entire event loop (which would freeze both input
+            // and output). Unwritten bytes remain in pending_input and are
+            // retried on the next iteration.
             if !pending_input.is_empty() {
-                let fd = input_fifo.as_raw_fd();
-                let mut pollfd = libc::pollfd {
-                    fd,
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut pollfd, 1, 0) } > 0
-                    && (pollfd.revents & libc::POLLOUT) != 0
-                {
-                    if let Err(error) = input_fifo
-                        .write_all(&pending_input)
-                        .and_then(|_| input_fifo.flush())
-                    {
+                match input_fifo.write(&pending_input) {
+                    Ok(n) if n > 0 => {
+                        pending_input.drain(..n);
+                        health.record_input(n as u64);
+                    }
+                    Ok(_) => {} // no progress, retry next iteration
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => {
                         break Err(remote_authority_error(error));
                     }
-                    pending_input.clear();
+                }
+                if !pending_input.is_empty() {
+                    // FIFO still congested — track for diagnostics.
+                    let stuck = pending_input.len() as u64;
+                    health.record_fifo_stall(stuck);
+                    health.maybe_log_stall(&command.transport_socket_path, &command.target_id);
                 }
             }
             let event = if pending_input.is_empty() {
@@ -626,39 +629,17 @@ where
                     payload,
                 )) => {
                     health.record_event();
-                    // Try a direct non-blocking write. If the FIFO is not
-                    // writable, queue the bytes to the pending buffer. The
-                    // drain step at the top of each event-loop iteration
-                    // retries until the FIFO drains.
-                    let fd = input_fifo.as_raw_fd();
-                    let mut pollfd = libc::pollfd {
-                        fd,
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    };
-                    let writable = unsafe { libc::poll(&mut pollfd, 1, 0) } > 0
-                        && (pollfd.revents & libc::POLLOUT) != 0;
-                    if writable {
-                        if let Err(error) = input_fifo
-                            .write_all(&payload.input_bytes)
-                            .and_then(|_| input_fifo.flush())
-                        {
-                            break Err(remote_authority_error(error));
-                        }
-                        health.record_input(payload.input_bytes.len() as u64);
-                    } else {
-                        // Queue to pending buffer. Cap at 64 KB to prevent
-                        // unbounded growth under sustained congestion.
-                        const PENDING_INPUT_MAX: usize = 64 * 1024;
-                        let input = &payload.input_bytes;
-                        if pending_input.len() + input.len() > PENDING_INPUT_MAX {
-                            let excess = pending_input.len() + input.len() - PENDING_INPUT_MAX;
-                            pending_input.drain(..excess.min(pending_input.len()));
-                        }
-                        pending_input.extend_from_slice(input);
-                        health.record_fifo_stall(input.len() as u64);
-                        health.maybe_log_stall(&command.transport_socket_path, &command.target_id);
+                    // Always queue to pending_input. The drain at the top
+                    // of each loop iteration flushes as much as the FIFO
+                    // accepts without blocking. With O_NONBLOCK, a
+                    // congested FIFO never stalls the event loop.
+                    const PENDING_INPUT_MAX: usize = 64 * 1024;
+                    let input = &payload.input_bytes;
+                    if pending_input.len() + input.len() > PENDING_INPUT_MAX {
+                        let excess = pending_input.len() + input.len() - PENDING_INPUT_MAX;
+                        pending_input.drain(..excess.min(pending_input.len()));
                     }
+                    pending_input.extend_from_slice(input);
                 }
                 AuthorityHostEvent::TransportCommand(RemoteAuthorityCommand::ApplyResize(
                     payload,
