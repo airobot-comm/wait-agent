@@ -715,13 +715,16 @@ pub(super) fn draw_remote_snapshot(
     );
 
     let mut stdout = io::stdout().lock();
-    // Reset G0/G1 charset designations and hide cursor before redraw.
+    // Hide cursor and disable line wrapping before redraw.
     // Avoid DECSTR (\x1b[!p) — it resets scroll regions, margins, and
     // other terminal state that the raw output stream (Claude Code's
     // cursor-positioning sequences, etc.) assumes to be in effect. The
     // line-by-line redraw below restores visible content only; terminal
     // state established by the original output is lost if we DECSTR.
-    write!(stdout, "\x1b(B\x1b)B\x1b[?25l\x1b[?7l").map_err(|error| {
+    // Also avoid charset resets (\x1b(B) — tmux honors them internally
+    // but has no mechanism to restore UTF-8, causing non-ASCII characters
+    // (⏵, ⎿, etc.) to render as blocks.
+    write!(stdout, "\x1b[?25l\x1b[?7l").map_err(|error| {
         LifecycleError::Io(
             "failed to hide remote main-slot cursor before redraw".to_string(),
             error,

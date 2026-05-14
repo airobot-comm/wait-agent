@@ -53,115 +53,6 @@ fn strip_ansi(text: &str) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
-/// Parse SGR parameters to track the background color state.
-/// Handles `0` (reset), `49` (default bg), `48;5;N` (256-color), `48;2;R;G;B` (truecolor).
-fn parse_sgr_bg(params: &str, bg: &mut Option<u32>) {
-    let mut iter = params.split(';');
-    while let Some(param) = iter.next() {
-        match param {
-            "0" => *bg = None,
-            "49" => *bg = None,
-            "48" => {
-                if let Some(mode) = iter.next() {
-                    match mode {
-                        "5" => {
-                            if let Some(n) = iter.next() {
-                                *bg = n.parse::<u32>().ok();
-                            }
-                        }
-                        "2" => {
-                            let r = iter.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                            let g = iter.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                            let b = iter.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                            *bg = Some((r << 16) | (g << 8) | b);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Extract the background color set at the beginning of an ANSI-encoded line.
-/// Returns `None` if no explicit background color was set before visible content.
-fn leading_bg_color(line: &str) -> Option<u32> {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut current_bg: Option<u32> = None;
-
-    while i < bytes.len() {
-        if bytes[i] != 0x1b {
-            break;
-        }
-        if i + 1 >= bytes.len() {
-            break;
-        }
-
-        if bytes[i + 1] == b'[' {
-            i += 2;
-            let start = i;
-            while i < bytes.len() && !bytes[i].is_ascii_alphabetic() && bytes[i] != b'~' {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b'm' {
-                let params = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
-                parse_sgr_bg(params, &mut current_bg);
-            }
-            if i < bytes.len() {
-                i += 1;
-            }
-        } else {
-            i += 1;
-            while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] <= 0x2F {
-                i += 1;
-            }
-            if i < bytes.len() {
-                i += 1;
-            }
-        }
-    }
-
-    current_bg
-}
-
-/// Find the line index where the content/input boundary is, using ANSI
-/// background color changes. Returns the first "input area" line — everything
-/// below this index has a different background color from the content area.
-///
-/// In a ratatui TUI like Codex, the content area and input area use different
-/// background colors. This function finds where that transition happens.
-fn ansi_find_bg_boundary(ansi_text: &str) -> Option<usize> {
-    let lines: Vec<&str> = ansi_text.lines().collect();
-    if lines.len() < 3 {
-        return None;
-    }
-
-    let last_bg = leading_bg_color(lines[lines.len() - 1])?;
-
-    // Find the bottom-most contiguous block with the same background
-    let mut block_start = lines.len() - 1;
-    while block_start > 0 {
-        let prev = leading_bg_color(lines[block_start - 1]);
-        if prev != Some(last_bg) {
-            break;
-        }
-        block_start -= 1;
-    }
-
-    if block_start == 0 {
-        return None;
-    }
-
-    let above_bg = leading_bg_color(lines[block_start - 1]);
-    if above_bg != Some(last_bg) {
-        Some(block_start)
-    } else {
-        None
-    }
-}
-
 /// Like `pane_content_signature_with_boundary` using the default heuristic
 /// boundary (separator or prompt character). Kept for backward-compatible
 /// test use.
@@ -193,12 +84,23 @@ fn pane_content_signature_with_boundary(pane_text: &str, content_end: usize) -> 
     hasher.finish()
 }
 
-/// Determine the content/input boundary in the pane text.
-/// 1. Look for a separator line (`─`/`━` characters, at least 3 wide)
-/// 2. Fall back to the last `›` or `❯` prompt character
-/// Returns the line index — everything at or above this index is "content".
+/// Find the line index where the content/input boundary is, using the last
+/// prompt character (`›` or `❯`) as the primary boundary. Falls back to a
+/// separator line.
+///
+/// Everything at or above the boundary index is "content" — typing at the
+/// prompt is excluded, so the content signature stays stable during input.
 fn pane_content_boundary(lines: &[&str]) -> usize {
-    // Try separator line first
+    // Use the last prompt character as the preferred boundary, so typing
+    // at the prompt never changes the content signature.
+    if let Some(pos) = lines.iter().rposition(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with('›') || trimmed.starts_with('❯')
+    }) {
+        return pos;
+    }
+
+    // Fall back to separator line
     if let Some(pos) = lines.iter().position(|line| {
         let trimmed = line.trim();
         !trimmed.is_empty()
@@ -208,14 +110,7 @@ fn pane_content_boundary(lines: &[&str]) -> usize {
         return pos;
     }
 
-    // Fall back to prompt character
-    lines
-        .iter()
-        .rposition(|line| {
-            let trimmed = line.trim();
-            trimmed.starts_with('›') || trimmed.starts_with('❯')
-        })
-        .unwrap_or(0)
+    0
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -263,8 +158,7 @@ impl EmbeddedTmuxBackend {
             if state == ManagedSessionTaskState::Input {
                 let session_key = format!("{}:{}", socket_name.as_str(), session_name);
                 let plain_lines: Vec<&str> = pane_text.lines().map(|l| l.trim_end()).collect();
-                let content_end = ansi_find_bg_boundary(&pane_ansi)
-                    .unwrap_or_else(|| pane_content_boundary(&plain_lines));
+                let content_end = pane_content_boundary(&plain_lines);
                 let current_sig = pane_content_signature_with_boundary(&pane_text, content_end);
 
                 PREVIOUS_PANE_SIGNATURE.with(|cache| {
@@ -490,69 +384,6 @@ mod tests {
         let input = "\x1b(BHello\x1b(BWorld";
         let result = strip_ansi(input);
         assert_eq!(result, "HelloWorld");
-    }
-
-    #[test]
-    fn leading_bg_color_parses_256_color() {
-        let line = "\x1b[48;5;235mContent line";
-        assert_eq!(leading_bg_color(line), Some(235));
-    }
-
-    #[test]
-    fn leading_bg_color_parses_truecolor() {
-        let line = "\x1b[48;2;100;200;50mColored text";
-        assert_eq!(leading_bg_color(line), Some((100 << 16) | (200 << 8) | 50));
-    }
-
-    #[test]
-    fn leading_bg_color_returns_none_when_no_bg_set() {
-        let line = "No escape sequences here";
-        assert_eq!(leading_bg_color(line), None);
-    }
-
-    #[test]
-    fn leading_bg_color_reset_clears_bg() {
-        // \x1b[0m resets, then \x1b[48;5;236m sets new bg
-        let line = "\x1b[0m\x1b[48;5;236mStyled content";
-        assert_eq!(leading_bg_color(line), Some(236));
-    }
-
-    #[test]
-    fn leading_bg_color_reset_only_returns_none() {
-        let line = "\x1b[0mContent after reset";
-        assert_eq!(leading_bg_color(line), None);
-    }
-
-    #[test]
-    fn ansi_find_bg_boundary_detects_input_area_with_different_bg() {
-        // Content area uses bg=235, input area uses bg=236
-        let ansi = "\x1b[48;5;235moutput line 1\n\
-                    \x1b[48;5;235moutput line 2\n\
-                    \x1b[48;5;236m› \n\
-                    \x1b[48;5;236mtip: enter";
-        assert_eq!(ansi_find_bg_boundary(ansi), Some(2));
-    }
-
-    #[test]
-    fn ansi_find_bg_boundary_returns_none_when_all_same_bg() {
-        let ansi = "\x1b[48;5;235mline 1\n\x1b[48;5;235mline 2\n\x1b[48;5;235mline 3";
-        assert_eq!(ansi_find_bg_boundary(ansi), None);
-    }
-
-    #[test]
-    fn ansi_find_bg_boundary_returns_none_for_short_panes() {
-        assert_eq!(ansi_find_bg_boundary("line 1\nline 2"), None);
-        assert_eq!(ansi_find_bg_boundary("single"), None);
-    }
-
-    #[test]
-    fn ansi_find_bg_boundary_detects_multi_line_input_area() {
-        // Input area is 2 lines with bg=236, content is 2 lines with bg=235
-        let ansi = "\x1b[48;5;235mcontent line\n\
-                    \x1b[48;5;235mmore content\n\
-                    \x1b[48;5;236m› \n\
-                    \x1b[48;5;236mpress enter";
-        assert_eq!(ansi_find_bg_boundary(ansi), Some(2));
     }
 
     #[test]
