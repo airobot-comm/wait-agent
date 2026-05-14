@@ -106,12 +106,25 @@ impl AgentDetector for CodexDetector {
             }
         }
 
-        // Input — scan ALL non-empty lines for the TUI prompt character (›).
-        // Codex places › on a menu/prompt line above the last instruction line,
-        // so checking only the last line would miss it.
-        for line in &normalized_lines {
-            if line.starts_with('›') {
-                return Some(ManagedSessionTaskState::Input);
+        // Input — find › in the LAST 5 non-empty lines. The actual prompt › is
+        // always near the bottom of the pane. Conversation › lines (user's
+        // echoed input) scroll up during execution and won't be in the last 5
+        // lines after the agent has started producing output.
+        //
+        // Only count a › line as Input if:
+        //   - The line contains ONLY "›" (empty prompt, no user text)
+        //   - OR the › is in the last 3 lines and the next line is not a
+        //     numbered option (numbered menus are caught by Confirm above)
+        for (i, line) in normalized_lines.iter().enumerate() {
+            if line.starts_with('›') && i >= normalized_lines.len().saturating_sub(5) {
+                // Empty prompt (just "›") — definitely Input
+                if line.trim_start_matches('›').trim().is_empty() {
+                    return Some(ManagedSessionTaskState::Input);
+                }
+                // User has typed text at the prompt — must be in last 3 lines
+                if i >= normalized_lines.len().saturating_sub(3) {
+                    return Some(ManagedSessionTaskState::Input);
+                }
             }
         }
         // Also check for ❯ prompt (shared TUI pattern) and keyword indicators.

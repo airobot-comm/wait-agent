@@ -103,22 +103,35 @@ impl AgentDetector for ClaudeDetector {
             }
         }
 
-        // Input — scan ALL non-empty lines for the TUI prompt character (❯).
-        // Claude Code's full-screen TUI places the prompt (❯) above a footer/status
-        // line, so checking only the last line would miss it.
-        // Keep `›` and keyword checks on the last line for non-TUI/legacy modes.
-        for line in &normalized_lines {
-            if line.starts_with('❯') {
+        // During active execution, claude shows "esc to interrupt" in the status
+        // line. The ❯ prompt is still visible but NOT actionable, so skip Input
+        // detection.
+        let is_executing = lowered.contains("interrupt") || lowered.starts_with("esc");
+
+        if !is_executing {
+            // Input — find ❯ in the input area (followed by a separator line of
+            // ─ characters). Claude Code's full-screen TUI places the prompt (❯)
+            // between two separators, above a footer/status line. Conversation
+            // ❯ lines (user's echoed input) are NOT followed by separators.
+            for (i, line) in normalized_lines.iter().enumerate() {
+                if line.starts_with('❯') {
+                    if let Some(next) = normalized_lines.get(i + 1) {
+                        if next.chars().all(|c| c == '─') {
+                            return Some(ManagedSessionTaskState::Input);
+                        }
+                    }
+                }
+            }
+            // Also check `›` and keyword patterns on the last line for
+            // non-TUI/legacy modes.
+            if last_line.starts_with('›')
+                || last_line.starts_with("> ")
+                || lowered.contains("ready")
+                || lowered.contains("type your message")
+                || lowered.contains("send a message")
+            {
                 return Some(ManagedSessionTaskState::Input);
             }
-        }
-        if last_line.starts_with('›')
-            || last_line.starts_with("> ")
-            || lowered.contains("ready")
-            || lowered.contains("type your message")
-            || lowered.contains("send a message")
-        {
-            return Some(ManagedSessionTaskState::Input);
         }
 
         Some(ManagedSessionTaskState::Running)

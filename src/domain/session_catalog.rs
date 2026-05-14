@@ -660,4 +660,37 @@ mod tests {
         );
         assert_eq!(state, ManagedSessionTaskState::Running);
     }
+
+    #[test]
+    fn task_state_remains_running_when_claude_executing_with_visible_prompt() {
+        // Claude's TUI shows the ❯ prompt area even during execution, but the
+        // status line says "esc to interrupt" — must be Running, not Input.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("claude"),
+            "❯ run echo hello\n\
+             ● Bash(echo hello)\n\
+             \n\
+             ─────────────────────\n\
+             ❯ \n\
+             ─────────────────────\n\
+             esc to interrupt    ● high · /effort",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Running);
+    }
+
+    #[test]
+    fn task_state_infers_input_when_claude_prompt_with_normal_status() {
+        // After execution completes, status returns to "? for shortcuts" → Input.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("claude"),
+            "❯ run echo hello\n\
+             ● Done.\n\
+             \n\
+             ─────────────────────\n\
+             ❯ \n\
+             ─────────────────────\n\
+             ? for shortcuts    ● high · /effort",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Input);
+    }
 }
