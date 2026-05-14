@@ -42,12 +42,9 @@ impl AgentDetector for CodexDetector {
 
     fn detect_from_pane_text(
         &self,
-        current_command: &str,
+        _current_command: &str,
         pane_text: &str,
     ) -> Option<&'static str> {
-        if !crate::domain::agent_detector::SHELL_NAMES.contains(&current_command) {
-            return None;
-        }
         let lowered = pane_text.to_ascii_lowercase();
         if lowered.contains("skip") && lowered.contains("codex") {
             return Some("codex");
@@ -78,18 +75,47 @@ impl AgentDetector for CodexDetector {
         let last_line = normalized_lines.last().copied().unwrap_or_default();
         let last_lowered = last_line.to_ascii_lowercase();
 
-        // Confirm — Codex-specific confirmation prompts
-        if last_lowered.contains("run this command")
-            || last_lowered.contains("allow this")
-            || last_lowered.ends_with("[y/n]")
-            || last_lowered.ends_with("(y/n)")
-        {
-            return Some(ManagedSessionTaskState::Confirm);
+        // Confirm — scan ALL non-empty lines for confirmation indicators.
+        //
+        // Codex's TUI uses a numbered menu for trust/confirm prompts:
+        //   Do you trust the contents of this directory?
+        //   › 1. Yes, continue
+        //     2. No, quit
+        //
+        //   Press enter to continue
+        // The › line contains "1." and is followed by "2." on the next line.
+        //
+        // Also check keywords across all lines since the prompt may appear
+        // above an instruction or footer line.
+        for (i, line) in normalized_lines.iter().enumerate() {
+            let lc = line.to_ascii_lowercase();
+            if lc.contains("run this command")
+                || lc.contains("allow this")
+                || lc.ends_with("[y/n]")
+                || lc.ends_with("(y/n)")
+            {
+                return Some(ManagedSessionTaskState::Confirm);
+            }
+            // TUI numbered menu: › 1. ..., next non-empty line starts with "2."
+            if line.starts_with('›') && line.contains(" 1.") {
+                if let Some(next) = normalized_lines.get(i + 1) {
+                    if next.starts_with("2.") || next.starts_with("2 ") {
+                        return Some(ManagedSessionTaskState::Confirm);
+                    }
+                }
+            }
         }
 
-        // Input — structural prompt indicator or known patterns
-        if last_line.starts_with('›')
-            || last_line.starts_with('❯')
+        // Input — scan ALL non-empty lines for the TUI prompt character (›).
+        // Codex places › on a menu/prompt line above the last instruction line,
+        // so checking only the last line would miss it.
+        for line in &normalized_lines {
+            if line.starts_with('›') {
+                return Some(ManagedSessionTaskState::Input);
+            }
+        }
+        // Also check for ❯ prompt (shared TUI pattern) and keyword indicators.
+        if last_line.starts_with('❯')
             || last_line.starts_with("> ")
             || last_lowered.contains("type your message")
             || last_lowered.contains("send a message")

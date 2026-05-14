@@ -553,4 +553,111 @@ mod tests {
 
         assert_eq!(state, ManagedSessionTaskState::Input);
     }
+
+    #[test]
+    fn task_state_infers_input_from_claude_tui_prompt_with_footer() {
+        // Claude Code's TUI places the ❯ prompt line above a footer/status line.
+        // The last non-empty line is NOT the prompt — this tests that the detector
+        // scans ALL lines for the ❯ prompt character.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("claude"),
+            "▐▛███▜▌   Claude Code v2.1.128\n\
+             ─────────────────────────────────────\n\
+             ❯ \n\
+             ─────────────────────────────────────\n\
+               ? for shortcuts    ● high · /effort",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn task_state_infers_input_from_codex_tui_prompt_with_trailing_instruction() {
+        // Codex's input prompt (non-menu) should be Input, not Confirm.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "Chat with Codex CLI\n\
+             ──────────────────\n\
+             › \n\
+             Press enter or type your message",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn task_state_infers_confirm_from_codex_trust_prompt() {
+        // Codex's trust prompt uses a numbered menu (› 1. / 2.) —
+        // this must be Confirm, not Input.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "You are in /opt/data/workspace\n\
+             › 1. Yes, continue\n\
+             2. No, quit\n\
+             Press enter to continue",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Confirm);
+    }
+
+    #[test]
+    fn task_state_infers_confirm_from_claude_tui_numbered_menu() {
+        // Claude Code's TUI confirmation uses a numbered menu with ❯ for selection.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("claude"),
+            "Do you want to create claude_test_file.txt?\n\
+             ❯ 1. Yes\n\
+             2. No\n\
+             Esc to cancel · Tab to amend",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Confirm);
+    }
+
+    #[test]
+    fn task_state_input_not_confirm_when_arrow_has_no_menu() {
+        // Plain ❯ on its own (no "1." / "2." menu) must still be Input.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("claude"),
+            "Some output\n\
+             ─────────────────────\n\
+             ❯ \n\
+             ─────────────────────\n\
+             status line",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn task_state_input_when_claude_has_partial_typed_text() {
+        // User typing at the prompt: ❯ followed by text, no numbered menu.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("claude"),
+            "❯ create a file named hello.txt\n\
+             ──────────────────────────────\n\
+             status line",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn task_state_remains_running_during_claude_tool_execution() {
+        // When claude is actively executing tools, ❯ should NOT appear in the pane.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("claude"),
+            "I'll help you with that!\n\
+             Creating files:\n\
+               - src/main.rs\n\
+             Running tool call xyz",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Running);
+    }
+
+    #[test]
+    fn task_state_remains_running_during_codex_tool_execution() {
+        // During codex execution, › prompt should not appear.
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "Searching files...\n\
+             Running analysis\n\
+             Done.",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Running);
+    }
 }

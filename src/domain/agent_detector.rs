@@ -109,11 +109,12 @@ impl DetectorRegistry {
         if let Some(name) = self.detect_from_process(current_command, argv) {
             return name.to_string();
         }
-        // 2. Pane-text detection (only when running under a shell)
-        if SHELL_NAMES.contains(&current_command) {
-            if let Some(name) = self.detect_from_pane_text(current_command, pane_text) {
-                return name.to_string();
-            }
+        // 2. Pane-text detection — try for all commands, not just shells.
+        //    This handles cases where an agent (codex, claude) runs under a
+        //    non-shell process like "node" and argv-based detection failed
+        //    (e.g. /proc raced), so we fall back to reading the pane text.
+        if let Some(name) = self.detect_from_pane_text(current_command, pane_text) {
+            return name.to_string();
         }
         // 3. Fall back to the original command name
         current_command.to_string()
