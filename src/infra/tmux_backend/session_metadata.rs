@@ -172,6 +172,20 @@ impl EmbeddedTmuxBackend {
                 });
             }
 
+            if state == ManagedSessionTaskState::Running {
+                let preview: String = pane_text
+                    .lines()
+                    .last()
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect();
+                eprintln!(
+                    "[WAITAGENT-DIAG] session={session_name} cmd=`{current_command}` name=`{command_name}` pane_in_mode={} last_line=`{preview}`",
+                    main_pane.in_mode,
+                );
+            }
+
             state
         };
         Ok(TmuxSessionRuntimeMetadata {
