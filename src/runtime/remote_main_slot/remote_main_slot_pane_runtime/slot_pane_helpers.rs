@@ -108,14 +108,6 @@ pub(super) fn write_remote_raw_output_with_initial_clear(
         write_escape(CLEAR_SCREEN_HOME_ESCAPE).map_err(remote_pane_error)?;
         *screen_initialized = true;
     }
-    // Reset G0/G1 character-set designations to US-ASCII before each raw
-    // batch to prevent block-character corruption. We intentionally avoid
-    // DECSTR (\x1b[!p) here — it resets scroll regions, cursor position,
-    // SGR, margins, and wrapping, which corrupts mid-frame cursor placement
-    // for full-screen TUIs receiving small chunks via raw PTY passthrough.
-    // DECSTR is only safe in draw_remote_snapshot() where a full synthetic
-    // redraw follows immediately.
-    write_escape("\x1b(B\x1b)B").map_err(remote_pane_error)?;
     write_remote_raw_output(bytes)
 }
 
