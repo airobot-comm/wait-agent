@@ -46,6 +46,10 @@ impl MirrorRouteState {
     fn should_send_mirror_request(&self) -> bool {
         matches!(self, Self::None)
     }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -731,6 +735,25 @@ impl RemoteControlPlaneService {
                         ),
                     },
                 ])
+            }
+        }
+    }
+
+    /// Returns true if the session has a pending mirror request
+    /// (OpenMirrorRequest was sent but not yet accepted/rejected).
+    pub fn is_mirror_pending(&self, session_id: &str) -> bool {
+        self.session_states
+            .get(session_id)
+            .map(|s| s.mirror_route.is_pending())
+            .unwrap_or(false)
+    }
+
+    /// Resets mirror_route from Pending back to None so the next
+    /// activation will retry OpenMirrorRequest.
+    pub fn clear_mirror_pending(&mut self, session_id: &str) {
+        if let Some(state) = self.session_states.get_mut(session_id) {
+            if state.mirror_route.is_pending() {
+                state.mirror_route = MirrorRouteState::None;
             }
         }
     }

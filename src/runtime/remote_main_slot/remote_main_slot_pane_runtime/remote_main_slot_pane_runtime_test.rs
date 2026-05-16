@@ -636,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn activate_surface_target_requires_registered_authority_connection() {
+    fn activate_surface_target_succeeds_without_authority_connection() {
         let runtime = RemoteMainSlotRuntime::with_registry(RemoteConnectionRegistry::new());
         let mailbox = runtime
             .ensure_local_observer_connection("observer-a")
@@ -652,7 +652,10 @@ mod tests {
             console_location: ConsoleLocation::LocalWorkspace,
         };
 
-        let error = activate_surface_target(
+        // Activation should succeed even without registered authority
+        // connection — output_log replay goes through the local
+        // observer mailbox.
+        activate_surface_target(
             &runtime,
             &target,
             &spec,
@@ -664,11 +667,7 @@ mod tests {
             },
             &mut observer,
         )
-        .expect_err("activation should fail before authority connection exists");
-
-        assert!(error
-            .to_string()
-            .contains("remote control-plane connection for node `peer-a` is not registered"));
+        .expect("activation should succeed via local replay even without authority connection");
     }
 
     #[test]

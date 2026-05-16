@@ -258,25 +258,21 @@ impl RemoteMainSlotPaneRuntime {
         let mut binding = None;
         let mut direct_raw_output_last_seq = None;
         let mut raw_screen_initialized = false;
-        let mut authority_status = if remote_runtime.has_connection(target.address.authority_id()) {
-            AuthorityTransportStatus::Connected
-        } else {
-            waiting_authority_status.clone()
-        };
-        if matches!(authority_status, AuthorityTransportStatus::Connected) {
-            let activated = activate_surface_target_with_mode(
-                &remote_runtime,
-                &target,
-                &spec,
-                &initial_size,
-                &mut observer,
-            )
-            .map(Some)?;
-            if let Some((activated_binding, raw)) = activated {
-                raw_input_route.activate(&target, &activated_binding, &spec.console_host_id);
-                write_remote_raw_output_with_initial_clear(&raw, &mut raw_screen_initialized)?;
-                binding = Some(activated_binding);
-            }
+        let mut authority_status = waiting_authority_status.clone();
+        // Always attempt activation — output_log replay comes from the
+        // local mailbox; no need to wait for authority transport.
+        let activated = activate_surface_target_with_mode(
+            &remote_runtime,
+            &target,
+            &spec,
+            &initial_size,
+            &mut observer,
+        )
+        .map(Some)?;
+        if let Some((activated_binding, raw)) = activated {
+            raw_input_route.activate(&target, &activated_binding, &spec.console_host_id);
+            write_remote_raw_output_with_initial_clear(&raw, &mut raw_screen_initialized)?;
+            binding = Some(activated_binding);
         }
         let run_result = (|| -> Result<(), LifecycleError> {
             if should_draw_remote_snapshot(binding.as_ref()) {
@@ -331,7 +327,9 @@ impl RemoteMainSlotPaneRuntime {
                             } else {
                                 AuthorityTransportStatus::Disconnected
                             };
-                            if binding.is_none()
+                            let needs_activation =
+                                binding.is_none() || remote_runtime.is_mirror_pending(&target);
+                            if needs_activation
                                 && matches!(authority_status, AuthorityTransportStatus::Connected)
                             {
                                 match activate_surface_target_with_mode(

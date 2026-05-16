@@ -1,8 +1,8 @@
 use crate::application::remote_control_plane_service::RemoteControlPlaneService;
 use crate::domain::session_catalog::ManagedSessionRecord;
 use crate::infra::remote_protocol::{
-    ControlPlanePayload, NodeBoundControlPlaneMessage, RemoteConsoleDescriptor,
-    RoutedControlPlaneMessage,
+    ControlPlaneDestination, ControlPlanePayload, NodeBoundControlPlaneMessage,
+    RemoteConsoleDescriptor, RoutedControlPlaneMessage,
 };
 use crate::lifecycle::LifecycleError;
 use crate::runtime::remote_transport_runtime::{
@@ -159,8 +159,59 @@ impl RemoteMainSlotRuntime {
                 "remote open_target did not yield an open_target_ok attachment".to_string(),
             )
         })?;
-        self.send_messages(&messages)?;
+
+        // Split messages: observer-bound (must succeed, local mailbox) vs
+        // authority-bound (may fail if sidecar hasn't connected yet).
+        let session_id = target.address.session_id().to_string();
+        let (observer_msgs, authority_msgs): (Vec<_>, Vec<_>) =
+            messages.into_iter().partition(|msg| {
+                !matches!(&msg.destination, ControlPlaneDestination::AuthorityNode(_))
+            });
+
+        // Observer messages go through local LoopbackConnection — must succeed.
+        {
+            let deliveries = self
+                .control_plane
+                .borrow()
+                .resolve_node_deliveries(&observer_msgs)
+                .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+            self.sink
+                .send(&deliveries)
+                .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+        }
+
+        // Authority messages may fail if the sidecar authority transport
+        // isn't connected yet.  That's fine — replay content is already
+        // en route to the observer, and mirror_pending will be retried
+        // when the authority transport connects.
+        if !authority_msgs.is_empty() {
+            if let Err(error) = (|| -> Result<(), RemoteControlPlaneTransportError> {
+                let deliveries = self
+                    .control_plane
+                    .borrow()
+                    .resolve_node_deliveries(&authority_msgs)
+                    .map_err(|e| RemoteControlPlaneTransportError::new(e.to_string()))?;
+                self.sink.send(&deliveries)?;
+                Ok(())
+            })() {
+                let _ = self
+                    .control_plane
+                    .borrow_mut()
+                    .clear_mirror_pending(&session_id);
+                log_diagnostic(format_args!(
+                    "authority not ready, deferred (will retry on connect): {error}"
+                ));
+            }
+        }
+
         Ok(binding)
+    }
+
+    /// Used by the authority connect handler to check whether a mirror
+    /// request needs to be (re-)sent.
+    pub fn is_mirror_pending(&self, target: &ManagedSessionRecord) -> bool {
+        let session_id = target.address.session_id().to_string();
+        self.control_plane.borrow().is_mirror_pending(&session_id)
     }
 
     pub fn send_raw_pty_input(
@@ -303,6 +354,39 @@ fn extract_open_binding(messages: &[RoutedControlPlaneMessage]) -> Option<Remote
         })
 }
 
+/// Buffered diagnostic logger for the main-slot process.
+/// Writes timestamped lines to a unique file in the temp directory so that
+/// diagnostic messages don't pollute the terminal display.
+pub(super) fn log_diagnostic(msg: impl fmt::Display) {
+    use std::fs::OpenOptions;
+    use std::io::{BufWriter, Write};
+    use std::sync::{Mutex, OnceLock};
+
+    static LOG: OnceLock<Mutex<BufWriter<std::fs::File>>> = OnceLock::new();
+    let writer = LOG.get_or_init(|| {
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("waitagent-diag-main-slot-{pid}.log"));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("failed to open main-slot diagnostic log file");
+        Mutex::new(BufWriter::with_capacity(4096, file))
+    });
+
+    fn now_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    let mut guard = writer.lock().unwrap();
+    let _ = writeln!(guard, "[{}] {}", now_millis(), msg);
+    // Flush on every write so logs survive a crash.
+    let _ = guard.flush();
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -347,11 +431,13 @@ mod tests {
         );
 
         let sent_messages = sent_messages.borrow();
-        assert_eq!(sent_messages.len(), 1);
-        assert_eq!(sent_messages[0].len(), 3);
+        // Messages are now split: observer batch first, authority batch second.
+        assert_eq!(sent_messages.len(), 2);
+        // Observer batch: OpenTargetOk + ResizeAuthorityChanged → 2 deliveries
+        assert_eq!(sent_messages[0].len(), 2);
         assert_eq!(sent_messages[0][0].node_id, "observer-a");
         assert_eq!(sent_messages[0][1].node_id, "observer-a");
-        assert_eq!(sent_messages[0][2].node_id, "peer-a");
+        assert_eq!(sent_messages[0][0].envelope.message_type, "open_target_ok");
         match &sent_messages[0][1].envelope.payload {
             ControlPlanePayload::ResizeAuthorityChanged(payload) => {
                 assert_eq!(payload.cols, None);
@@ -359,8 +445,11 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+        // Authority batch: OpenMirrorRequest → 1 delivery
+        assert_eq!(sent_messages[1].len(), 1);
+        assert_eq!(sent_messages[1][0].node_id, "peer-a");
         assert_eq!(
-            sent_messages[0][2].envelope.message_type,
+            sent_messages[1][0].envelope.message_type,
             "open_mirror_request"
         );
     }
