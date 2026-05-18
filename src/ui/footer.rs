@@ -134,7 +134,7 @@ fn left_status_text(
     connect_endpoint: Option<&str>,
 ) -> String {
     let base = match projection {
-        FooterProjection::Pane => "keys: ^N new  ^O fullscreen  C-b s menu".to_string(),
+        FooterProjection::Pane => "keys: ^N new  ^O fullscreen  ^E log  C-b s menu".to_string(),
         FooterProjection::FullscreenStatus => {
             "keys: [Ctrl-o] fullscreen off  [PgUp/PgDn] scroll  [Up/Down] line  [q] exit-page  [Ctrl-n] new".to_string()
         }

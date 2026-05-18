@@ -10,6 +10,8 @@ const SIDEBAR_HIDE_KEY: &str = "h";
 const CREATE_SESSION_KEY: &str = "C-n";
 const CREATE_SESSION_PREFIX_KEY: &str = "c";
 const FOOTER_SESSIONS_KEY: &str = "s";
+const ERROR_LOG_KEY: &str = "C-e";
+const ERROR_LOG_PREFIX_KEY: &str = "E";
 // Enter intentionally unbound as no-prefix to avoid globally intercepting
 // ENTER in the main pane. Footer menu is accessible via "s".
 const SIDEBAR_COLLAPSED_WIDTH: u16 = 1;
@@ -26,6 +28,7 @@ const TMUX_MENU_BORDER_STYLE_OPTION: &str = "menu-border-style";
 pub struct FooterMenuBindings {
     pub create_session_command: String,
     pub open_sessions_menu_command: String,
+    pub error_log_command: String,
 }
 
 pub struct ControlService<G> {
@@ -161,6 +164,16 @@ where
             workspace,
             FOOTER_SESSIONS_KEY,
             &footer_bindings.open_sessions_menu_command,
+        )?;
+        self.tmux.bind_key_without_prefix(
+            workspace,
+            ERROR_LOG_KEY,
+            &[footer_bindings.error_log_command.clone()],
+        )?;
+        self.tmux.bind_command_with_prefix(
+            workspace,
+            ERROR_LOG_PREFIX_KEY,
+            &footer_bindings.error_log_command,
         )?;
         Ok(())
     }
@@ -564,6 +577,7 @@ mod tests {
                 Some(&FooterMenuBindings {
                     create_session_command: "run-shell -b 'waitagent __new-target'".to_string(),
                     open_sessions_menu_command: "run-shell 'waitagent __footer-menu'".to_string(),
+                    error_log_command: "display-popup -w 80% -h 80% -E \"waitagent __error-log && echo '' && echo '--- Press ENTER to close ---' && read -r\"".to_string(),
                 }),
             )
             .expect("control configuration should succeed");
@@ -628,6 +642,14 @@ mod tests {
                 Call::BindCommandWithPrefix(
                     "s".to_string(),
                     "run-shell 'waitagent __footer-menu'".to_string(),
+                ),
+                Call::BindWithoutPrefix(
+                    "C-e".to_string(),
+                    vec!["display-popup -w 80% -h 80% -E \"waitagent __error-log && echo '' && echo '--- Press ENTER to close ---' && read -r\"".to_string(),],
+                ),
+                Call::BindCommandWithPrefix(
+                    "E".to_string(),
+                    "display-popup -w 80% -h 80% -E \"waitagent __error-log && echo '' && echo '--- Press ENTER to close ---' && read -r\"".to_string(),
                 ),
             ]
         );

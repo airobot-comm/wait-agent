@@ -592,6 +592,13 @@ impl WorkspaceLayoutRuntime {
                 "run-shell -b {}",
                 tmux_quote_argument(&shell_command)
             ),
+            error_log_command: format!(
+                "display-popup -w 80% -h 80% -E {}",
+                tmux_quote_argument(&format!(
+                    "{} __error-log && echo '' && echo '--- Press ENTER to close ---' && read -r",
+                    self.current_executable.display(),
+                ))
+            ),
         }
     }
 
