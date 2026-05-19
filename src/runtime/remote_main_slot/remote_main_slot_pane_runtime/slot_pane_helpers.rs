@@ -34,6 +34,9 @@ const SHOW_CURSOR_ESCAPE: &str = "\x1b[?25h";
 pub(super) const CLEAR_SCREEN_HOME_ESCAPE: &str = "\x1b[2J\x1b[H";
 const TARGET_PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TARGET_PRESENCE_MISS_GRACE_POLLS: usize = 4;
+pub(crate) const RECONNECT_ANIMATION_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const RECONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+const RECONNECT_SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠸', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 static REMOTE_PANE_SIGWINCH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static REMOTE_DRAW_DEBUG_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -167,6 +170,7 @@ pub(super) fn should_exit_surface_locally(spec: &RemoteInteractSurfaceSpec, byte
     spec.console_location == ConsoleLocation::ServerConsole && bytes.contains(&0x1d)
 }
 
+#[cfg(test)]
 pub(super) fn should_exit_surface_for_target_presence(
     _spec: &RemoteInteractSurfaceSpec,
     is_present: bool,
@@ -664,16 +668,24 @@ pub(super) fn draw_remote_snapshot(
     binding: Option<&RemoteAttachmentBinding>,
     snapshot: &RemoteObserverSnapshot,
     authority_status: &AuthorityTransportStatus,
+    reconnecting_elapsed: Option<Duration>,
+    reconnect_animation_frame: u8,
 ) -> Result<(), LifecycleError> {
     let viewport = terminal.current_size_or_default();
-    let connected_visible_output = snapshot.has_visible_output
-        && matches!(authority_status, AuthorityTransportStatus::Connected);
+    // Keep showing last known content when authority is disconnected due to
+    // network jitter but we have received output before. Only show placeholder
+    // when we never got any content or are still waiting for initial authority.
+    let has_content = snapshot.has_visible_output
+        && !matches!(
+            authority_status,
+            AuthorityTransportStatus::WaitingForRemoteAuthority
+        );
     let active_screen = snapshot.active_screen();
-    let placeholder = (!connected_visible_output)
-        .then(|| placeholder_lines(target, binding, authority_status, viewport));
+    let placeholder =
+        (!has_content).then(|| placeholder_lines(target, binding, authority_status, viewport));
     let mut rendered_lines = Vec::with_capacity(usize::from(viewport.rows.max(1)));
     for row in 0..usize::from(viewport.rows.max(1)) {
-        rendered_lines.push(if connected_visible_output {
+        rendered_lines.push(if has_content {
             render_terminal_safe_remote_line(
                 active_screen
                     .styled_lines
@@ -697,11 +709,17 @@ pub(super) fn draw_remote_snapshot(
             .to_string()
         });
     }
+    // Overlay reconnecting status bar on the last row when reconnecting
+    if let Some(elapsed) = reconnecting_elapsed {
+        let last_row = rendered_lines.len().saturating_sub(1);
+        rendered_lines[last_row] =
+            render_reconnecting_status(viewport, elapsed, reconnect_animation_frame);
+    }
     debug_log_draw_snapshot(
         "draw_remote_snapshot",
         &target.address.qualified_target(),
         snapshot.last_output_seq,
-        connected_visible_output,
+        has_content,
         active_screen.lines.as_slice(),
         rendered_lines.as_slice(),
         &format!(
@@ -716,14 +734,6 @@ pub(super) fn draw_remote_snapshot(
 
     let mut stdout = io::stdout().lock();
     // Hide cursor and disable line wrapping before redraw.
-    // Avoid DECSTR (\x1b[!p) — it resets scroll regions, margins, and
-    // other terminal state that the raw output stream (Claude Code's
-    // cursor-positioning sequences, etc.) assumes to be in effect. The
-    // line-by-line redraw below restores visible content only; terminal
-    // state established by the original output is lost if we DECSTR.
-    // Also avoid charset resets (\x1b(B) — tmux honors them internally
-    // but has no mechanism to restore UTF-8, causing non-ASCII characters
-    // (⏵, ⎿, etc.) to render as blocks.
     write!(stdout, "\x1b[?25l\x1b[?7l").map_err(|error| {
         LifecycleError::Io(
             "failed to hide remote main-slot cursor before redraw".to_string(),
@@ -737,7 +747,11 @@ pub(super) fn draw_remote_snapshot(
         })?;
     }
 
-    if connected_visible_output {
+    // Only show cursor when we're connected and showing live content
+    if has_content
+        && reconnecting_elapsed.is_none()
+        && matches!(authority_status, AuthorityTransportStatus::Connected)
+    {
         render_remote_cursor(&mut stdout, active_screen)?;
     } else {
         write!(stdout, "\x1b[?7h\x1b[?25l").map_err(|error| {
@@ -747,6 +761,24 @@ pub(super) fn draw_remote_snapshot(
     stdout.flush().map_err(|error| {
         LifecycleError::Io("failed to flush remote main-slot output".to_string(), error)
     })
+}
+
+fn render_reconnecting_status(
+    viewport: TerminalSize,
+    elapsed: Duration,
+    animation_frame: u8,
+) -> String {
+    let spinner =
+        RECONNECT_SPINNER_FRAMES[animation_frame as usize % RECONNECT_SPINNER_FRAMES.len()];
+    let secs = elapsed.as_secs();
+    let text = format!(" {} reconnecting... {}s ", spinner, secs);
+    let width = usize::from(viewport.cols.max(1));
+    if text.chars().count() >= width {
+        return text.chars().take(width).collect();
+    }
+    let padded = format!("{text:<width$}");
+    // Use amber background with black text for visibility
+    format!("\x1b[48;5;220m\x1b[30m{padded}\x1b[0m")
 }
 
 fn render_remote_cursor(

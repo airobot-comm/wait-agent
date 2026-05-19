@@ -16,8 +16,10 @@ use crate::terminal::TerminalRuntime;
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
@@ -275,6 +277,9 @@ impl RemoteMainSlotPaneRuntime {
             binding = Some(activated_binding);
         }
         let run_result = (|| -> Result<(), LifecycleError> {
+            let mut reconnecting_since: Option<Instant> = None;
+            let mut reconnect_animation_frame: u8 = 0;
+
             if should_draw_remote_snapshot(binding.as_ref()) {
                 draw_remote_snapshot(
                     &terminal,
@@ -282,12 +287,43 @@ impl RemoteMainSlotPaneRuntime {
                     binding.as_ref(),
                     &observer.snapshot(),
                     &authority_status,
+                    None,
+                    0,
                 )?;
             }
 
             loop {
-                match event_rx.recv() {
-                    Ok(RemotePaneEvent::MailboxUpdated) => {
+                let event = if reconnecting_since.is_some() {
+                    match event_rx.recv_timeout(slot_pane_helpers::RECONNECT_ANIMATION_INTERVAL) {
+                        Ok(event) => event,
+                        Err(RecvTimeoutError::Timeout) => {
+                            let elapsed = reconnecting_since.unwrap().elapsed();
+                            if elapsed > slot_pane_helpers::RECONNECT_TIMEOUT {
+                                return Ok(());
+                            }
+                            reconnect_animation_frame = (reconnect_animation_frame + 1) % 8;
+                            draw_remote_snapshot(
+                                &terminal,
+                                &target,
+                                binding.as_ref(),
+                                &observer.snapshot(),
+                                &authority_status,
+                                Some(elapsed),
+                                reconnect_animation_frame,
+                            )?;
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                    }
+                } else {
+                    match event_rx.recv() {
+                        Ok(event) => event,
+                        Err(_) => return Ok(()),
+                    }
+                };
+
+                match event {
+                    RemotePaneEvent::MailboxUpdated => {
                         let raw = raw_output_reader
                             .sync_and_collect_raw()
                             .map_err(remote_protocol_error)?;
@@ -299,7 +335,7 @@ impl RemoteMainSlotPaneRuntime {
                             &mut raw_screen_initialized,
                         )?;
                     }
-                    Ok(RemotePaneEvent::Resize) => {
+                    RemotePaneEvent::Resize => {
                         if let Ok(Some(size)) = terminal.capture_resize() {
                             if let Some(binding) = binding.as_ref() {
                                 remote_runtime.send_pty_resize(
@@ -310,18 +346,19 @@ impl RemoteMainSlotPaneRuntime {
                                 )?;
                             }
                         }
-                        if should_draw_remote_snapshot(binding.as_ref()) {
-                            draw_remote_snapshot(
-                                &terminal,
-                                &target,
-                                binding.as_ref(),
-                                &observer.snapshot(),
-                                &authority_status,
-                            )?;
-                        }
+                        draw_remote_snapshot(
+                            &terminal,
+                            &target,
+                            binding.as_ref(),
+                            &observer.snapshot(),
+                            &authority_status,
+                            reconnecting_since.map(|s| s.elapsed()),
+                            reconnect_animation_frame,
+                        )?;
                     }
-                    Ok(RemotePaneEvent::AuthorityTransport(event)) => match event {
+                    RemotePaneEvent::AuthorityTransport(event) => match event {
                         AuthorityTransportEvent::Connected => {
+                            reconnecting_since = None;
                             authority_status = if target_is_present(&target_presence) {
                                 AuthorityTransportStatus::Connected
                             } else {
@@ -358,33 +395,32 @@ impl RemoteMainSlotPaneRuntime {
                                     }
                                 }
                             }
-                            if should_draw_remote_snapshot(binding.as_ref()) {
-                                draw_remote_snapshot(
-                                    &terminal,
-                                    &target,
-                                    binding.as_ref(),
-                                    &observer.snapshot(),
-                                    &authority_status,
-                                )?;
-                            }
-                        }
-                        AuthorityTransportEvent::Disconnected => {
-                            remote_runtime
-                                .handle_authority_disconnect(target.address.authority_id());
-                            authority_status = authority_status_from_runtime(
-                                &remote_runtime,
-                                &target,
-                                target_is_present(&target_presence),
-                                &waiting_authority_status,
-                            );
-                            binding = None;
-                            raw_input_route.clear();
                             draw_remote_snapshot(
                                 &terminal,
                                 &target,
                                 binding.as_ref(),
                                 &observer.snapshot(),
                                 &authority_status,
+                                None,
+                                0,
+                            )?;
+                        }
+                        AuthorityTransportEvent::Disconnected => {
+                            remote_runtime
+                                .handle_authority_disconnect(target.address.authority_id());
+                            let _is_present = target_is_present(&target_presence);
+                            authority_status = AuthorityTransportStatus::Disconnected;
+                            // Keep binding and last content visible; start reconnecting
+                            reconnecting_since = Some(Instant::now());
+                            reconnect_animation_frame = 0;
+                            draw_remote_snapshot(
+                                &terminal,
+                                &target,
+                                binding.as_ref(),
+                                &observer.snapshot(),
+                                &authority_status,
+                                Some(Duration::ZERO),
+                                0,
                             )?;
                         }
                         AuthorityTransportEvent::Failed(message) => {
@@ -395,6 +431,8 @@ impl RemoteMainSlotPaneRuntime {
                                 binding.as_ref(),
                                 &observer.snapshot(),
                                 &authority_status,
+                                None,
+                                0,
                             )?;
                         }
                         AuthorityTransportEvent::RawPtyOutput {
@@ -431,9 +469,17 @@ impl RemoteMainSlotPaneRuntime {
                                 .map_err(remote_protocol_error)?;
                         }
                     },
-                    Ok(RemotePaneEvent::TargetPresenceChanged(is_present)) => {
-                        if should_exit_surface_for_target_presence(&spec, is_present) {
+                    RemotePaneEvent::TargetPresenceChanged(is_present) => {
+                        if !is_present && reconnecting_since.is_none() {
+                            // Target truly gone while not reconnecting → exit
                             return Ok(());
+                        }
+                        if !is_present {
+                            // During reconnect: target disappearance is a
+                            // catalog side-effect of network jitter. Clear
+                            // local state but keep reconnecting.
+                            binding = None;
+                            raw_input_route.clear();
                         }
                         authority_status = authority_status_from_runtime(
                             &remote_runtime,
@@ -441,20 +487,55 @@ impl RemoteMainSlotPaneRuntime {
                             is_present,
                             &waiting_authority_status,
                         );
-                        if should_draw_remote_snapshot(binding.as_ref()) {
-                            draw_remote_snapshot(
-                                &terminal,
+                        // When both target and authority transport are back
+                        // while reconnecting, reactivate. This handles the
+                        // race where Connected arrives before or after
+                        // TargetPresenceChanged(true).
+                        if is_present
+                            && binding.is_none()
+                            && matches!(authority_status, AuthorityTransportStatus::Connected)
+                        {
+                            let size = terminal.current_size_or_default();
+                            match activate_surface_target_with_mode(
+                                &remote_runtime,
                                 &target,
-                                binding.as_ref(),
-                                &observer.snapshot(),
-                                &authority_status,
-                            )?;
+                                &spec,
+                                &size,
+                                &mut observer,
+                            ) {
+                                Ok(activated) => {
+                                    reconnecting_since = None;
+                                    raw_input_route.activate(
+                                        &target,
+                                        &activated.0,
+                                        &spec.console_host_id,
+                                    );
+                                    write_remote_raw_output_with_initial_clear(
+                                        &activated.1,
+                                        &mut raw_screen_initialized,
+                                    )?;
+                                    binding = Some(activated.0);
+                                }
+                                Err(error) => {
+                                    authority_status =
+                                        AuthorityTransportStatus::Failed(error.to_string());
+                                }
+                            }
                         }
+                        draw_remote_snapshot(
+                            &terminal,
+                            &target,
+                            binding.as_ref(),
+                            &observer.snapshot(),
+                            &authority_status,
+                            reconnecting_since.map(|i| i.elapsed()),
+                            reconnect_animation_frame,
+                        )?;
                     }
-                    Ok(RemotePaneEvent::Input {
+                    RemotePaneEvent::Input {
                         bytes,
                         raw_forwarded,
-                    }) => {
+                    } => {
                         for signal in input_signal_decoder.feed(&spec, &bytes) {
                             on_signal(signal);
                         }
@@ -479,7 +560,6 @@ impl RemoteMainSlotPaneRuntime {
                             )?;
                         }
                     }
-                    Err(_) => return Ok(()),
                 }
             }
         })();
