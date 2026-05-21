@@ -310,6 +310,7 @@ impl MainSlotRuntime {
                 .remote_target_record(workspace.socket_name.as_str(), &active_target)?
                 .is_some()
             {
+                self.cleanup_orphan_isolation_panes(&workspace, &workspace_main_pane)?;
                 self.backend
                     .respawn_pane(
                         &workspace,
@@ -376,6 +377,7 @@ impl MainSlotRuntime {
             }
         }
 
+        self.cleanup_orphan_isolation_panes(&workspace, &workspace_main_pane)?;
         self.backend
             .respawn_pane(
                 &workspace,
@@ -641,6 +643,40 @@ impl MainSlotRuntime {
         // per-output-line bridge is redundant and causes signal storms.
         self.layout_runtime
             .disable_main_pane_output_bridge(workspace)
+    }
+
+    /// Kill any panes in the workspace window that are not the designated
+    /// main pane, sidebar, footer, or already dead. This cleans up orphan
+    /// isolation panes left behind when `respawn-pane -k` kills a
+    /// `__remote-main-slot` process without running Drop, leaving the
+    /// `SessionPaneGuard` isolation pane (`sleep infinity`) stranded at the
+    /// main display position.
+    fn cleanup_orphan_isolation_panes(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        main_pane: &TmuxPaneId,
+    ) -> Result<(), LifecycleError> {
+        let window = self
+            .backend
+            .current_window(workspace)
+            .map_err(main_slot_error)?;
+        let panes = self
+            .backend
+            .list_panes(workspace, &window)
+            .map_err(main_slot_error)?;
+        for pane in &panes {
+            if pane.is_dead
+                || pane.pane_id == *main_pane
+                || pane.title == SIDEBAR_PANE_TITLE
+                || pane.title == FOOTER_PANE_TITLE
+            {
+                continue;
+            }
+            self.backend
+                .kill_pane(workspace, &pane.pane_id)
+                .map_err(main_slot_error)?;
+        }
+        Ok(())
     }
 
     fn infer_target_main_pane(&self, workspace: &TmuxWorkspaceHandle) -> Option<String> {
