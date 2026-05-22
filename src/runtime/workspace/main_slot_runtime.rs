@@ -773,7 +773,9 @@ impl MainSlotRuntime {
         if self.pane_is_live(workspace, pane_id.as_str()) {
             Ok(Some(pane_id))
         } else {
-            // Pane died — clean up the stale option so a new one is created
+            // Pane died — kill it to prevent dead-pane accumulation,
+            // then clean up the stale option so a new one is created.
+            let _ = self.backend.kill_pane(workspace, &pane_id);
             self.backend
                 .set_session_option(workspace, &option_name, "")
                 .map_err(main_slot_error)?;

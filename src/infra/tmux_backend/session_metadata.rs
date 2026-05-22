@@ -139,10 +139,20 @@ impl EmbeddedTmuxBackend {
         session_name: &str,
     ) -> Result<TmuxSessionRuntimeMetadata, TmuxError> {
         let panes = self.list_panes_on_target(socket_name, session_name)?;
-        let Some(main_pane) = panes.iter().find(|pane| {
-            pane.title != super::WAITAGENT_SIDEBAR_PANE_TITLE
-                && pane.title != super::WAITAGENT_FOOTER_PANE_TITLE
-        }) else {
+        let Some(main_pane) = panes
+            .iter()
+            .find(|pane| {
+                !pane.is_dead
+                    && pane.title != super::WAITAGENT_SIDEBAR_PANE_TITLE
+                    && pane.title != super::WAITAGENT_FOOTER_PANE_TITLE
+            })
+            .or_else(|| {
+                panes.iter().find(|pane| {
+                    pane.title != super::WAITAGENT_SIDEBAR_PANE_TITLE
+                        && pane.title != super::WAITAGENT_FOOTER_PANE_TITLE
+                })
+            })
+        else {
             return Ok(TmuxSessionRuntimeMetadata::default());
         };
         let pane_ansi = self.capture_pane_text(socket_name, &main_pane.pane_id)?;
