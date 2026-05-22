@@ -56,6 +56,10 @@ impl MainSlotRuntime {
         &self,
         command: ActivateTargetCommand,
     ) -> Result<(), LifecycleError> {
+        ERROR_LOG.log(format!(
+            "[diag] run_activate_target: target={}, socket={}, session={}",
+            command.target, command.current_socket_name, command.current_session_name
+        ));
         let current_workspace = self.current_workspace(&command)?;
         let current_socket = TmuxSocketName::new(&command.current_socket_name);
         let socket_scoped_registry =
