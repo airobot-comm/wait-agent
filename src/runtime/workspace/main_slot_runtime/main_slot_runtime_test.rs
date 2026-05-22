@@ -259,6 +259,151 @@ mod tests {
     }
 
     #[test]
+    fn switching_from_remote_back_to_local_target_restores_local_main_pane() {
+        let backend = EmbeddedTmuxBackend::from_build_env()
+            .expect("vendored tmux backend should discover build env");
+        let workspace_config = unique_workspace_config("remote-to-local-switch");
+        let workspace_dir = workspace_config.workspace_dir.clone();
+        let waitagent_executable = waitagent_test_executable();
+        let entry_runtime = WorkspaceEntryRuntime::new(
+            WorkspaceRuntime::new(WorkspaceService::new(backend.clone())),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                RemoteNetworkConfig::default(),
+            )
+            .expect("workspace layout runtime should build"),
+        );
+        let workspace = entry_runtime
+            .bootstrap_workspace(&workspace_dir)
+            .expect("workspace bootstrap should succeed");
+        let target_host = backend
+            .ensure_workspace(
+                &WorkspaceInstanceConfig::for_new_target_on_socket_with_size(
+                    &workspace_dir,
+                    workspace.workspace_handle.socket_name.as_str(),
+                    None,
+                    None,
+                ),
+            )
+            .expect("target host bootstrap should succeed");
+
+        let runtime = MainSlotRuntime::new(
+            backend.clone(),
+            TargetHostRuntime::from_build_env(backend.clone())
+                .expect("target host runtime should build"),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                RemoteNetworkConfig::default(),
+            )
+            .expect("workspace layout runtime should build"),
+            TargetRegistryService::new(
+                DefaultTargetCatalogGateway::from_build_env_with_socket_name(
+                    workspace.workspace_handle.socket_name.as_str(),
+                )
+                .expect("target catalog gateway should build"),
+            ),
+            waitagent_executable.clone(),
+            RemoteNetworkConfig::default(),
+        );
+
+        let local_target = format!(
+            "{}:{}",
+            workspace.workspace_handle.socket_name.as_str(),
+            target_host.session_name.as_str()
+        );
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: local_target.clone(),
+            })
+            .expect("local target activation should succeed");
+
+        let remote_runtime_owner = RemoteRuntimeOwnerRuntime::new_for_tests(
+            waitagent_executable.clone(),
+            RemoteNetworkConfig::default(),
+        );
+        let remote_target = remote_session_with_selector(
+            "peer-a",
+            "remote-switch-1",
+            &local_target,
+            ManagedSessionTaskState::Input,
+        );
+        remote_runtime_owner
+            .upsert_session(
+                workspace.workspace_handle.socket_name.as_str(),
+                "peer-a",
+                &remote_target,
+            )
+            .expect("remote target should be discoverable on workspace socket");
+
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: remote_target.address.qualified_target(),
+            })
+            .expect("remote target activation should succeed");
+
+        wait_for_condition(|| {
+            let active_target = backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read");
+            active_target.as_deref() == Some(remote_target.address.qualified_target().as_str())
+        });
+
+        // Now switch back to the local target host
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: local_target.clone(),
+            })
+            .expect("local target re-activation should succeed");
+
+        wait_for_condition(|| {
+            let active_target = backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read");
+            active_target.as_deref() == Some(local_target.as_str())
+        });
+
+        // After switching back, verify the @waitagent_main_pane_id is actually set
+        // AND that the configured main pane runs bash (not waitagent)
+        wait_for_condition(|| {
+            let Ok(main_pane_id) = backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
+            else {
+                return false;
+            };
+            let Some(main_pane_id) = main_pane_id.filter(|id| !id.is_empty()) else {
+                return false;
+            };
+            let Ok(window) = backend.current_window(&workspace.workspace_handle) else {
+                return false;
+            };
+            let Ok(panes) = backend.list_panes(&workspace.workspace_handle, &window) else {
+                return false;
+            };
+            let Some(main_pane) = panes.iter().find(|p| p.pane_id.as_str() == main_pane_id) else {
+                return false;
+            };
+            main_pane.current_command.as_deref() == Some("bash")
+        });
+
+        // Main pane pipe should be disabled after switching back to local
+        assert!(
+            workspace_main_pane_pipe(&backend, &workspace.workspace_handle).as_deref() == Some("0"),
+            "main pane should have pipe disabled after switching back to local target"
+        );
+
+        kill_server(&backend, &workspace.workspace_handle);
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
+    #[test]
     fn remote_main_pane_exit_falls_back_to_local_target_host() {
         let backend = EmbeddedTmuxBackend::from_build_env()
             .expect("vendored tmux backend should discover build env");

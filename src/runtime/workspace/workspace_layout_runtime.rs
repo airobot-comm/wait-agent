@@ -374,26 +374,32 @@ impl WorkspaceLayoutRuntime {
                 Some(&footer_bindings),
             )
             .map_err(tmux_layout_error)?;
+        // Resolve the effective main pane. When the pane designated by
+        // @waitagent_main_pane_id (previous_main_pane) is still alive and
+        // is not a chrome pane, prefer it over layout.main_pane (which
+        // comes from main_pane_id() and picks the first non-chrome pane
+        // by list-panes index order). This prevents the 1-cell leftover
+        // pane created by create_remote_session_pane (which often has the
+        // lowest pane index after swap-pane) from being incorrectly
+        // designated as the main pane.
+        let main_pane = resolve_effective_main_pane(
+            &self.backend,
+            workspace,
+            previous_main_pane.as_ref(),
+            &layout.main_pane,
+        );
         self.backend
-            .set_session_option(
-                workspace,
-                WAITAGENT_MAIN_PANE_OPTION,
-                layout.main_pane.as_str(),
-            )
+            .set_session_option(workspace, WAITAGENT_MAIN_PANE_OPTION, main_pane.as_str())
             .map_err(tmux_layout_error)?;
         if self.main_pane_output_bridge_enabled(workspace)? {
-            self.ensure_main_pane_output_bridge(
-                workspace,
-                &layout.main_pane,
-                &main_pane_pipe_command,
-            )?;
+            self.ensure_main_pane_output_bridge(workspace, &main_pane, &main_pane_pipe_command)?;
         } else {
             self.suspend_main_pane_output_bridge(workspace)?;
         }
         self.layout_service
             .ensure_layout_hooks(
                 workspace,
-                &layout.main_pane,
+                &main_pane,
                 previous_main_pane.as_ref(),
                 &reconcile_command,
                 &pane_died_command,
@@ -778,6 +784,41 @@ fn shell_escape(value: &str) -> String {
 
 fn tmux_quote_argument(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn resolve_effective_main_pane(
+    backend: &EmbeddedTmuxBackend,
+    workspace: &TmuxWorkspaceHandle,
+    previous: Option<&TmuxPaneId>,
+    suggested: &TmuxPaneId,
+) -> TmuxPaneId {
+    let Some(previous) = previous else {
+        return suggested.clone();
+    };
+    if previous == suggested {
+        return suggested.clone();
+    }
+    // The previously-configured main pane differs from main_pane_id()'s
+    // suggestion. Check if it's still a valid non-chrome pane — if so,
+    // prefer it to prevent a stale leftover pane (e.g., the 1-cell pane
+    // from create_remote_session_pane which has a lower pane index than
+    // the display pane after swap-pane) from being designated as main.
+    let Ok(window) = backend.current_window(workspace) else {
+        return suggested.clone();
+    };
+    let Ok(panes) = backend.list_panes(workspace, &window) else {
+        return suggested.clone();
+    };
+    if panes.iter().any(|p| {
+        p.pane_id == *previous
+            && !p.is_dead
+            && p.title != SIDEBAR_PANE_TITLE
+            && p.title != FOOTER_PANE_TITLE
+    }) {
+        previous.clone()
+    } else {
+        suggested.clone()
+    }
 }
 
 fn tmux_layout_error(error: TmuxError) -> LifecycleError {
