@@ -3,6 +3,7 @@ use crate::application::target_registry_service::{
 };
 use crate::cli::{RemoteNetworkConfig, UiPaneCommand};
 use crate::domain::workspace::WorkspaceInstanceId;
+use crate::infra::error_log::ERROR_LOG;
 use crate::infra::tmux::{
     EmbeddedTmuxBackend, TmuxLayoutGateway, TmuxSessionName, TmuxSocketName, TmuxWorkspaceHandle,
 };
@@ -95,6 +96,7 @@ impl EventDrivenPaneRuntime {
                     let outcome = chrome.apply_sidebar_input(&bytes);
                     redraw_sidebar(outcome.render, &mut last_buffer)?;
                     if let Some(activation) = outcome.activation {
+                        ERROR_LOG.log(format!("[diag] sidebar input: activation={:?}", activation));
                         self.apply_sidebar_activation(&command, activation)?;
                     }
                 }
@@ -178,26 +180,42 @@ impl EventDrivenPaneRuntime {
         command: &UiPaneCommand,
         activation: EventDrivenSidebarActivation,
     ) -> Result<(), LifecycleError> {
-        match activation {
-            EventDrivenSidebarActivation::SelectMainPane => self
-                .backend
-                .run_socket_command(
-                    &TmuxSocketName::new(&command.socket_name),
-                    &["select-pane".to_string(), "-L".to_string()],
-                )
-                .map_err(event_pane_error),
-            EventDrivenSidebarActivation::ActivateTarget { target } => self
-                .backend
-                .run_socket_command(
-                    &TmuxSocketName::new(&command.socket_name),
-                    &activate_target_run_shell_args(
-                        &current_executable_string()?,
-                        &command.socket_name,
-                        &command.session_name,
-                        &target,
-                    ),
-                )
-                .map_err(event_pane_error),
+        match &activation {
+            EventDrivenSidebarActivation::SelectMainPane => {
+                ERROR_LOG.log(format!(
+                    "[diag] apply_sidebar_activation: SelectMainPane socket={}",
+                    command.socket_name
+                ));
+                self.backend
+                    .run_socket_command(
+                        &TmuxSocketName::new(&command.socket_name),
+                        &["select-pane".to_string(), "-L".to_string()],
+                    )
+                    .map_err(event_pane_error)
+            }
+            EventDrivenSidebarActivation::ActivateTarget { target } => {
+                ERROR_LOG.log(format!(
+                    "[diag] apply_sidebar_activation: ActivateTarget target={} socket={}",
+                    target, command.socket_name
+                ));
+                let result = self
+                    .backend
+                    .run_socket_command(
+                        &TmuxSocketName::new(&command.socket_name),
+                        &activate_target_run_shell_args(
+                            &current_executable_string()?,
+                            &command.socket_name,
+                            &command.session_name,
+                            &target,
+                        ),
+                    )
+                    .map_err(event_pane_error);
+                ERROR_LOG.log(format!(
+                    "[diag] apply_sidebar_activation: result={:?}",
+                    result.is_ok()
+                ));
+                result
+            }
         }
     }
 
