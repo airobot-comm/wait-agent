@@ -1,17 +1,24 @@
 use crate::cli::{RemoteMainSlotCommand, RemoteNetworkConfig};
+use crate::infra::remote_grpc_transport::{
+    GrpcRemoteNodeTransport, OutboundNodeSessionRequest, RemoteNodeTransport,
+    RemoteNodeTransportEvent,
+};
 use crate::lifecycle::LifecycleError;
+use crate::runtime::remote_authority_connection_runtime::QueuedAuthorityStreamSink;
 use crate::runtime::remote_authority_transport_runtime::authority_transport_socket_path;
 use crate::runtime::remote_main_slot_pane_runtime::RemoteMainSlotPaneRuntime;
 use crate::runtime::remote_node_ingress_runtime::{
-    AuthoritySocketRemoteNodeIngressSource, RemoteNodeIngressGuard, RemoteNodeIngressRuntime,
-    RemoteNodeIngressStarter,
+    ActiveGrpcNodeSession, AuthoritySocketRemoteNodeIngressSource, RemoteNodeIngressGuard,
+    RemoteNodeIngressRuntime, RemoteNodeIngressStarter,
 };
 use crate::runtime::remote_node_session_runtime::{
     RemoteNodePublicationSink, RemoteNodeSessionError,
 };
 use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
+use std::io;
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 use std::sync::Arc;
 
 // Remote main-slot authority ingress belongs to the pane process lifecycle.
@@ -21,6 +28,7 @@ pub struct RemoteMainSlotIngressRuntime {
     pane_runtime: RemoteMainSlotPaneRuntime,
     publication_runtime: RemoteTargetPublicationRuntime,
     node_ingress: Box<dyn RemoteNodeIngressStarter>,
+    network: RemoteNetworkConfig,
 }
 
 impl RemoteMainSlotIngressRuntime {
@@ -28,11 +36,13 @@ impl RemoteMainSlotIngressRuntime {
         pane_runtime: RemoteMainSlotPaneRuntime,
         publication_runtime: RemoteTargetPublicationRuntime,
         node_ingress: Box<dyn RemoteNodeIngressStarter>,
+        network: RemoteNetworkConfig,
     ) -> Self {
         Self {
             pane_runtime,
             publication_runtime,
             node_ingress,
+            network,
         }
     }
 
@@ -52,6 +62,7 @@ impl RemoteMainSlotIngressRuntime {
             Box::new(RemoteNodeIngressRuntime::new(
                 AuthoritySocketRemoteNodeIngressSource,
             )),
+            network,
         ))
     }
 
@@ -92,7 +103,68 @@ impl RemoteMainSlotIngressRuntime {
 
     pub fn run(&self, command: RemoteMainSlotCommand) -> Result<(), LifecycleError> {
         let _authority_ingress = self.start_ingress_for_command(&command)?;
+        let authority_sink = self.pane_runtime.external_authority_stream_submitter()?;
+        let _grpc_guard = self.establish_grpc_authority_bridge(
+            &extract_authority_id_from_target(&command.target),
+            authority_sink,
+        )?;
         self.pane_runtime.run(command)
+    }
+
+    fn establish_grpc_authority_bridge(
+        &self,
+        authority_id: &str,
+        authority_sink: QueuedAuthorityStreamSink,
+    ) -> Result<Option<GrpcAuthorityBridgeGuard>, LifecycleError> {
+        let Some(endpoint_uri) = self.network.connect_endpoint_uri() else {
+            return Ok(None);
+        };
+        if authority_id.is_empty() {
+            return Ok(None);
+        }
+
+        let transport = GrpcRemoteNodeTransport::new();
+        let (event_tx, event_rx) = mpsc::channel();
+        let transport_guard = transport
+            .connect_outbound(
+                OutboundNodeSessionRequest {
+                    node_id: authority_id.to_string(),
+                    endpoint_uri,
+                },
+                event_tx,
+            )
+            .map_err(|error| {
+                LifecycleError::Io(
+                    "failed to connect gRPC authority bridge to remote node".to_string(),
+                    io::Error::new(io::ErrorKind::Other, error.to_string()),
+                )
+            })?;
+
+        let session = loop {
+            match event_rx.recv() {
+                Ok(RemoteNodeTransportEvent::SessionOpened { session }) => break session,
+                Ok(_) => continue,
+                Err(_) => {
+                    return Err(LifecycleError::Io(
+                        "gRPC authority bridge closed before session opened".to_string(),
+                        io::Error::new(io::ErrorKind::Other, "event channel closed"),
+                    ))
+                }
+            }
+        };
+
+        let active_session =
+            ActiveGrpcNodeSession::new(session, authority_sink).map_err(|error| {
+                LifecycleError::Io(
+                    "failed to create active gRPC node session for authority bridge".to_string(),
+                    error,
+                )
+            })?;
+
+        Ok(Some(GrpcAuthorityBridgeGuard {
+            _transport_guard: transport_guard,
+            _session: active_session,
+        }))
     }
 }
 
@@ -114,13 +186,26 @@ impl RemoteNodePublicationSink for LiveRemotePublicationSink {
     }
 }
 
+pub(crate) struct GrpcAuthorityBridgeGuard {
+    _transport_guard: crate::infra::remote_grpc_transport::GrpcRemoteNodeTransportGuard,
+    _session: ActiveGrpcNodeSession,
+}
+
+fn extract_authority_id_from_target(target: &str) -> String {
+    target
+        .strip_prefix("remote-peer:")
+        .and_then(|t| t.split_once(':'))
+        .map(|(id, _)| id.to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::RemoteMainSlotIngressRuntime;
     use crate::application::target_registry_service::{
         DefaultTargetCatalogGateway, TargetRegistryService,
     };
-    use crate::cli::RemoteMainSlotCommand;
+    use crate::cli::{RemoteMainSlotCommand, RemoteNetworkConfig};
     use crate::domain::session_catalog::{
         ConsoleLocation, ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState,
         SessionAvailability,
@@ -190,6 +275,7 @@ mod tests {
             RemoteTargetPublicationRuntime::from_build_env()
                 .expect("publication runtime should build from env"),
             Box::new(RemoteNodeIngressRuntime::with_grpc_source(bind_addr)),
+            RemoteNetworkConfig::default(),
         );
         let target = remote_target();
         let remote_runtime = RemoteMainSlotRuntime::with_registry(RemoteConnectionRegistry::new());
@@ -296,6 +382,7 @@ mod tests {
             RemoteTargetPublicationRuntime::from_build_env()
                 .expect("publication runtime should build from env"),
             Box::new(RemoteNodeIngressRuntime::with_grpc_source(bind_addr)),
+            RemoteNetworkConfig::default(),
         );
         let target = remote_target();
         let remote_runtime = RemoteMainSlotRuntime::with_registry(RemoteConnectionRegistry::new());

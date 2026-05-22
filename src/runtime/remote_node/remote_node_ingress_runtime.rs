@@ -233,14 +233,14 @@ fn run_grpc_node_ingress_worker(
     }
 }
 
-struct ActiveGrpcNodeSession {
+pub(crate) struct ActiveGrpcNodeSession {
     inbound_writer: UnixStream,
     outbound_shutdown: UnixStream,
     outbound_forwarder: Option<thread::JoinHandle<()>>,
 }
 
 impl ActiveGrpcNodeSession {
-    fn new(
+    pub(crate) fn new(
         session: RemoteNodeSessionHandle,
         authority_sink: QueuedAuthorityStreamSink,
     ) -> io::Result<Self> {
@@ -265,7 +265,7 @@ impl ActiveGrpcNodeSession {
         })
     }
 
-    fn write_authority_envelope(
+    pub(crate) fn write_authority_envelope(
         &mut self,
         envelope: &ProtocolEnvelope<ControlPlanePayload>,
     ) -> Result<(), io::Error> {

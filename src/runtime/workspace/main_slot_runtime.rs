@@ -966,12 +966,23 @@ fn workspace_host_program(workspace_dir: &Path) -> TmuxProgram {
     TmuxProgram::new(shell).with_start_directory(workspace_dir)
 }
 
+fn extract_remote_authority_connect_addr(target: &str) -> Option<String> {
+    let target = target.strip_prefix("remote-peer:")?;
+    let (authority_id, _) = target.split_once(':')?;
+    let (ip, port) = authority_id.split_once('#')?;
+    Some(format!("{ip}:{port}"))
+}
+
 fn remote_main_slot_program(
     executable: &Path,
     current_workspace: &CurrentWorkspace,
     target: &str,
     network: &RemoteNetworkConfig,
 ) -> TmuxProgram {
+    let mut network = network.clone();
+    if let Some(connect_addr) = extract_remote_authority_connect_addr(target) {
+        network.connect = Some(connect_addr);
+    }
     TmuxProgram::new(executable.display().to_string())
         .with_args(prepend_global_network_args(
             vec![
@@ -983,7 +994,7 @@ fn remote_main_slot_program(
                 "--target".to_string(),
                 target.to_string(),
             ],
-            network,
+            &network,
         ))
         .with_start_directory(&current_workspace.workspace_dir)
 }
