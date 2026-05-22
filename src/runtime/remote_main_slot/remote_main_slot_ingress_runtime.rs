@@ -1,14 +1,14 @@
 use crate::cli::{RemoteMainSlotCommand, RemoteNetworkConfig};
 use crate::infra::remote_grpc_transport::{
     GrpcRemoteNodeTransport, OutboundNodeSessionRequest, RemoteNodeTransport,
-    RemoteNodeTransportEvent,
 };
+use crate::infra::remote_protocol::{ControlPlanePayload, ProtocolEnvelope};
 use crate::lifecycle::LifecycleError;
 use crate::runtime::remote_authority_connection_runtime::QueuedAuthorityStreamSink;
 use crate::runtime::remote_authority_transport_runtime::authority_transport_socket_path;
 use crate::runtime::remote_main_slot_pane_runtime::RemoteMainSlotPaneRuntime;
 use crate::runtime::remote_node_ingress_runtime::{
-    ActiveGrpcNodeSession, AuthoritySocketRemoteNodeIngressSource, RemoteNodeIngressGuard,
+    run_grpc_node_ingress_worker, AuthoritySocketRemoteNodeIngressSource, RemoteNodeIngressGuard,
     RemoteNodeIngressRuntime, RemoteNodeIngressStarter,
 };
 use crate::runtime::remote_node_session_runtime::{
@@ -18,8 +18,7 @@ use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRu
 use std::io;
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 // Remote main-slot authority ingress belongs to the pane process lifecycle.
@@ -115,8 +114,9 @@ impl RemoteMainSlotIngressRuntime {
     }
 
     /// Spawns a background thread that connects to the remote authority via
-    /// gRPC and bridges the session into the authority stream queue. Returns
-    /// immediately so the caller can start the pane UI without delay.
+    /// gRPC and bridges all session events (mirror bootstrap, target output,
+    /// etc.) into the authority stream queue. Returns immediately so the
+    /// caller can start the pane UI without delay.
     fn spawn_background_grpc_bridge(
         &self,
         authority_id: String,
@@ -130,7 +130,7 @@ impl RemoteMainSlotIngressRuntime {
         }
 
         let transport = GrpcRemoteNodeTransport::new();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
         let transport_guard = transport
             .connect_outbound(
                 OutboundNodeSessionRequest {
@@ -146,30 +146,14 @@ impl RemoteMainSlotIngressRuntime {
                 )
             })?;
 
-        let session_holder: Arc<Mutex<Option<ActiveGrpcNodeSession>>> = Arc::new(Mutex::new(None));
-        let worker_session_holder = session_holder.clone();
-
         thread::Builder::new()
             .name("grpc-bridge".into())
             .spawn(move || {
-                let session = loop {
-                    match event_rx.recv() {
-                        Ok(RemoteNodeTransportEvent::SessionOpened { session }) => break session,
-                        Ok(_) => continue,
-                        Err(_) => return,
-                    }
-                };
-                match ActiveGrpcNodeSession::new(session, authority_sink) {
-                    Ok(active_session) => {
-                        *worker_session_holder.lock().expect("gRPC bridge mutex") =
-                            Some(active_session);
-                    }
-                    Err(error) => {
-                        super::remote_main_slot_runtime::log_diagnostic(format_args!(
-                            "gRPC bridge: failed to create active session: {error}"
-                        ));
-                    }
-                }
+                run_grpc_node_ingress_worker(
+                    event_rx,
+                    authority_sink,
+                    Arc::new(NoopPublicationSink),
+                );
             })
             .map_err(|error| {
                 LifecycleError::Io("failed to spawn gRPC bridge thread".to_string(), error)
@@ -177,7 +161,6 @@ impl RemoteMainSlotIngressRuntime {
 
         Ok(Some(GrpcAuthorityBridgeGuard {
             _transport_guard: transport_guard,
-            _session_holder: session_holder,
         }))
     }
 }
@@ -202,7 +185,17 @@ impl RemoteNodePublicationSink for LiveRemotePublicationSink {
 
 pub(crate) struct GrpcAuthorityBridgeGuard {
     _transport_guard: crate::infra::remote_grpc_transport::GrpcRemoteNodeTransportGuard,
-    _session_holder: Arc<Mutex<Option<ActiveGrpcNodeSession>>>,
+}
+
+struct NoopPublicationSink;
+
+impl RemoteNodePublicationSink for NoopPublicationSink {
+    fn publish(
+        &self,
+        _envelope: ProtocolEnvelope<ControlPlanePayload>,
+    ) -> Result<(), RemoteNodeSessionError> {
+        Ok(())
+    }
 }
 
 fn extract_authority_id_from_target(target: &str) -> String {

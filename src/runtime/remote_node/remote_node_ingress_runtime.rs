@@ -191,7 +191,7 @@ impl RemoteNodeIngressSource for GrpcRemoteNodeIngressSource {
     }
 }
 
-fn run_grpc_node_ingress_worker(
+pub(crate) fn run_grpc_node_ingress_worker(
     event_rx: mpsc::Receiver<RemoteNodeTransportEvent>,
     authority_sink: QueuedAuthorityStreamSink,
     publication_sink: Arc<dyn RemoteNodePublicationSink>,
@@ -282,7 +282,7 @@ impl ActiveGrpcNodeSession {
     }
 }
 
-fn route_grpc_envelope(
+pub(crate) fn route_grpc_envelope(
     node_id: &str,
     envelope: GrpcNodeSessionEnvelope,
     session: Option<&mut ActiveGrpcNodeSession>,
