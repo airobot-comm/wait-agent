@@ -19,7 +19,8 @@ use std::io;
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 // Remote main-slot authority ingress belongs to the pane process lifecycle.
 // It accepts authority-side transport connections on the scoped socket path
@@ -104,16 +105,21 @@ impl RemoteMainSlotIngressRuntime {
     pub fn run(&self, command: RemoteMainSlotCommand) -> Result<(), LifecycleError> {
         let _authority_ingress = self.start_ingress_for_command(&command)?;
         let authority_sink = self.pane_runtime.external_authority_stream_submitter()?;
-        let _grpc_guard = self.establish_grpc_authority_bridge(
-            &extract_authority_id_from_target(&command.target),
+        // Start gRPC bridge in background so the UI (run_surface) starts
+        // immediately instead of blocking on gRPC connection establishment.
+        let _grpc_guard = self.spawn_background_grpc_bridge(
+            extract_authority_id_from_target(&command.target),
             authority_sink,
         )?;
         self.pane_runtime.run(command)
     }
 
-    fn establish_grpc_authority_bridge(
+    /// Spawns a background thread that connects to the remote authority via
+    /// gRPC and bridges the session into the authority stream queue. Returns
+    /// immediately so the caller can start the pane UI without delay.
+    fn spawn_background_grpc_bridge(
         &self,
-        authority_id: &str,
+        authority_id: String,
         authority_sink: QueuedAuthorityStreamSink,
     ) -> Result<Option<GrpcAuthorityBridgeGuard>, LifecycleError> {
         let Some(endpoint_uri) = self.network.connect_endpoint_uri() else {
@@ -128,7 +134,7 @@ impl RemoteMainSlotIngressRuntime {
         let transport_guard = transport
             .connect_outbound(
                 OutboundNodeSessionRequest {
-                    node_id: authority_id.to_string(),
+                    node_id: authority_id.clone(),
                     endpoint_uri,
                 },
                 event_tx,
@@ -140,30 +146,38 @@ impl RemoteMainSlotIngressRuntime {
                 )
             })?;
 
-        let session = loop {
-            match event_rx.recv() {
-                Ok(RemoteNodeTransportEvent::SessionOpened { session }) => break session,
-                Ok(_) => continue,
-                Err(_) => {
-                    return Err(LifecycleError::Io(
-                        "gRPC authority bridge closed before session opened".to_string(),
-                        io::Error::new(io::ErrorKind::Other, "event channel closed"),
-                    ))
-                }
-            }
-        };
+        let session_holder: Arc<Mutex<Option<ActiveGrpcNodeSession>>> = Arc::new(Mutex::new(None));
+        let worker_session_holder = session_holder.clone();
 
-        let active_session =
-            ActiveGrpcNodeSession::new(session, authority_sink).map_err(|error| {
-                LifecycleError::Io(
-                    "failed to create active gRPC node session for authority bridge".to_string(),
-                    error,
-                )
+        thread::Builder::new()
+            .name("grpc-bridge".into())
+            .spawn(move || {
+                let session = loop {
+                    match event_rx.recv() {
+                        Ok(RemoteNodeTransportEvent::SessionOpened { session }) => break session,
+                        Ok(_) => continue,
+                        Err(_) => return,
+                    }
+                };
+                match ActiveGrpcNodeSession::new(session, authority_sink) {
+                    Ok(active_session) => {
+                        *worker_session_holder.lock().expect("gRPC bridge mutex") =
+                            Some(active_session);
+                    }
+                    Err(error) => {
+                        super::remote_main_slot_runtime::log_diagnostic(format_args!(
+                            "gRPC bridge: failed to create active session: {error}"
+                        ));
+                    }
+                }
+            })
+            .map_err(|error| {
+                LifecycleError::Io("failed to spawn gRPC bridge thread".to_string(), error)
             })?;
 
         Ok(Some(GrpcAuthorityBridgeGuard {
             _transport_guard: transport_guard,
-            _session: active_session,
+            _session_holder: session_holder,
         }))
     }
 }
@@ -188,7 +202,7 @@ impl RemoteNodePublicationSink for LiveRemotePublicationSink {
 
 pub(crate) struct GrpcAuthorityBridgeGuard {
     _transport_guard: crate::infra::remote_grpc_transport::GrpcRemoteNodeTransportGuard,
-    _session: ActiveGrpcNodeSession,
+    _session_holder: Arc<Mutex<Option<ActiveGrpcNodeSession>>>,
 }
 
 fn extract_authority_id_from_target(target: &str) -> String {

@@ -118,8 +118,19 @@ pub(super) fn activate_surface_target_with_mode(
     Ok((binding, raw))
 }
 
-pub(super) fn should_draw_remote_snapshot(binding: Option<&RemoteAttachmentBinding>) -> bool {
+pub(super) fn should_draw_remote_snapshot(
+    binding: Option<&RemoteAttachmentBinding>,
+    snapshot: &RemoteObserverSnapshot,
+    authority_status: &AuthorityTransportStatus,
+) -> bool {
+    // Draw placeholder when there's no active raw PTY binding,
+    // or when we're still waiting for initial authority data.
     binding.is_none()
+        || (!snapshot.has_visible_output
+            && matches!(
+                authority_status,
+                AuthorityTransportStatus::WaitingForRemoteAuthority
+            ))
 }
 
 pub(super) fn write_remote_raw_output(bytes: &[u8]) -> Result<(), LifecycleError> {

@@ -291,7 +291,11 @@ impl RemoteMainSlotPaneRuntime {
             let mut reconnecting_since: Option<Instant> = None;
             let mut reconnect_animation_frame: u8 = 0;
 
-            if should_draw_remote_snapshot(binding.as_ref()) {
+            if should_draw_remote_snapshot(
+                binding.as_ref(),
+                &observer.snapshot(),
+                &authority_status,
+            ) {
                 let _ = observer.sync();
                 draw_remote_snapshot(
                     &terminal,

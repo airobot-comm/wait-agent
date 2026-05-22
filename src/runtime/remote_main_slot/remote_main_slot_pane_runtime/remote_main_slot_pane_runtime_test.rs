@@ -35,10 +35,11 @@ mod tests {
     use crate::runtime::remote_main_slot_runtime::RemoteControlPlaneTransportError;
     use crate::runtime::remote_main_slot_runtime::RemoteMainSlotRuntime;
     use crate::runtime::remote_observer_runtime::RemoteObserverRuntime;
+    use crate::runtime::remote_observer_runtime::RemoteObserverSnapshot;
     use crate::runtime::remote_transport_runtime::{
         RemoteConnectionRegistry, RemoteControlPlaneConnection,
     };
-    use crate::terminal::{TerminalEngine, TerminalSize};
+    use crate::terminal::{ScreenSnapshot, ScreenState, TerminalEngine, TerminalSize};
     use std::fs;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
@@ -97,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_remote_draws_placeholder_until_target_is_bound() {
+    fn raw_remote_draws_placeholder_until_content_appears() {
         let binding = RemoteAttachmentBinding {
             session_id: "shell-1".to_string(),
             target_id: "remote-peer:peer-a:shell-1".to_string(),
@@ -105,8 +106,69 @@ mod tests {
             console_id: "console-a".to_string(),
         };
 
-        assert!(should_draw_remote_snapshot(None));
-        assert!(!should_draw_remote_snapshot(Some(&binding)));
+        let snapshot = empty_snapshot();
+
+        let waiting = AuthorityTransportStatus::WaitingForRemoteAuthority;
+        let connected = AuthorityTransportStatus::Connected;
+
+        // No binding → always draw placeholder
+        assert!(should_draw_remote_snapshot(None, &snapshot, &waiting));
+
+        // Binding but no visible output + waiting → draw placeholder (no black screen)
+        assert!(should_draw_remote_snapshot(
+            Some(&binding),
+            &snapshot,
+            &waiting
+        ));
+
+        // Binding, no visible output, but connected → don't draw (raw PTY handles it)
+        assert!(!should_draw_remote_snapshot(
+            Some(&binding),
+            &snapshot,
+            &connected
+        ));
+    }
+
+    fn empty_snapshot() -> RemoteObserverSnapshot {
+        let empty_screen = ScreenSnapshot {
+            size: TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            lines: Vec::new(),
+            styled_lines: Vec::new(),
+            active_style_ansi: String::new(),
+            scrollback: Vec::new(),
+            styled_scrollback: Vec::new(),
+            scroll_top: 0,
+            scroll_bottom: 24,
+            window_title: None,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            alternate_screen: false,
+        };
+        RemoteObserverSnapshot {
+            session_id: None,
+            target_id: None,
+            attachment_id: None,
+            console_id: None,
+            availability: None,
+            resize_epoch: None,
+            resize_authority_console_id: None,
+            resize_authority_host_id: None,
+            last_output_seq: None,
+            has_visible_output: false,
+            bootstrap_complete: false,
+            screen: ScreenState {
+                normal: empty_screen.clone(),
+                alternate: empty_screen,
+                alternate_screen_active: false,
+                application_cursor_keys: false,
+            },
+        }
     }
 
     #[test]
