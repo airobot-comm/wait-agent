@@ -15,7 +15,6 @@ use crate::runtime::remote_node_session_runtime::{
     RemoteNodePublicationSink, RemoteNodeSessionError,
 };
 use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
-use std::io;
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -117,6 +116,10 @@ impl RemoteMainSlotIngressRuntime {
     /// gRPC and bridges all session events (mirror bootstrap, target output,
     /// etc.) into the authority stream queue. Returns immediately so the
     /// caller can start the pane UI without delay.
+    ///
+    /// Both the `connect_outbound()` call (which blocks on TCP+gRPC handshake)
+    /// and the subsequent event-processing loop run inside the background thread,
+    /// preventing UI startup from being blocked by network timeouts.
     fn spawn_background_grpc_bridge(
         &self,
         authority_id: String,
@@ -129,39 +132,38 @@ impl RemoteMainSlotIngressRuntime {
             return Ok(None);
         }
 
-        let transport = GrpcRemoteNodeTransport::new();
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let transport_guard = transport
-            .connect_outbound(
-                OutboundNodeSessionRequest {
-                    node_id: authority_id.clone(),
-                    endpoint_uri,
-                },
-                event_tx,
-            )
-            .map_err(|error| {
-                LifecycleError::Io(
-                    "failed to connect gRPC authority bridge to remote node".to_string(),
-                    io::Error::new(io::ErrorKind::Other, error.to_string()),
-                )
-            })?;
-
         thread::Builder::new()
             .name("grpc-bridge".into())
             .spawn(move || {
-                run_grpc_node_ingress_worker(
-                    event_rx,
-                    authority_sink,
-                    Arc::new(NoopPublicationSink),
-                );
+                let transport = GrpcRemoteNodeTransport::new();
+                let (event_tx, event_rx) = std::sync::mpsc::channel();
+
+                match transport.connect_outbound(
+                    OutboundNodeSessionRequest {
+                        node_id: authority_id,
+                        endpoint_uri,
+                    },
+                    event_tx,
+                ) {
+                    Ok(_transport_guard) => {
+                        run_grpc_node_ingress_worker(
+                            event_rx,
+                            authority_sink,
+                            Arc::new(NoopPublicationSink),
+                        );
+                        // transport_guard dropped here — signals gRPC shutdown
+                    }
+                    Err(_) => {
+                        // Connection to remote authority failed.
+                        // UI is already running, so no error propagation needed.
+                    }
+                }
             })
             .map_err(|error| {
                 LifecycleError::Io("failed to spawn gRPC bridge thread".to_string(), error)
             })?;
 
-        Ok(Some(GrpcAuthorityBridgeGuard {
-            _transport_guard: transport_guard,
-        }))
+        Ok(Some(GrpcAuthorityBridgeGuard))
     }
 }
 
@@ -183,9 +185,7 @@ impl RemoteNodePublicationSink for LiveRemotePublicationSink {
     }
 }
 
-pub(crate) struct GrpcAuthorityBridgeGuard {
-    _transport_guard: crate::infra::remote_grpc_transport::GrpcRemoteNodeTransportGuard,
-}
+pub(crate) struct GrpcAuthorityBridgeGuard;
 
 struct NoopPublicationSink;
 

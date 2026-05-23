@@ -94,29 +94,48 @@ impl EventDrivenPaneRuntime {
             match event {
                 PaneEvent::Input(bytes) => {
                     let outcome = chrome.apply_sidebar_input(&bytes);
-                    redraw_sidebar(outcome.render, &mut last_buffer)?;
+                    if let Err(error) = redraw_sidebar(outcome.render, &mut last_buffer) {
+                        ERROR_LOG.log(format!("[diag] sidebar redraw error on input: {error}"));
+                    }
                     if let Some(activation) = outcome.activation {
                         ERROR_LOG.log(format!("[diag] sidebar input: activation={:?}", activation));
-                        self.apply_sidebar_activation(&command, activation)?;
+                        if let Err(error) = self.apply_sidebar_activation(&command, activation) {
+                            ERROR_LOG.log(format!("[diag] sidebar activation error: {error}"));
+                        }
                     }
                 }
                 PaneEvent::Resize => {
-                    redraw_sidebar(
-                        chrome.refresh_sidebar_for_pane(
-                            &command,
-                            pane_target.as_deref().unwrap_or(""),
-                        )?,
-                        &mut last_buffer,
-                    )?;
+                    match chrome
+                        .refresh_sidebar_for_pane(&command, pane_target.as_deref().unwrap_or(""))
+                    {
+                        Ok(update) => {
+                            if let Err(error) = redraw_sidebar(update, &mut last_buffer) {
+                                ERROR_LOG
+                                    .log(format!("[diag] sidebar redraw error on resize: {error}"));
+                            }
+                        }
+                        Err(error) => {
+                            ERROR_LOG
+                                .log(format!("[diag] sidebar refresh error on resize: {error}"));
+                        }
+                    }
                 }
                 PaneEvent::Refresh => loop {
-                    redraw_sidebar(
-                        chrome.refresh_sidebar_for_pane(
-                            &command,
-                            pane_target.as_deref().unwrap_or(""),
-                        )?,
-                        &mut last_buffer,
-                    )?;
+                    match chrome
+                        .refresh_sidebar_for_pane(&command, pane_target.as_deref().unwrap_or(""))
+                    {
+                        Ok(update) => {
+                            if let Err(error) = redraw_sidebar(update, &mut last_buffer) {
+                                ERROR_LOG.log(format!(
+                                    "[diag] sidebar redraw error on refresh: {error}"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            ERROR_LOG
+                                .log(format!("[diag] sidebar refresh error on refresh: {error}"));
+                        }
+                    }
                     if pending_refreshes.swap(0, Ordering::AcqRel) <= 1 {
                         break;
                     }

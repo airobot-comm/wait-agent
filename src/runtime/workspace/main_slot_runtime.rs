@@ -478,6 +478,25 @@ impl MainSlotRuntime {
             target_id
         ));
 
+        // Move the leftover 1-cell pane to a detached helper window so the
+        // process stays alive but the workspace layout stays clean. After
+        // swap_panes, workspace_main_pane holds the old content at the 1-cell
+        // position where split_pane_bottom created the session pane.
+        let _ = self.backend.run_on_socket(
+            &workspace.socket_name,
+            &[
+                "break-pane".to_string(),
+                "-d".to_string(),
+                "-s".to_string(),
+                workspace_main_pane.as_str().to_string(),
+                "-n".to_string(),
+                format!(
+                    "wa-orphan-{}",
+                    workspace_main_pane.as_str().trim_start_matches('%')
+                ),
+            ],
+        );
+
         self.set_workspace_main_pane(&workspace, &session_pane)?;
         ERROR_LOG.log(format!(
             "[diag][{}] set_workspace_main_pane done, setting active_target",
