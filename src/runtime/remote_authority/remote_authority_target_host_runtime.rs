@@ -1042,12 +1042,6 @@ where
         .gateway
         .resize_pty(&command.socket_name, pane, payload.cols, payload.rows)
         .map_err(remote_authority_error)?;
-    // Trigger bash to produce output *before* pipe-pane is set up so the
-    // pipe has data to send when the output pump starts reading stdin.
-    // Without this, pipe-pane -O sends immediate EOF for an empty pane.
-    let _ = runtime
-        .gateway
-        .send_keys_to_pane(&command.socket_name, pane, "\n");
     runtime
         .gateway
         .set_output_pipe(&command.socket_name, pane, &pipe_command)
