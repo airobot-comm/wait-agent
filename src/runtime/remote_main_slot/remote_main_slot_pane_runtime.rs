@@ -634,6 +634,10 @@ impl RemoteMainSlotPaneRuntime {
                                 .sync_and_collect_raw()
                                 .map_err(remote_protocol_error)?;
                             if !output.is_empty() {
+                                ERROR_LOG.log(format!(
+                                    "[diag-timing] Envelope drain: writing {} bytes to pane",
+                                    output.len()
+                                ));
                                 write_remote_raw_output_with_initial_clear(
                                     &output,
                                     &mut raw_screen_initialized,

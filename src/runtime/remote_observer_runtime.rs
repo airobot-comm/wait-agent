@@ -1,3 +1,4 @@
+use crate::infra::error_log::ERROR_LOG;
 use crate::infra::remote_protocol::{ControlPlanePayload, ProtocolEnvelope};
 use crate::runtime::remote_transport_runtime::LocalNodeMailbox;
 use crate::terminal::{ScreenSnapshot, ScreenState, TerminalEngine, TerminalSize};
@@ -80,6 +81,10 @@ impl RemoteObserverRuntime {
     pub fn sync(&mut self) -> Result<usize, RemoteObserverRuntimeError> {
         let envelopes = self.mailbox.snapshot_from(self.processed_envelopes);
         for envelope in &envelopes {
+            ERROR_LOG.log(format!(
+                "[diag-timing] observer sync: processing envelope type={}",
+                envelope.payload.message_type()
+            ));
             self.apply_envelope(envelope)?;
         }
         self.processed_envelopes += envelopes.len();

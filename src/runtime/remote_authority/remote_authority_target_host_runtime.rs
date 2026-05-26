@@ -1015,7 +1015,7 @@ fn pump_capture_pane_to_ingest_socket(
             .to_string(),
     );
     let tmux_bin = tmux_binary_path();
-    let mut last_content = String::new();
+    let mut last_text = String::new();
     loop {
         let output = std::process::Command::new(&tmux_bin)
             .args([
@@ -1023,10 +1023,9 @@ fn pump_capture_pane_to_ingest_socket(
                 &tmux_socket_path(socket_name),
                 "capture-pane",
                 "-p",
+                "-e",
                 "-t",
                 pane,
-                "-S",
-                "-",
             ])
             .output()
             .map_err(|e| RemoteAuthorityHostError::new(format!("capture-pane failed: {e}")))?;
@@ -1035,31 +1034,73 @@ fn pump_capture_pane_to_ingest_socket(
             continue;
         }
         let content = String::from_utf8_lossy(&output.stdout).into_owned();
-        if content != last_content {
-            // Send only the changed lines as output
-            let new_bytes = extract_new_output(&last_content, &content);
-            if !new_bytes.is_empty() {
+        // Compare text content (strip ANSI) to detect changes, but send
+        // the full ANSI-included capture for correct terminal rendering.
+        let text = strip_ansi_escape_sequences(&content);
+        if text != last_text {
+            let full_bytes = content.as_bytes().to_vec();
+            if !full_bytes.is_empty() {
                 ERROR_LOG.log(format!(
                     "[diag-timing] output pump: capture detected change, sending {} bytes",
-                    new_bytes.len()
+                    full_bytes.len()
                 ));
-                write_output_chunk_frame(&mut stream, &new_bytes)?;
+                write_output_chunk_frame(&mut stream, &full_bytes)?;
             }
-            last_content = content;
+            last_text = text;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-/// Returns the first n bytes of `current` that differ from `previous`,
-/// skipping any common prefix.
-fn extract_new_output(previous: &str, current: &str) -> Vec<u8> {
-    let common_len = previous
-        .chars()
-        .zip(current.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    current[common_len..].as_bytes().to_vec()
+/// Strips ANSI escape sequences (CSI, OSC, etc.) from a string, returning
+/// only the visible text content. Used to compare screen captures for changes.
+fn strip_ansi_escape_sequences(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip the ESC and the following sequence
+            if let Some(&next) = chars.peek() {
+                if next == '[' {
+                    chars.next(); // consume '['
+                                  // Skip until we find a letter (the terminator)
+                    while let Some(&p) = chars.peek() {
+                        if p.is_ascii_alphabetic() || p == '~' {
+                            chars.next(); // consume terminator
+                            break;
+                        }
+                        chars.next();
+                    }
+                } else if next == ']' {
+                    chars.next(); // consume ']'
+                                  // OSC sequence ends with BEL (\x07) or ST (\x1b\\)
+                    while let Some(&p) = chars.peek() {
+                        if p == '\x07' || p == '\x1b' {
+                            if p == '\x1b' {
+                                chars.next(); // ESC
+                                chars.next(); // '\\'
+                            } else {
+                                chars.next(); // BEL
+                            }
+                            break;
+                        }
+                        chars.next();
+                    }
+                } else {
+                    // Other escape types, skip ESC
+                }
+            }
+        } else if c == '\r' {
+            // Normalize \r\n to \n
+            if chars.peek() == Some(&'\n') {
+                result.push('\n');
+                chars.next();
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Path to the vendored tmux binary in the waitagent data directory.
