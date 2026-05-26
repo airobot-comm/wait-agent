@@ -1034,16 +1034,17 @@ fn pump_capture_pane_to_ingest_socket(
         }
         let content = String::from_utf8_lossy(&output.stdout).into_owned();
         if content != last_text {
-            let new_bytes = extract_new_output(&last_text, &content);
-            if !new_bytes.is_empty() {
-                ERROR_LOG.log(format!(
-                    "[diag-timing] output pump: capture detected change, sending {} bytes",
-                    new_bytes.len()
-                ));
-                // Prepend \r\n so output starts on a fresh line on the client.
-                let framed: Vec<u8> = b"\r\n".iter().chain(&new_bytes).cloned().collect();
-                write_output_chunk_frame(&mut stream, &framed)?;
-            }
+            // Send the full screen content so the client terminal engine
+            // can redraw everything correctly.  Prepend clear-screen and
+            // cursor-home so the output replaces the previous frame rather
+            // than appending at an unpredictable cursor position.
+            let esc = b"\x1b[2J\x1b[H";
+            let payload: Vec<u8> = esc.iter().chain(content.as_bytes()).cloned().collect();
+            ERROR_LOG.log(format!(
+                "[diag-timing] output pump: capture detected change, sending {} bytes",
+                payload.len()
+            ));
+            write_output_chunk_frame(&mut stream, &payload)?;
             last_text = content;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
