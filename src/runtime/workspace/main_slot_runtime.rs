@@ -507,6 +507,10 @@ impl MainSlotRuntime {
                 t_before_swap.elapsed()
             ));
 
+            // Select the session pane so keyboard focus follows the swap.
+            // Without this, keystrokes may still land on the previous pane.
+            let _ = self.backend.select_pane(&workspace, &session_pane);
+
             // Move the leftover 1-cell pane to a detached helper window so
             // the process stays alive but the workspace layout stays clean.
             // After swap_panes, workspace_main_pane holds the old content at
