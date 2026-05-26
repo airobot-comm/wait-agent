@@ -3,8 +3,9 @@ use crate::infra::remote_grpc_proto::v1::node_session_envelope::Body;
 use crate::infra::remote_grpc_proto::v1::{
     ApplyPtyResize, CloseMirrorRequest, MirrorBootstrapChunk, MirrorBootstrapComplete,
     NodeSessionEnvelope as GrpcNodeSessionEnvelope, OpenMirrorAccepted, OpenMirrorRejected,
-    OpenMirrorRequest, RawPtyInput, RouteContext, TargetExited as GrpcTargetExited,
-    TargetOutput as GrpcTargetOutput, TargetPublished as GrpcTargetPublished,
+    OpenMirrorRequest, RawPtyInput, RawPtyOutput as GrpcRawPtyOutput, RouteContext,
+    TargetExited as GrpcTargetExited, TargetOutput as GrpcTargetOutput,
+    TargetPublished as GrpcTargetPublished,
 };
 use crate::infra::remote_grpc_transport::{
     GrpcRemoteNodeTransport, GrpcRemoteNodeTransportGuard, RemoteNodeSessionHandle,
@@ -13,8 +14,8 @@ use crate::infra::remote_grpc_transport::{
 use crate::infra::remote_protocol::{
     BootstrapMode, CloseMirrorRequestPayload, ControlPlanePayload, MirrorBootstrapChunkPayload,
     MirrorBootstrapCompletePayload, OpenMirrorAcceptedPayload, OpenMirrorRejectedPayload,
-    OpenMirrorRequestPayload, ProtocolEnvelope, TargetExitedPayload, TargetOutputPayload,
-    TargetPublishedPayload, REMOTE_PROTOCOL_VERSION,
+    OpenMirrorRequestPayload, ProtocolEnvelope, RawPtyOutputPayload, TargetExitedPayload,
+    TargetOutputPayload, TargetPublishedPayload, REMOTE_PROTOCOL_VERSION,
 };
 use crate::infra::remote_transport_codec::{
     read_authority_transport_frame, write_authority_transport_frame, write_control_plane_envelope,
@@ -314,6 +315,34 @@ pub(crate) fn route_grpc_envelope(
             })?;
             session
                 .write_authority_envelope(&map_target_output_envelope(node_id, &envelope, payload)?)
+        }
+        Some(Body::RawPtyOutput(payload)) => {
+            let session = session.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("grpc authority session `{node_id}` is not registered"),
+                )
+            })?;
+            session.write_authority_envelope(&ProtocolEnvelope {
+                protocol_version: REMOTE_PROTOCOL_VERSION.to_string(),
+                message_id: envelope.message_id.clone(),
+                message_type: "raw_pty_output",
+                timestamp: timestamp_string(&envelope),
+                sender_id: node_id.to_string(),
+                correlation_id: envelope.correlation_id.clone(),
+                session_id: route_session_id(&envelope)
+                    .or_else(|| grpc_payload_session_id(&payload.session_id, &payload.target_id)),
+                target_id: route_target_id(&envelope).or_else(|| Some(payload.target_id.clone())),
+                attachment_id: route_attachment_id(&envelope),
+                console_id: route_console_id(&envelope),
+                payload: ControlPlanePayload::RawPtyOutput(RawPtyOutputPayload {
+                    session_id: grpc_payload_session_id(&payload.session_id, &payload.target_id)
+                        .unwrap_or_else(|| payload.target_id.clone()),
+                    target_id: payload.target_id.clone(),
+                    output_seq: payload.output_seq,
+                    output_bytes: payload.output_bytes.clone(),
+                }),
+            })
         }
         Some(Body::MirrorBootstrapChunk(payload)) => {
             let session = session.ok_or_else(|| {

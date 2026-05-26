@@ -490,6 +490,13 @@ where
         let sender_transport = transport.clone();
         let output_sender_thread = thread::spawn(move || {
             while let Ok(msg) = output_rx.recv() {
+                ERROR_LOG.log(format!(
+                    "[diag-timing] target host: output sender sending (seq={})",
+                    match &msg {
+                        AuthorityOutputMessage::RawPtyOutput { output_seq, .. } => *output_seq,
+                        AuthorityOutputMessage::TargetOutput { output_seq, .. } => *output_seq,
+                    }
+                ));
                 let result = match msg {
                     AuthorityOutputMessage::RawPtyOutput {
                         session_id,
@@ -517,7 +524,9 @@ where
                     ),
                 };
                 if let Err(error) = result {
-                    eprintln!("[authority] output send error: {error}");
+                    ERROR_LOG.log(format!(
+                        "[diag-timing] target host: output sender send error: {error}"
+                    ));
                 }
             }
         });
@@ -718,28 +727,25 @@ where
                 AuthorityHostEvent::OutputChunk(bytes) => {
                     health.record_event();
                     health.record_output();
-                    let raw_pty_passthrough = match mirror_state {
-                        MirrorState::Inactive => continue,
-                        MirrorState::Active {
-                            raw_pty_passthrough,
-                        } => raw_pty_passthrough,
+                    ERROR_LOG.log(format!(
+                        "[diag-timing] target host: received OutputChunk ({} bytes)",
+                        bytes.len()
+                    ));
+                    if matches!(mirror_state, MirrorState::Inactive) {
+                        continue;
                     };
                     output_seq += 1;
-                    let msg = if raw_pty_passthrough {
-                        AuthorityOutputMessage::RawPtyOutput {
-                            session_id: command.transport_session_id.clone(),
-                            target_id: command.target_id.clone(),
-                            output_seq,
-                            bytes,
-                        }
-                    } else {
-                        AuthorityOutputMessage::TargetOutput {
-                            session_id: command.transport_session_id.clone(),
-                            target_id: command.target_id.clone(),
-                            output_seq,
-                            stream: "pty",
-                            bytes,
-                        }
+                    // Always use TargetOutput: capture-pane produces plain text
+                    // that needs terminal-engine interpretation on the client.
+                    // RawPtyOutput bypasses the observer and writes directly,
+                    // which works for ANSI-formatted PTY streams but not for
+                    // the plain-text diff produced by extract_new_output.
+                    let msg = AuthorityOutputMessage::TargetOutput {
+                        session_id: command.transport_session_id.clone(),
+                        target_id: command.target_id.clone(),
+                        output_seq,
+                        stream: "pty",
+                        bytes,
                     };
                     // Blocking send ensures output frames are never silently
                     // dropped. Backpressure propagates to the PTY capture
@@ -941,12 +947,20 @@ fn spawn_output_ingest_thread(
                 Ok((mut stream, _)) => loop {
                     match read_output_chunk_frame(&mut stream) {
                         Ok(bytes) => {
+                            ERROR_LOG.log(format!(
+                                "[diag-timing] ingest thread: received chunk ({} bytes)",
+                                bytes.len()
+                            ));
                             if tx.send(AuthorityHostEvent::OutputChunk(bytes)).is_err() {
                                 return;
                             }
                         }
                         Err(error) if error.is_unexpected_eof() => break,
-                        Err(_) => break,
+                        Err(error) => {
+                            ERROR_LOG
+                                .log(format!("[diag-timing] ingest thread: read error: {error}"));
+                            break;
+                        }
                     }
                 },
                 Err(_) => break,
