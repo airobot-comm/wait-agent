@@ -230,7 +230,7 @@ fn utf8_char_width(byte: u8) -> Option<usize> {
     }
 }
 
-fn send_literal_keys_args(pane: &TmuxPaneId, literal: &str) -> Vec<String> {
+pub(crate) fn send_literal_keys_args(pane: &TmuxPaneId, literal: &str) -> Vec<String> {
     vec![
         "send-keys".to_string(),
         "-l".to_string(),

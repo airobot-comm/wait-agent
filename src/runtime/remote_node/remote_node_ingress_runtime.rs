@@ -639,6 +639,10 @@ fn forward_local_authority_outbound(
             AuthorityTransportFrame::RawPtyInput(payload) => {
                 // Raw input from the stdin fast path — convert to a gRPC
                 // RawPtyInput envelope and forward to the authority.
+                ERROR_LOG.log(format!(
+                    "[diag-timing] forwarder: forwarding RawPtyInput ({} bytes)",
+                    payload.input_bytes.len()
+                ));
                 let ts = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()

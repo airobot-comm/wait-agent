@@ -131,6 +131,15 @@ mod tests {
                 .push(command.to_string());
             Ok(())
         }
+
+        fn send_keys_to_pane(
+            &self,
+            _socket_name: &str,
+            _pane: &TmuxPaneId,
+            _keys: &str,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     struct FakeLiveSession {

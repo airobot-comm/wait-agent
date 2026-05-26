@@ -2,7 +2,8 @@ use crate::cli::{
     prepend_global_network_args, RemoteAuthorityOutputPumpCommand,
     RemoteAuthorityTargetHostCommand, RemoteNetworkConfig,
 };
-use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError, TmuxPaneId};
+use crate::infra::error_log::ERROR_LOG;
+use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError, TmuxPaneId, TmuxSocketName};
 use crate::lifecycle::LifecycleError;
 use crate::runtime::remote_authority_transport_runtime::{
     RemoteAuthorityCommand, RemoteAuthorityTransportRuntime,
@@ -209,6 +210,13 @@ pub trait RemoteTargetPtyGateway: Send + Sync + Clone + 'static {
         pane: &TmuxPaneId,
         command: &str,
     ) -> Result<(), Self::Error>;
+
+    fn send_keys_to_pane(
+        &self,
+        socket_name: &str,
+        pane: &TmuxPaneId,
+        keys: &str,
+    ) -> Result<(), Self::Error>;
 }
 
 impl RemoteTargetPtyGateway for EmbeddedTmuxBackend {
@@ -272,6 +280,25 @@ impl RemoteTargetPtyGateway for EmbeddedTmuxBackend {
         command: &str,
     ) -> Result<(), Self::Error> {
         self.set_pane_pipe_on_socket(socket_name, pane, command)
+    }
+
+    fn send_keys_to_pane(
+        &self,
+        socket_name: &str,
+        pane: &TmuxPaneId,
+        keys: &str,
+    ) -> Result<(), Self::Error> {
+        self.run_on_socket(
+            &TmuxSocketName::new(socket_name),
+            &[
+                "send-keys".to_string(),
+                "-l".to_string(),
+                "-t".to_string(),
+                pane.as_str().to_string(),
+                keys.to_string(),
+            ],
+        )
+        .map(|_| ())
     }
 }
 
@@ -519,11 +546,19 @@ where
             if !pending_input.is_empty() {
                 match input_fifo.write(&pending_input) {
                     Ok(n) if n > 0 => {
+                        ERROR_LOG.log(format!(
+                            "[diag-timing] target host: fifo wrote {} bytes (was pending {})",
+                            n,
+                            pending_input.len()
+                        ));
                         pending_input.drain(..n);
                         health.record_input(n as u64);
                     }
                     Ok(_) => {} // no progress, retry next iteration
                     Err(error) => {
+                        ERROR_LOG.log(format!(
+                            "[diag-timing] target host: fifo write error: {error}"
+                        ));
                         break Err(remote_authority_error(error));
                     }
                 }
@@ -645,15 +680,15 @@ where
                     payload,
                 )) => {
                     health.record_event();
-                    // Buffer input to the ring buffer. The blocking FIFO
-                    // write at the top of each loop iteration drains it.
-                    // If the buffer exceeds 256KiB, skip incoming bytes
-                    // rather than dropping already-buffered data (which
-                    // would corrupt the input stream ordering).
                     const PENDING_INPUT_MAX: usize = 256 * 1024;
                     let input = &payload.input_bytes;
                     if pending_input.len() + input.len() <= PENDING_INPUT_MAX {
                         pending_input.extend_from_slice(input);
+                        ERROR_LOG.log(format!(
+                            "[diag-timing] target host: buffered RawPtyInput ({} bytes), pending={}",
+                            input.len(),
+                            pending_input.len()
+                        ));
                     }
                 }
                 AuthorityHostEvent::TransportCommand(RemoteAuthorityCommand::ApplyResize(
@@ -796,6 +831,10 @@ pub(crate) fn remote_authority_target_host_args(
 
 impl RemoteAuthorityOutputPumpRuntime {
     pub fn run(command: RemoteAuthorityOutputPumpCommand) -> Result<(), LifecycleError> {
+        ERROR_LOG.log(format!(
+            "[diag-timing] output pump: starting, ingest={}, fifo={}",
+            command.ingest_socket_path, command.input_fifo_path
+        ));
         let input_fifo_path = command.input_fifo_path.clone();
         let input_thread = thread::spawn(move || -> Result<(), RemoteAuthorityHostError> {
             let mut fifo = OpenOptions::new().read(true).open(input_fifo_path)?;
@@ -898,11 +937,21 @@ fn pump_reader_to_ingest_socket(
     mut reader: impl Read,
     ingest_socket_path: &str,
 ) -> Result<(), RemoteAuthorityHostError> {
-    let mut stream = UnixStream::connect(ingest_socket_path)?;
+    let mut stream = UnixStream::connect(ingest_socket_path).map_err(|e| {
+        ERROR_LOG.log(format!(
+            "[diag-timing] output pump: UnixStream::connect({}) failed: {e}",
+            ingest_socket_path
+        ));
+        e
+    })?;
+    ERROR_LOG.log(format!(
+        "[diag-timing] output pump: connected to ingest socket, starting pump loop"
+    ));
     let mut buffer = [0_u8; 4096];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
+            ERROR_LOG.log("[diag-timing] output pump: stdin EOF, exiting pump loop".to_string());
             break;
         }
         write_output_chunk_frame(&mut stream, &buffer[..read])?;
@@ -993,6 +1042,12 @@ where
         .gateway
         .resize_pty(&command.socket_name, pane, payload.cols, payload.rows)
         .map_err(remote_authority_error)?;
+    // Trigger bash to produce output *before* pipe-pane is set up so the
+    // pipe has data to send when the output pump starts reading stdin.
+    // Without this, pipe-pane -O sends immediate EOF for an empty pane.
+    let _ = runtime
+        .gateway
+        .send_keys_to_pane(&command.socket_name, pane, "\n");
     runtime
         .gateway
         .set_output_pipe(&command.socket_name, pane, &pipe_command)
