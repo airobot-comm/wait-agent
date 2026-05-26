@@ -832,27 +832,49 @@ pub(crate) fn remote_authority_target_host_args(
 impl RemoteAuthorityOutputPumpRuntime {
     pub fn run(command: RemoteAuthorityOutputPumpCommand) -> Result<(), LifecycleError> {
         ERROR_LOG.log(format!(
-            "[diag-timing] output pump: starting, ingest={}, fifo={}",
-            command.ingest_socket_path, command.input_fifo_path
+            "[diag-timing] output pump: starting, ingest={}, fifo={}, socket={}, pane={}",
+            command.ingest_socket_path, command.input_fifo_path, command.socket_name, command.pane
         ));
         let input_fifo_path = command.input_fifo_path.clone();
+        let socket = command.socket_name.clone();
+        let pane = command.pane.clone();
+        let tmux_bin = tmux_binary_path();
+        let tmux_sock = tmux_socket_path(&socket);
         let input_thread = thread::spawn(move || -> Result<(), RemoteAuthorityHostError> {
-            let mut fifo = OpenOptions::new().read(true).open(input_fifo_path)?;
-            let mut stdout = io::stdout().lock();
+            let mut fifo = OpenOptions::new().read(true).open(&input_fifo_path)?;
             let mut buffer = [0_u8; 4096];
             loop {
                 let read = fifo.read(&mut buffer)?;
                 if read == 0 {
                     break;
                 }
-                stdout.write_all(&buffer[..read])?;
-                stdout.flush()?;
+                // Use send-keys to deliver input to the PTY.  pipe-pane -I is
+                // unreliable: if pipe-pane -O sends stdin EOF (empty pane),
+                // tmux may close the stdout pipe as well.
+                // send-keys -H expects each byte as a separate hex argument.
+                let mut args: Vec<String> = vec![
+                    "-S".to_string(),
+                    tmux_sock.clone(),
+                    "send-keys".to_string(),
+                    "-H".to_string(),
+                    "-t".to_string(),
+                    pane.clone(),
+                ];
+                for b in &buffer[..read] {
+                    args.push(format!("{b:02x}"));
+                }
+                let result = std::process::Command::new(&tmux_bin).args(&args).output();
+                if let Err(e) = result {
+                    ERROR_LOG.log(format!("[diag-timing] output pump: send-keys failed: {e}"));
+                    break;
+                }
             }
             Ok(())
         });
 
-        let stdin = io::stdin();
-        let pump_result = pump_reader_to_ingest_socket(stdin.lock(), &command.ingest_socket_path);
+        let ingest = command.ingest_socket_path.clone();
+        let pump_result =
+            pump_capture_pane_to_ingest_socket(&ingest, &command.socket_name, &command.pane);
         match input_thread.join() {
             Ok(Ok(())) => {}
             Ok(Err(error)) if pump_result.is_ok() => return Err(remote_authority_error(error)),
@@ -959,6 +981,84 @@ fn pump_reader_to_ingest_socket(
     Ok(())
 }
 
+/// Polls `capture-pane` on the target pane and forwards output chunks to the
+/// ingest socket. Replaces the pipe-pane -O stdin approach which sends
+/// immediate EOF for an empty pane.
+fn pump_capture_pane_to_ingest_socket(
+    ingest_socket_path: &str,
+    socket_name: &str,
+    pane: &str,
+) -> Result<(), RemoteAuthorityHostError> {
+    let mut stream = UnixStream::connect(ingest_socket_path).map_err(|e| {
+        ERROR_LOG.log(format!(
+            "[diag-timing] output pump: UnixStream::connect({}) failed: {e}",
+            ingest_socket_path
+        ));
+        e
+    })?;
+    ERROR_LOG.log(
+        "[diag-timing] output pump: connected to ingest socket, starting capture-pane poll loop"
+            .to_string(),
+    );
+    let tmux_bin = tmux_binary_path();
+    let mut last_content = String::new();
+    loop {
+        let output = std::process::Command::new(&tmux_bin)
+            .args([
+                "-S",
+                &tmux_socket_path(socket_name),
+                "capture-pane",
+                "-p",
+                "-t",
+                pane,
+                "-S",
+                "-",
+            ])
+            .output()
+            .map_err(|e| RemoteAuthorityHostError::new(format!("capture-pane failed: {e}")))?;
+        if !output.status.success() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            continue;
+        }
+        let content = String::from_utf8_lossy(&output.stdout).into_owned();
+        if content != last_content {
+            // Send only the changed lines as output
+            let new_bytes = extract_new_output(&last_content, &content);
+            if !new_bytes.is_empty() {
+                ERROR_LOG.log(format!(
+                    "[diag-timing] output pump: capture detected change, sending {} bytes",
+                    new_bytes.len()
+                ));
+                write_output_chunk_frame(&mut stream, &new_bytes)?;
+            }
+            last_content = content;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Returns the first n bytes of `current` that differ from `previous`,
+/// skipping any common prefix.
+fn extract_new_output(previous: &str, current: &str) -> Vec<u8> {
+    let common_len = previous
+        .chars()
+        .zip(current.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    current[common_len..].as_bytes().to_vec()
+}
+
+/// Path to the vendored tmux binary in the waitagent data directory.
+fn tmux_binary_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".local/share/waitagent/tmux")
+}
+
+/// Path to the tmux socket for a waitagent workspace.
+fn tmux_socket_path(socket_name: &str) -> String {
+    format!("/tmp/tmux-1000/{socket_name}")
+}
+
 fn write_output_chunk_frame(
     writer: &mut impl Write,
     bytes: &[u8],
@@ -1004,6 +1104,8 @@ fn remote_authority_output_pump_shell_command(
     executable: &str,
     ingest_socket_path: &Path,
     input_fifo_path: &Path,
+    socket_name: &str,
+    pane: &str,
 ) -> String {
     [
         shell_escape(executable),
@@ -1012,6 +1114,10 @@ fn remote_authority_output_pump_shell_command(
         shell_escape(&ingest_socket_path.display().to_string()),
         shell_escape("--input-fifo-path"),
         shell_escape(&input_fifo_path.display().to_string()),
+        shell_escape("--socket-name"),
+        shell_escape(socket_name),
+        shell_escape("--pane"),
+        shell_escape(pane),
     ]
     .join(" ")
 }
@@ -1031,6 +1137,8 @@ where
         runtime.current_executable.to_string_lossy().as_ref(),
         ingest_socket_path,
         &authority_input_fifo_path(&command.transport_socket_path, &command.target_id),
+        &command.socket_name,
+        pane.as_str(),
     );
     runtime
         .gateway

@@ -205,6 +205,8 @@ pub struct RemoteAuthorityTargetHostCommand {
 pub struct RemoteAuthorityOutputPumpCommand {
     pub ingest_socket_path: String,
     pub input_fifo_path: String,
+    pub socket_name: String,
+    pub pane: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -753,6 +755,8 @@ fn parse_remote_authority_output_pump(
     let mut iter = args.into_iter();
     let mut ingest_socket_path = None;
     let mut input_fifo_path = None;
+    let mut socket_name = None;
+    let mut pane = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -762,6 +766,8 @@ fn parse_remote_authority_output_pump(
             "--input-fifo-path" => {
                 input_fifo_path = Some(expect_value("--input-fifo-path", &mut iter)?)
             }
+            "--socket-name" => socket_name = Some(expect_value("--socket-name", &mut iter)?),
+            "--pane" => pane = Some(expect_value("--pane", &mut iter)?),
             "--help" | "-h" => {}
             _ => return Err(CliError::UnexpectedArgument(arg)),
         }
@@ -772,6 +778,9 @@ fn parse_remote_authority_output_pump(
             .ok_or_else(|| CliError::MissingValue("--ingest-socket-path".to_string()))?,
         input_fifo_path: input_fifo_path
             .ok_or_else(|| CliError::MissingValue("--input-fifo-path".to_string()))?,
+        socket_name: socket_name
+            .ok_or_else(|| CliError::MissingValue("--socket-name".to_string()))?,
+        pane: pane.ok_or_else(|| CliError::MissingValue("--pane".to_string()))?,
     })
 }
 
