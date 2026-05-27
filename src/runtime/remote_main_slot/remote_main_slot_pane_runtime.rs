@@ -391,6 +391,11 @@ impl RemoteMainSlotPaneRuntime {
                                             .to_string(),
                                     );
                                 }
+                                let _ = std::io::Write::write_all(
+                                    &mut io::stdout(),
+                                    CLEAR_SCREEN_HOME_ESCAPE.as_bytes(),
+                                );
+                                let _ = std::io::Write::flush(&mut io::stdout());
                                 return Ok(());
                             }
                             reconnect_animation_frame = (reconnect_animation_frame + 1) % 8;
@@ -595,6 +600,13 @@ impl RemoteMainSlotPaneRuntime {
                                     "[diag-timing] Disconnected: target not in catalog, exiting cleanly"
                                         .to_string(),
                                 );
+                                // Clear the screen so tmux doesn't flash
+                                // "Pane is dead" before the workspace swap.
+                                let _ = std::io::Write::write_all(
+                                    &mut io::stdout(),
+                                    CLEAR_SCREEN_HOME_ESCAPE.as_bytes(),
+                                );
+                                let _ = std::io::Write::flush(&mut io::stdout());
                                 return Ok(());
                             }
                             authority_status = AuthorityTransportStatus::Disconnected;
@@ -661,6 +673,11 @@ impl RemoteMainSlotPaneRuntime {
                                         "[diag-timing] authority signalled session exit, shutting down"
                                             .to_string(),
                                     );
+                                    let _ = std::io::Write::write_all(
+                                        &mut io::stdout(),
+                                        CLEAR_SCREEN_HOME_ESCAPE.as_bytes(),
+                                    );
+                                    let _ = std::io::Write::flush(&mut io::stdout());
                                     return Ok(());
                                 }
                                 return Err(remote_protocol_error(e));
