@@ -590,20 +590,12 @@ impl RemoteMainSlotPaneRuntime {
                             // new raw PTY output, rather than writing on top
                             // of whatever draw_remote_snapshot left on screen.
                             raw_screen_initialized = false;
-                            // Keep binding and last content visible; start reconnecting
+                            // Keep binding and last content visible; start reconnecting.
+                            // Do NOT draw the reconnecting indicator yet — the target
+                            // may be exiting cleanly and we will detect that on the
+                            // next timeout before the user ever sees "reconnecting".
                             reconnecting_since = Some(Instant::now());
                             reconnect_animation_frame = 0;
-                            let _ = observer.sync();
-                            draw_remote_snapshot(
-                                &terminal,
-                                &target,
-                                binding.as_ref(),
-                                &observer.snapshot(),
-                                &authority_status,
-                                None,
-                                Some(Duration::ZERO),
-                                0,
-                            )?;
                         }
                         AuthorityTransportEvent::Failed(message) => {
                             authority_status = AuthorityTransportStatus::Failed(message);
