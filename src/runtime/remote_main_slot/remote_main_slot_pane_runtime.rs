@@ -624,8 +624,18 @@ impl RemoteMainSlotPaneRuntime {
                                 )?;
                                 continue;
                             }
-                            apply_authority_envelope(&remote_runtime, &target, &envelope)
-                                .map_err(remote_protocol_error)?;
+                            if let Err(e) =
+                                apply_authority_envelope(&remote_runtime, &target, &envelope)
+                            {
+                                if e.to_string().contains("session exit") {
+                                    ERROR_LOG.log(
+                                        "[diag-timing] authority signalled session exit, shutting down"
+                                            .to_string(),
+                                    );
+                                    return Ok(());
+                                }
+                                return Err(remote_protocol_error(e));
+                            }
                             // Drain observer mailbox immediately: the mailbox
                             // watcher may never fire because sync() below
                             // consumes envelopes via try_recv(), making the
@@ -658,6 +668,18 @@ impl RemoteMainSlotPaneRuntime {
                             }
                             // Connection is active; the false event is stale.
                             // Skip it — the next poll will send the correct state.
+                        }
+                        if !is_present && reconnecting_since.is_some() {
+                            // The target has disappeared while we are trying to
+                            // reconnect.  If no connection exists either, this is
+                            // a clean session exit, not a transient network blip.
+                            if !remote_runtime.has_connection(target.address.authority_id()) {
+                                ERROR_LOG.log(
+                                    "[diag-timing] target exited during reconnect, shutting down"
+                                        .to_string(),
+                                );
+                                return Ok(());
+                            }
                         }
                         if !is_present {
                             // During reconnect: target disappearance is a

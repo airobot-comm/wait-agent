@@ -738,6 +738,14 @@ pub(crate) fn apply_authority_envelope(
                 )
                 .map_err(|error| RemoteSocketTransportError::new(error.to_string()))
         }
+        ControlPlanePayload::TargetExited(_) => {
+            // Authority explicitly signalled session exit — return a
+            // distinguished error so the event loop can perform a clean
+            // shutdown instead of entering reconnection.
+            Err(RemoteSocketTransportError::new(
+                "authority signalled session exit",
+            ))
+        }
         other => Err(RemoteSocketTransportError::new(format!(
             "unexpected authority envelope payload `{}`",
             other.message_type()

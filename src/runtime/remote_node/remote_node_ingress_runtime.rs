@@ -483,6 +483,27 @@ pub(crate) fn route_grpc_envelope(
                 }),
             })
         }
+        Some(Body::TargetExited(payload)) => {
+            let Some(session) = session else {
+                return Ok(());
+            };
+            session.write_authority_envelope(&ProtocolEnvelope {
+                protocol_version: REMOTE_PROTOCOL_VERSION.to_string(),
+                message_id: envelope.message_id.clone(),
+                message_type: "target_exited",
+                timestamp: timestamp_string(&envelope),
+                sender_id: node_id.to_string(),
+                correlation_id: envelope.correlation_id.clone(),
+                session_id: None,
+                target_id: Some(payload.target_id.clone()),
+                attachment_id: None,
+                console_id: None,
+                payload: ControlPlanePayload::TargetExited(TargetExitedPayload {
+                    transport_session_id: payload.transport_session_id.clone(),
+                    source_session_name: None,
+                }),
+            })
+        }
         Some(Body::Heartbeat(_)) | Some(Body::ClientHello(_)) => Ok(()),
         _ => Ok(()),
     }
