@@ -737,9 +737,9 @@ where
                     output_seq += 1;
                     // Always use TargetOutput: capture-pane produces plain text
                     // that needs terminal-engine interpretation on the client.
-                    // RawPtyOutput bypasses the observer and writes directly,
-                    // which works for ANSI-formatted PTY streams but not for
-                    // the plain-text diff produced by extract_new_output.
+                    // RawPtyOutput carries raw PTY bytes streamed through
+                    // pipe-pane -O; TargetOutput carries full-screen captures
+                    // from the output pump.
                     let msg = AuthorityOutputMessage::TargetOutput {
                         session_id: command.transport_session_id.clone(),
                         target_id: command.target_id.clone(),
@@ -975,32 +975,6 @@ fn spawn_output_ingest_thread(
     })
 }
 
-fn pump_reader_to_ingest_socket(
-    mut reader: impl Read,
-    ingest_socket_path: &str,
-) -> Result<(), RemoteAuthorityHostError> {
-    let mut stream = UnixStream::connect(ingest_socket_path).map_err(|e| {
-        ERROR_LOG.log(format!(
-            "[diag-timing] output pump: UnixStream::connect({}) failed: {e}",
-            ingest_socket_path
-        ));
-        e
-    })?;
-    ERROR_LOG.log(format!(
-        "[diag-timing] output pump: connected to ingest socket, starting pump loop"
-    ));
-    let mut buffer = [0_u8; 4096];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            ERROR_LOG.log("[diag-timing] output pump: stdin EOF, exiting pump loop".to_string());
-            break;
-        }
-        write_output_chunk_frame(&mut stream, &buffer[..read])?;
-    }
-    Ok(())
-}
-
 /// Reads raw PTY output from stdin (piped via `pipe-pane -O`) and forwards
 /// it to the ingest socket.  This streams the terminal byte stream directly
 /// instead of polling `capture-pane`, so ANSI escape sequences, cursor
@@ -1040,118 +1014,6 @@ fn pump_stdin_to_ingest_socket(ingest_socket_path: &str) -> Result<(), RemoteAut
         }
     }
     Ok(())
-}
-
-/// Polls `capture-pane` on the target pane and forwards output chunks to the
-/// ingest socket.  Kept as dead code for reference; the active path uses
-/// `pump_stdin_to_ingest_socket` (pipe-pane -O).
-#[allow(dead_code)]
-fn pump_capture_pane_to_ingest_socket(
-    ingest_socket_path: &str,
-    socket_name: &str,
-    pane: &str,
-) -> Result<(), RemoteAuthorityHostError> {
-    let mut stream = UnixStream::connect(ingest_socket_path).map_err(|e| {
-        ERROR_LOG.log(format!(
-            "[diag-timing] output pump: UnixStream::connect({}) failed: {e}",
-            ingest_socket_path
-        ));
-        e
-    })?;
-    ERROR_LOG.log(
-        "[diag-timing] output pump: connected to ingest socket, starting capture-pane poll loop"
-            .to_string(),
-    );
-    let tmux_bin = tmux_binary_path();
-    let mut last_text = String::new();
-    loop {
-        let output = std::process::Command::new(&tmux_bin)
-            .args([
-                "-S",
-                &tmux_socket_path(socket_name),
-                "capture-pane",
-                "-e",
-                "-p",
-                "-t",
-                pane,
-            ])
-            .output()
-            .map_err(|e| RemoteAuthorityHostError::new(format!("capture-pane failed: {e}")))?;
-        if !output.status.success() {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            continue;
-        }
-        let content = String::from_utf8_lossy(&output.stdout).into_owned();
-        if content != last_text {
-            let esc = b"\x1b[2J\x1b[H";
-            let payload: Vec<u8> = esc.iter().chain(content.as_bytes()).cloned().collect();
-            write_output_chunk_frame(&mut stream, &payload)?;
-            last_text = content;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-/// Returns the suffix of `current` that differs from `previous`,
-/// skipping any common prefix. Used for plain-text diff of screen captures.
-fn extract_new_output(previous: &str, current: &str) -> Vec<u8> {
-    let common_len = previous
-        .chars()
-        .zip(current.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    current[common_len..].as_bytes().to_vec()
-}
-
-/// Strips ANSI escape sequences (CSI, OSC, etc.) from a string, returning
-/// only the visible text content. Used to compare screen captures for changes.
-fn strip_ansi_escape_sequences(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip the ESC and the following sequence
-            if let Some(&next) = chars.peek() {
-                if next == '[' {
-                    chars.next(); // consume '['
-                                  // Skip until we find a letter (the terminator)
-                    while let Some(&p) = chars.peek() {
-                        if p.is_ascii_alphabetic() || p == '~' {
-                            chars.next(); // consume terminator
-                            break;
-                        }
-                        chars.next();
-                    }
-                } else if next == ']' {
-                    chars.next(); // consume ']'
-                                  // OSC sequence ends with BEL (\x07) or ST (\x1b\\)
-                    while let Some(&p) = chars.peek() {
-                        if p == '\x07' || p == '\x1b' {
-                            if p == '\x1b' {
-                                chars.next(); // ESC
-                                chars.next(); // '\\'
-                            } else {
-                                chars.next(); // BEL
-                            }
-                            break;
-                        }
-                        chars.next();
-                    }
-                } else {
-                    // Other escape types, skip ESC
-                }
-            }
-        } else if c == '\r' {
-            // Normalize \r\n to \n
-            if chars.peek() == Some(&'\n') {
-                result.push('\n');
-                chars.next();
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }
 
 /// Path to the vendored tmux binary in the waitagent data directory.
@@ -1288,19 +1150,7 @@ where
         .gateway
         .capture_terminal_flags(socket_name, pane)
         .map_err(remote_authority_error)?;
-    ERROR_LOG.log(format!(
-        "[diag-bootstrap] screen len={} cursor=({},{}) visible_only={}",
-        screen.len(),
-        cursor_x,
-        cursor_y,
-        visible_only
-    ));
     let replay = render_bootstrap_replay(&screen, cursor_x, cursor_y);
-    ERROR_LOG.log(format!(
-        "[diag-bootstrap] replay len={}, first 120 bytes: {:?}",
-        replay.len(),
-        &replay.as_bytes()[..replay.len().min(120)]
-    ));
     let last_chunk_seq = if replay.is_empty() { 0 } else { 1 };
     if !replay.is_empty() {
         transport

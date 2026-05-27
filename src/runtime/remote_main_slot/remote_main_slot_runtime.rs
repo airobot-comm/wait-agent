@@ -11,8 +11,6 @@ use crate::runtime::remote_transport_runtime::{
 };
 use std::cell::RefCell;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 pub trait RemoteControlPlaneSink {
     fn send(
@@ -67,7 +65,6 @@ pub struct RemoteMainSlotRuntime {
     control_plane: RefCell<RemoteControlPlaneService>,
     sink: Box<dyn RemoteControlPlaneSink>,
     connection_registry: Option<RemoteConnectionRegistry>,
-    pub target_exited: Arc<AtomicBool>,
 }
 
 impl RemoteMainSlotRuntime {
@@ -77,7 +74,6 @@ impl RemoteMainSlotRuntime {
             control_plane: RefCell::new(RemoteControlPlaneService::new()),
             sink,
             connection_registry: None,
-            target_exited: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -93,7 +89,6 @@ impl RemoteMainSlotRuntime {
                 connection_registry.clone(),
             )),
             connection_registry: Some(connection_registry),
-            target_exited: Arc::new(AtomicBool::new(false)),
         }
     }
 
