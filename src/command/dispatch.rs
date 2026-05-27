@@ -203,7 +203,9 @@ impl CommandDispatcher {
                 Ok(())
             }
             Command::Version => {
-                println!("waitagent {}", env!("CARGO_PKG_VERSION"));
+                let full =
+                    option_env!("WAITAGENT_VERSION_FULL").unwrap_or(env!("CARGO_PKG_VERSION"));
+                println!("waitagent {full}");
                 Ok(())
             }
             Command::ShowErrorLog => {

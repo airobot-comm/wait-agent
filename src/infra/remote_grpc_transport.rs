@@ -24,9 +24,9 @@ use tonic::{Request, Response, Status};
 
 const SERVER_ID: &str = "waitagent-remote-ingress";
 const HEARTBEAT_INTERVAL_SECONDS: i64 = 15;
-const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
-const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]

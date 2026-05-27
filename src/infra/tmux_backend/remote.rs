@@ -274,6 +274,7 @@ fn clear_pane_pipe_args(pane: &TmuxPaneId) -> Vec<String> {
 fn set_pane_pipe_args(pane: &TmuxPaneId, command: &str) -> Vec<String> {
     vec![
         "pipe-pane".to_string(),
+        "-O".to_string(),
         "-t".to_string(),
         pane.as_str().to_string(),
         command.to_string(),

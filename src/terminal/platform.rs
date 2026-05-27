@@ -120,7 +120,10 @@ pub(crate) fn write_escape(fd: RawFd, value: &str) -> Result<(), TerminalError> 
 
 pub(crate) fn make_raw(mut termios: Termios) -> Termios {
     termios.c_iflag &= !(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    termios.c_oflag &= !OPOST;
+    // Keep OPOST enabled so \n is translated to \r\n on output.
+    // Raw input (no ICANON/ECHO/ISIG) does not require disabling output
+    // post-processing, and disabling OPOST breaks line-oriented rendering
+    // in remote session panes (cursor advances without carriage-return).
     termios.c_cflag |= CS8;
     termios.c_lflag &= !(ECHO | ICANON | IEXTEN | ISIG);
     termios.c_cc[VMIN] = 1;

@@ -418,6 +418,18 @@ impl RemoteRawPtyMailboxReader {
                         b"\x1b[?25l".as_slice()
                     });
                 }
+                ControlPlanePayload::TargetOutput(payload) => {
+                    if let Some(last_output_seq) = self.last_output_seq {
+                        if payload.output_seq <= last_output_seq {
+                            return Err(RemoteSocketTransportError::new(format!(
+                                "remote target output received out-of-order for `{}`: {} after {}",
+                                payload.target_id, payload.output_seq, last_output_seq
+                            )));
+                        }
+                    }
+                    self.last_output_seq = Some(payload.output_seq);
+                    raw.extend_from_slice(&payload.output_bytes);
+                }
                 ControlPlanePayload::RawPtyOutput(payload) => {
                     if let Some(last_output_seq) = self.last_output_seq {
                         if payload.output_seq <= last_output_seq {

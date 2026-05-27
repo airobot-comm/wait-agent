@@ -783,7 +783,6 @@ impl EmbeddedTmuxBackend {
             "capture-pane".to_string(),
             "-p".to_string(),
             "-e".to_string(),
-            "-N".to_string(),
             "-t".to_string(),
             pane_target.to_string(),
         ];

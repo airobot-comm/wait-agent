@@ -6,6 +6,37 @@ mod tmux_glue_contract;
 fn main() {
     tmux_glue_build_script::run();
     compile_remote_grpc_proto();
+    emit_version_info();
+}
+
+fn emit_version_info() {
+    let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".into());
+
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+
+    let git_dirty = std::process::Command::new("git")
+        .args(["diff-index", "--quiet", "HEAD", "--"])
+        .status()
+        .ok()
+        .map(|s| !s.success())
+        .unwrap_or(false);
+
+    let build_time = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+
+    let dirty_flag = if git_dirty { "-dirty" } else { "" };
+    println!("cargo:rustc-env=WAITAGENT_VERSION_FULL={pkg_version} ({git_hash}{dirty_flag}) {build_time}");
 }
 
 fn compile_remote_grpc_proto() {

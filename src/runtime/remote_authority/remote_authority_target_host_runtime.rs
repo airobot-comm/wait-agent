@@ -879,8 +879,7 @@ impl RemoteAuthorityOutputPumpRuntime {
         });
 
         let ingest = command.ingest_socket_path.clone();
-        let pump_result =
-            pump_capture_pane_to_ingest_socket(&ingest, &command.socket_name, &command.pane);
+        let pump_result = pump_stdin_to_ingest_socket(&ingest);
         match input_thread.join() {
             Ok(Ok(())) => {}
             Ok(Err(error)) if pump_result.is_ok() => return Err(remote_authority_error(error)),
@@ -995,9 +994,51 @@ fn pump_reader_to_ingest_socket(
     Ok(())
 }
 
+/// Reads raw PTY output from stdin (piped via `pipe-pane -O`) and forwards
+/// it to the ingest socket.  This streams the terminal byte stream directly
+/// instead of polling `capture-pane`, so ANSI escape sequences, cursor
+/// movement, and incremental output are preserved faithfully.  The bootstrap
+/// replay already painted the initial screen, so this only needs to handle
+/// ongoing output.
+fn pump_stdin_to_ingest_socket(ingest_socket_path: &str) -> Result<(), RemoteAuthorityHostError> {
+    let mut stream = UnixStream::connect(ingest_socket_path).map_err(|e| {
+        ERROR_LOG.log(format!(
+            "[diag-timing] output pump: UnixStream::connect({}) failed: {e}",
+            ingest_socket_path
+        ));
+        e
+    })?;
+    ERROR_LOG.log(
+        "[diag-timing] output pump: connected to ingest socket, reading from pipe-pane -O stdin"
+            .to_string(),
+    );
+    let mut stdin = io::stdin().lock();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stdin.read(&mut buffer) {
+            Ok(0) => {
+                // pipe-pane closed — pane was destroyed or tmux shut down
+                ERROR_LOG.log("[diag-timing] output pump: stdin EOF, exiting".to_string());
+                break;
+            }
+            Ok(read) => {
+                write_output_chunk_frame(&mut stream, &buffer[..read])?;
+            }
+            Err(e) => {
+                ERROR_LOG.log(format!(
+                    "[diag-timing] output pump: stdin read error: {e}, exiting"
+                ));
+                return Err(RemoteAuthorityHostError::new(format!("stdin read: {e}")));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Polls `capture-pane` on the target pane and forwards output chunks to the
-/// ingest socket. Replaces the pipe-pane -O stdin approach which sends
-/// immediate EOF for an empty pane.
+/// ingest socket.  Kept as dead code for reference; the active path uses
+/// `pump_stdin_to_ingest_socket` (pipe-pane -O).
+#[allow(dead_code)]
 fn pump_capture_pane_to_ingest_socket(
     ingest_socket_path: &str,
     socket_name: &str,
@@ -1022,6 +1063,7 @@ fn pump_capture_pane_to_ingest_socket(
                 "-S",
                 &tmux_socket_path(socket_name),
                 "capture-pane",
+                "-e",
                 "-p",
                 "-t",
                 pane,
@@ -1034,16 +1076,8 @@ fn pump_capture_pane_to_ingest_socket(
         }
         let content = String::from_utf8_lossy(&output.stdout).into_owned();
         if content != last_text {
-            // Send the full screen content so the client terminal engine
-            // can redraw everything correctly.  Prepend clear-screen and
-            // cursor-home so the output replaces the previous frame rather
-            // than appending at an unpredictable cursor position.
             let esc = b"\x1b[2J\x1b[H";
             let payload: Vec<u8> = esc.iter().chain(content.as_bytes()).cloned().collect();
-            ERROR_LOG.log(format!(
-                "[diag-timing] output pump: capture detected change, sending {} bytes",
-                payload.len()
-            ));
             write_output_chunk_frame(&mut stream, &payload)?;
             last_text = content;
         }
@@ -1247,7 +1281,19 @@ where
         .gateway
         .capture_terminal_flags(socket_name, pane)
         .map_err(remote_authority_error)?;
+    ERROR_LOG.log(format!(
+        "[diag-bootstrap] screen len={} cursor=({},{}) visible_only={}",
+        screen.len(),
+        cursor_x,
+        cursor_y,
+        visible_only
+    ));
     let replay = render_bootstrap_replay(&screen, cursor_x, cursor_y);
+    ERROR_LOG.log(format!(
+        "[diag-bootstrap] replay len={}, first 120 bytes: {:?}",
+        replay.len(),
+        &replay.as_bytes()[..replay.len().min(120)]
+    ));
     let last_chunk_seq = if replay.is_empty() { 0 } else { 1 };
     if !replay.is_empty() {
         transport
