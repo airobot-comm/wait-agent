@@ -766,7 +766,7 @@ pub(crate) fn map_outbound_grpc_envelope(
                 task_state: Some(payload.task_state.to_string()),
             }))
         }
-        (NodeSessionChannel::Publication, ControlPlanePayload::TargetExited(payload)) => {
+        (_, ControlPlanePayload::TargetExited(payload)) => {
             Some(GrpcBody::TargetExited(GrpcTargetExited {
                 target_id: envelope.target_id.clone().unwrap_or_else(|| {
                     format!("remote-peer:{node_id}:{}", payload.transport_session_id)
