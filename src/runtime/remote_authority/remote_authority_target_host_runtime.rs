@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MirrorState {
@@ -542,10 +542,14 @@ where
             .open(&input_fifo_path)
             .map_err(remote_authority_error)?;
 
+        const PANE_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+        const MAX_IDLE_WITHOUT_PANE_CHECK: Duration = Duration::from_secs(5);
+
         let health = Arc::new(EventLoopHealth::new());
         let mut pending_input: Vec<u8> = Vec::new();
         let mut output_cache: VecDeque<OutputFrame> =
             VecDeque::with_capacity(OUTPUT_CACHE_CAPACITY);
+        let mut last_event_or_input_time = Instant::now();
 
         let loop_result = loop {
             // Drain queued input bytes to the FIFO. The FIFO is blocking so
@@ -562,6 +566,7 @@ where
                         ));
                         pending_input.drain(..n);
                         health.record_input(n as u64);
+                        last_event_or_input_time = Instant::now();
                     }
                     Ok(_) => {} // no progress, retry next iteration
                     Err(error) => {
@@ -577,17 +582,77 @@ where
                     health.maybe_log_stall(&command.transport_socket_path, &command.target_id);
                 }
             }
-            let event = if pending_input.is_empty() {
-                match event_rx.recv() {
-                    Ok(e) => e,
-                    Err(_) => break Ok(()),
-                }
+
+            // Use a timeout so we can periodically check whether the pane is
+            // still alive.  A blocking recv() would stall forever after the
+            // pane dies because no more OutputChunk or TransportCommand events
+            // will arrive, yet the shared gRPC stream keeps the transport
+            // alive.  The watchdog detects the dead pane and exits the event
+            // loop so TargetExited is sent upstream.
+            let recv_timeout = if pending_input.is_empty() {
+                PANE_LIVENESS_CHECK_INTERVAL
             } else {
-                match event_rx.recv_timeout(Duration::from_millis(10)) {
-                    Ok(e) => e,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+                Duration::from_millis(10)
+            };
+            let event = match event_rx.recv_timeout(recv_timeout) {
+                Ok(e) => {
+                    last_event_or_input_time = Instant::now();
+                    e
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // No event within the window — check whether the pane
+                    // is still alive.  If it died, exit cleanly so that
+                    // TargetExited is sent and the remote side can tear
+                    // down its per-session pane.
+                    let idle = last_event_or_input_time.elapsed();
+                    if idle > MAX_IDLE_WITHOUT_PANE_CHECK {
+                        // Use display-message to check if the pane is dead.
+                        // capture-pane succeeds for dead panes (it returns
+                        // buffered content), so it cannot detect liveness.
+                        let pane = self
+                            .gateway
+                            .target_presentation_pane(
+                                &command.socket_name,
+                                &command.target_session_name,
+                            )
+                            .ok();
+                        let pane_alive = pane.as_ref().map_or(true, |p| {
+                            let tmux_bin = tmux_binary_path();
+                            let tmux_sock = tmux_socket_path(&command.socket_name);
+                            match std::process::Command::new(&tmux_bin)
+                                .args([
+                                    "-S",
+                                    &tmux_sock,
+                                    "display-message",
+                                    "-p",
+                                    "-t",
+                                    p.as_str(),
+                                    "-F",
+                                    "#{pane_dead}",
+                                ])
+                                .output()
+                            {
+                                Ok(o) if o.status.success() => o.stdout.first() != Some(&b'1'),
+                                _ => true, // assume alive if command fails
+                            }
+                        });
+                        if !pane_alive {
+                            ERROR_LOG.log(format!(
+                                "[diag-timing] target host: pane DEAD detected (idle={:?}), exiting event loop to send TargetExited (target={})",
+                                idle,
+                                command.target_id
+                            ));
+                            break Ok(());
+                        }
+                        ERROR_LOG.log(format!(
+                            "[diag-timing] target host: pane still alive, idle={:?}, target={}",
+                            idle, command.target_id
+                        ));
+                        last_event_or_input_time = Instant::now();
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
             };
             match event {
                 AuthorityHostEvent::TransportCommand(RemoteAuthorityCommand::OpenMirror(
@@ -784,6 +849,11 @@ where
         // reaches the __remote-main-slot event loop before the gRPC stream
         // is torn down.  Otherwise the remote sees a bare Disconnected and
         // enters the reconnecting loop.
+        ERROR_LOG.log(format!(
+            "[diag-timing] target host: event loop exited, sending TargetExited (target={}, session={})",
+            command.target_id,
+            command.target_session_name
+        ));
         let _ = transport
             .send_target_exited(&command.transport_session_id, &command.target_session_name);
         if matches!(mirror_state, MirrorState::Active { .. }) {
@@ -850,7 +920,7 @@ impl RemoteAuthorityOutputPumpRuntime {
         ));
         let input_fifo_path = command.input_fifo_path.clone();
         let socket = command.socket_name.clone();
-        let pane = command.pane.clone();
+        let pane = command.pane.trim().to_string();
         let tmux_bin = tmux_binary_path();
         let tmux_sock = tmux_socket_path(&socket);
         let input_thread = thread::spawn(move || -> Result<(), RemoteAuthorityHostError> {
@@ -1106,7 +1176,7 @@ where
         ingest_socket_path,
         &authority_input_fifo_path(&command.transport_socket_path, &command.target_id),
         &command.socket_name,
-        pane.as_str(),
+        pane.as_str().trim(),
     );
     runtime
         .gateway

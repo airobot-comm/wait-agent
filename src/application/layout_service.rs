@@ -8,7 +8,7 @@ pub const FOOTER_PANE_TITLE: &str = "waitagent-footer";
 const MAIN_PANE_REMAIN_ON_EXIT_OPTION: &str = "remain-on-exit";
 const TMUX_OPTION_ON: &str = "on";
 const SESSION_LAYOUT_RECONCILE_HOOKS: [&str; 1] = ["client-resized"];
-const MAIN_PANE_RECOVERY_HOOKS: [&str; 1] = ["pane-died"];
+const MAIN_PANE_RECOVERY_HOOKS: [&str; 1] = ["pane-exited"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutFocusBehavior {

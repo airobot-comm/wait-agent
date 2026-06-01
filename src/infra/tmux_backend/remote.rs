@@ -10,51 +10,15 @@ const WAITAGENT_ACTIVE_TARGET_OPTION: &str = "@waitagent_active_target";
 impl EmbeddedTmuxBackend {
     pub(crate) fn target_presentation_pane_on_socket(
         &self,
-        socket_name: &str,
+        _socket_name: &str,
         target_session_name: &str,
     ) -> Result<TmuxPaneId, TmuxError> {
-        let socket = TmuxSocketName::new(socket_name);
-        let target_identity = format!("{socket_name}:{target_session_name}");
-        let sessions = self.list_sessions_on_socket(&socket)?;
-
-        if let Some(workspace_session) = sessions.iter().find(|session| {
-            session.is_workspace_chrome()
-                && self
-                    .show_session_option(
-                        &crate::infra::tmux::TmuxWorkspaceHandle {
-                            workspace_id: crate::domain::workspace::WorkspaceInstanceId::new(
-                                session.address.session_id(),
-                            ),
-                            socket_name: socket.clone(),
-                            session_name: crate::infra::tmux::TmuxSessionName::new(
-                                session.address.session_id(),
-                            ),
-                        },
-                        WAITAGENT_ACTIVE_TARGET_OPTION,
-                    )
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    == Some(target_identity.as_str())
-        }) {
-            let workspace = crate::infra::tmux::TmuxWorkspaceHandle {
-                workspace_id: crate::domain::workspace::WorkspaceInstanceId::new(
-                    workspace_session.address.session_id(),
-                ),
-                socket_name: socket.clone(),
-                session_name: crate::infra::tmux::TmuxSessionName::new(
-                    workspace_session.address.session_id(),
-                ),
-            };
-            if let Some(pane_id) =
-                self.show_session_option(&workspace, WAITAGENT_MAIN_PANE_OPTION)?
-            {
-                return Ok(TmuxPaneId::new(pane_id));
-            }
-            return self.target_main_pane_on_socket(socket_name, workspace.session_name.as_str());
-        }
-
-        self.target_main_pane_on_socket(socket_name, target_session_name)
+        // Return a session-qualified pane reference so that tmux commands
+        // (pipe-pane, send-keys, resize-pane, capture-pane) resolve the
+        // pane in the correct session regardless of which session is active.
+        // Target sessions always have exactly one window (index 0) with one
+        // pane (index 0).
+        Ok(TmuxPaneId::new(format!("{}:0.0", target_session_name)))
     }
 
     pub(crate) fn target_main_pane_on_socket(

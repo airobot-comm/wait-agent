@@ -101,8 +101,15 @@ impl TargetHostRuntime {
         &self,
         session: &ManagedSessionRecord,
     ) -> Result<(), LifecycleError> {
-        if session.address.transport() == &SessionTransport::RemotePeer || !session.is_target_host()
-        {
+        if !session.is_target_host() {
+            return Ok(());
+        }
+        if session.address.transport() == &SessionTransport::RemotePeer {
+            self.remote_target_publication_runtime
+                .signal_source_session_closed(
+                    session.address.server_id(),
+                    session.address.session_id(),
+                )?;
             return Ok(());
         }
         self.remote_target_publication_runtime

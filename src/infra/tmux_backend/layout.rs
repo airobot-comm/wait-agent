@@ -523,11 +523,15 @@ fn set_pane_pipe_args(pane: &TmuxPaneId, command: &str) -> Vec<String> {
 }
 
 fn set_pane_hook_args(pane: &TmuxPaneId, hook_name: &str, command: &str) -> Vec<String> {
+    let target = pane.as_str();
+    // Use the session name (everything before ":") for the -t target
+    // so the hook fires for all panes in the session, not just one pane.
+    let session_target = target.split(':').next().unwrap_or(target);
     vec![
         "set-hook".to_string(),
         "-p".to_string(),
         "-t".to_string(),
-        pane.as_str().to_string(),
+        session_target.to_string(),
         hook_name.to_string(),
         command.to_string(),
     ]

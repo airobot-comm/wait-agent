@@ -226,11 +226,14 @@ impl MainSlotRuntime {
 
         match next_target {
             Some(target) => {
-                self.activate_target_after_main_pane_exit(
-                    &current_workspace,
-                    &recovery_pane,
-                    &target,
-                )?;
+                self.backend
+                    .respawn_pane(
+                        &workspace,
+                        &recovery_pane,
+                        &workspace_host_program(&current_workspace.workspace_dir),
+                    )
+                    .map_err(main_slot_error)?;
+                self.activate_target_in_workspace(&current_workspace, &target)?;
                 self.close_target_session_identity(active_target.as_deref())?;
                 self.layout_runtime
                     .refresh_workspace_chrome(&workspace, &current_workspace.workspace_dir)?;
@@ -557,17 +560,19 @@ impl MainSlotRuntime {
             t_start.elapsed()
         ));
 
-        self.layout_runtime
-            .sync_main_slot_bindings(&workspace, &current_workspace.workspace_dir)?;
-        ERROR_LOG.log(format!(
-            "[diag-timing][{}] bindings synced ({:?})",
-            target_id,
-            t_start.elapsed()
-        ));
-
         let result = self
             .layout_runtime
             .refresh_workspace_chrome(&workspace, &current_workspace.workspace_dir);
+        // refresh_workspace_chrome may have re-resolved main pane.
+        // Restore the session pane and its pane-died hook.
+        self.set_workspace_main_pane(&workspace, &session_pane)?;
+        let pane_died_command = self.layout_runtime.main_pane_died_hook_command(&workspace);
+        self.backend
+            .set_pane_hook(&workspace, &session_pane, "pane-exited", &pane_died_command)
+            .map_err(main_slot_error)?;
+        self.backend
+            .set_pane_option(&workspace, &session_pane, "remain-on-exit", "on")
+            .map_err(main_slot_error)?;
         ERROR_LOG.log(format!(
             "[diag-timing][{}] refresh_workspace_chrome done result={:?} (total={:?})",
             target_id,
@@ -575,38 +580,6 @@ impl MainSlotRuntime {
             t_start.elapsed()
         ));
         result
-    }
-
-    fn activate_target_after_main_pane_exit(
-        &self,
-        current_workspace: &CurrentWorkspace,
-        recovery_pane: &TmuxPaneId,
-        target: &crate::domain::session_catalog::ManagedSessionRecord,
-    ) -> Result<(), LifecycleError> {
-        let workspace = workspace_handle(
-            &current_workspace.socket_name,
-            &current_workspace.session_name,
-        );
-        self.backend
-            .respawn_pane(
-                &workspace,
-                recovery_pane,
-                &workspace_host_program(&current_workspace.workspace_dir),
-            )
-            .map_err(main_slot_error)?;
-        let target_main_pane = self.target_main_pane(target)?;
-        self.backend
-            .swap_panes(&workspace, &target_main_pane, recovery_pane)
-            .map_err(main_slot_error)?;
-        self.set_workspace_main_pane(&workspace, &target_main_pane)?;
-        self.set_active_target(&workspace, Some(&target.address.qualified_target()))?;
-        self.layout_runtime
-            .disable_main_pane_output_bridge(&workspace)?;
-        self.layout_runtime
-            .sync_main_slot_bindings(&workspace, &current_workspace.workspace_dir)?;
-        self.layout_runtime
-            .refresh_workspace_chrome(&workspace, &current_workspace.workspace_dir)?;
-        Ok(())
     }
 
     fn fallback_after_remote_main_pane_exit(
@@ -620,20 +593,28 @@ impl MainSlotRuntime {
             .target_registry
             .list_targets_on_authority(workspace.socket_name.as_str())
             .map_err(main_slot_error)?;
-        let next_target = next_target_host_session(&sessions, workspace.socket_name.as_str(), None);
+        let next_target = next_target_host_session(
+            &sessions,
+            workspace.socket_name.as_str(),
+            active_target.as_deref(),
+        );
         match next_target {
             Some(target) => {
-                self.activate_target_after_main_pane_exit(
-                    current_workspace,
-                    recovery_pane,
-                    &target,
-                )?;
-                self.set_active_target(
-                    workspace,
-                    Some(target.address.qualified_target().as_str()),
-                )?;
-                self.layout_runtime
-                    .disable_main_pane_output_bridge(workspace)?;
+                self.backend
+                    .respawn_pane(
+                        workspace,
+                        recovery_pane,
+                        &workspace_host_program(&current_workspace.workspace_dir),
+                    )
+                    .map_err(main_slot_error)?;
+                match target.address.transport() {
+                    SessionTransport::RemotePeer => {
+                        self.activate_remote_target_in_workspace(current_workspace, &target)?;
+                    }
+                    _ => {
+                        self.activate_target_in_workspace(current_workspace, &target)?;
+                    }
+                }
             }
             None => {
                 self.backend
@@ -808,6 +789,13 @@ impl MainSlotRuntime {
         let Some(target) = target else {
             return Ok(false);
         };
+        // Remote authority targets carry an IP:port#port prefix.  Short-
+        // circuit without querying the catalog, which may not have the
+        // remote session yet when called from a short-lived __main-pane-died
+        // subprocess.
+        if target.contains('#') {
+            return Ok(true);
+        }
         Ok(self.remote_target_record(socket_name, target)?.is_some())
     }
 

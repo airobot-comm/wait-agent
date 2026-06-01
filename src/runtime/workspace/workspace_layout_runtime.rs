@@ -652,7 +652,7 @@ impl WorkspaceLayoutRuntime {
         )
     }
 
-    fn main_pane_died_hook_command(&self, workspace: &TmuxWorkspaceHandle) -> String {
+    pub(crate) fn main_pane_died_hook_command(&self, workspace: &TmuxWorkspaceHandle) -> String {
         let shell_command = main_pane_died_hook_shell_command(
             self.current_executable.to_string_lossy().as_ref(),
             workspace.socket_name.as_str(),
