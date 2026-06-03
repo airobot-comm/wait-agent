@@ -430,9 +430,43 @@ fn route_transport_envelope(
                 .apply_discovered_remote_session_envelope_on_live_workspaces(node_id, mapped)
         }
         Some(Body::TargetExited(payload)) => {
+            ERROR_LOG.log(format!(
+                "[diag-bug] ingress_server route_transport_envelope: received TargetExited node={node_id} session={}",
+                payload.transport_session_id
+            ));
             let mapped = map_target_exited_envelope(node_id, &envelope, payload);
             publication_runtime
-                .apply_discovered_remote_session_envelope_on_live_workspaces(node_id, mapped)
+                .apply_discovered_remote_session_envelope_on_live_workspaces(node_id, mapped)?;
+            ERROR_LOG.log(format!(
+                "[diag-bug] ingress_server: applied TargetExited to live workspaces node={node_id} session={}",
+                payload.transport_session_id
+            ));
+            let Some(session) = session else {
+                return Ok(());
+            };
+            let session_id = payload.transport_session_id.clone();
+            let target_id = format!("remote-peer:{node_id}:{session_id}");
+            let mut stale = Vec::new();
+            for (path, bridge) in &session.bridges {
+                if bridge
+                    .transport
+                    .send_payload(
+                        &session_id,
+                        &target_id,
+                        ControlPlanePayload::TargetExited(TargetExitedPayload {
+                            transport_session_id: session_id.clone(),
+                            source_session_name: None,
+                        }),
+                    )
+                    .is_err()
+                {
+                    stale.push(path.clone());
+                }
+            }
+            for path in stale {
+                session.bridges.remove(&path);
+            }
+            Ok(())
         }
         Some(Body::TargetOutput(payload)) => {
             let Some(session) = session else {

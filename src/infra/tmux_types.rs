@@ -341,6 +341,13 @@ pub trait TmuxLayoutGateway: TmuxGateway {
         value: &str,
     ) -> Result<(), Self::Error>;
 
+    fn unset_pane_option(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        pane: &TmuxPaneId,
+        option_name: &str,
+    ) -> Result<(), Self::Error>;
+
     fn set_session_hook(
         &self,
         workspace: &TmuxWorkspaceHandle,

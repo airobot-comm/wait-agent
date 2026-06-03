@@ -8,7 +8,7 @@ pub const FOOTER_PANE_TITLE: &str = "waitagent-footer";
 const MAIN_PANE_REMAIN_ON_EXIT_OPTION: &str = "remain-on-exit";
 const TMUX_OPTION_ON: &str = "on";
 const SESSION_LAYOUT_RECONCILE_HOOKS: [&str; 1] = ["client-resized"];
-const MAIN_PANE_RECOVERY_HOOKS: [&str; 1] = ["pane-exited"];
+const MAIN_PANE_RECOVERY_HOOKS: [&str; 1] = ["pane-died"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutFocusBehavior {
@@ -117,11 +117,10 @@ where
                     self.tmux
                         .unset_pane_hook(workspace, previous_main_pane, hook_name)?;
                 }
-                self.tmux.set_pane_option(
+                self.tmux.unset_pane_option(
                     workspace,
                     previous_main_pane,
                     MAIN_PANE_REMAIN_ON_EXIT_OPTION,
-                    "",
                 )?;
             }
         }
@@ -212,6 +211,7 @@ mod tests {
         SetTitle(String),
         SetPaneStyle(String, String),
         SetPaneOption(String, String, String),
+        UnsetPaneOption(String, String),
         SetWidth(String, u16),
         SetHeight(String, u16),
         SetHook(String, String),
@@ -453,6 +453,19 @@ mod tests {
                 pane.as_str().to_string(),
                 option_name.to_string(),
                 value.to_string(),
+            ));
+            Ok(())
+        }
+
+        fn unset_pane_option(
+            &self,
+            _workspace: &TmuxWorkspaceHandle,
+            pane: &TmuxPaneId,
+            option_name: &str,
+        ) -> Result<(), Self::Error> {
+            self.calls.borrow_mut().push(Call::UnsetPaneOption(
+                pane.as_str().to_string(),
+                option_name.to_string(),
             ));
             Ok(())
         }
@@ -754,10 +767,9 @@ mod tests {
                     "run-shell -b 'waitagent __layout-reconcile'".to_string(),
                 ),
                 Call::UnsetPaneHook("%1".to_string(), "pane-died".to_string()),
-                Call::SetPaneOption(
+                Call::UnsetPaneOption(
                     "%1".to_string(),
                     "remain-on-exit".to_string(),
-                    "".to_string(),
                 ),
                 Call::SetPaneOption(
                     "%3".to_string(),

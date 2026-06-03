@@ -350,6 +350,24 @@ impl TmuxLayoutGateway for EmbeddedTmuxBackend {
         Ok(())
     }
 
+    fn unset_pane_option(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        pane: &TmuxPaneId,
+        option_name: &str,
+    ) -> Result<(), Self::Error> {
+        let args = vec![
+            "set-option".to_string(),
+            "-p".to_string(),
+            "-u".to_string(),
+            "-t".to_string(),
+            pane.as_str().to_string(),
+            option_name.to_string(),
+        ];
+        self.run_workspace_command(workspace, &args)?;
+        Ok(())
+    }
+
     fn set_session_hook(
         &self,
         workspace: &TmuxWorkspaceHandle,

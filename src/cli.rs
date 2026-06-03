@@ -110,6 +110,8 @@ pub enum Command {
     ChromeRefreshSocket(SocketNameCommand),
     UiSidebar(UiPaneCommand),
     UiFooter(UiPaneCommand),
+    LocalTargetHost(LocalTargetHostCommand),
+    LocalTargetExited(LocalTargetExitedCommand),
     RemoteMainSlot(RemoteMainSlotCommand),
     RemoteServerConsole(RemoteServerConsoleCommand),
     RemoteAuthorityTargetHost(RemoteAuthorityTargetHostCommand),
@@ -128,6 +130,8 @@ pub enum Command {
     ActivateTarget(ActivateTargetCommand),
     NewTarget(NewTargetCommand),
     MainPaneDied(MainPaneDiedCommand),
+    RemoteTargetExited(RemoteTargetExitedCommand),
+    MainPaneWatchdog(MainPaneWatchdogCommand),
     FooterMenu(FooterMenuCommand),
     ToggleFullscreen(ToggleFullscreenCommand),
     CloseSession(CloseSessionCommand),
@@ -182,6 +186,19 @@ pub struct RemoteMainSlotCommand {
     pub socket_name: String,
     pub session_name: String,
     pub target: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LocalTargetHostCommand {
+    pub socket_name: String,
+    pub target_session_name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LocalTargetExitedCommand {
+    pub socket_name: String,
+    pub target_session_name: String,
+    pub pane_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -308,6 +325,21 @@ pub struct MainPaneDiedCommand {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct RemoteTargetExitedCommand {
+    pub socket_name: String,
+    pub session_name: String,
+    pub target: String,
+    pub pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MainPaneWatchdogCommand {
+    pub socket_name: String,
+    pub session_name: String,
+    pub pane_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct CloseSessionCommand {
     pub socket_name: String,
     pub session_name: String,
@@ -352,6 +384,14 @@ impl Cli {
             "__ui-footer" => {
                 args.remove(0);
                 Command::UiFooter(parse_ui_pane(args)?)
+            }
+            "__local-target-host" => {
+                args.remove(0);
+                Command::LocalTargetHost(parse_local_target_host(args)?)
+            }
+            "__local-target-exited" => {
+                args.remove(0);
+                Command::LocalTargetExited(parse_local_target_exited(args)?)
             }
             "__remote-main-slot" => {
                 args.remove(0);
@@ -432,6 +472,14 @@ impl Cli {
             "__main-pane-died" => {
                 args.remove(0);
                 Command::MainPaneDied(parse_main_pane_died(args)?)
+            }
+            "__remote-target-exited" => {
+                args.remove(0);
+                Command::RemoteTargetExited(parse_remote_target_exited(args)?)
+            }
+            "__main-pane-watchdog" => {
+                args.remove(0);
+                Command::MainPaneWatchdog(parse_main_pane_watchdog(args)?)
             }
             "__footer-menu" => {
                 args.remove(0);
@@ -1176,6 +1224,110 @@ fn parse_main_pane_died(args: Vec<String>) -> Result<MainPaneDiedCommand, CliErr
     })
 }
 
+fn parse_local_target_host(args: Vec<String>) -> Result<LocalTargetHostCommand, CliError> {
+    let mut iter = args.into_iter();
+    let mut socket_name = None;
+    let mut target_session_name = None;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--socket-name" => socket_name = Some(expect_value("--socket-name", &mut iter)?),
+            "--target-session-name" => {
+                target_session_name = Some(expect_value("--target-session-name", &mut iter)?)
+            }
+            "--help" | "-h" => {}
+            _ => return Err(CliError::UnexpectedArgument(arg)),
+        }
+    }
+
+    Ok(LocalTargetHostCommand {
+        socket_name: socket_name
+            .ok_or_else(|| CliError::MissingValue("--socket-name".to_string()))?,
+        target_session_name: target_session_name
+            .ok_or_else(|| CliError::MissingValue("--target-session-name".to_string()))?,
+    })
+}
+
+fn parse_local_target_exited(args: Vec<String>) -> Result<LocalTargetExitedCommand, CliError> {
+    let mut iter = args.into_iter();
+    let mut socket_name = None;
+    let mut target_session_name = None;
+    let mut pane_id = None;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--socket-name" => socket_name = Some(expect_value("--socket-name", &mut iter)?),
+            "--target-session-name" => {
+                target_session_name = Some(expect_value("--target-session-name", &mut iter)?)
+            }
+            "--pane-id" => pane_id = Some(expect_value("--pane-id", &mut iter)?),
+            "--help" | "-h" => {}
+            _ => return Err(CliError::UnexpectedArgument(arg)),
+        }
+    }
+
+    Ok(LocalTargetExitedCommand {
+        socket_name: socket_name
+            .ok_or_else(|| CliError::MissingValue("--socket-name".to_string()))?,
+        target_session_name: target_session_name
+            .ok_or_else(|| CliError::MissingValue("--target-session-name".to_string()))?,
+        pane_id: pane_id.ok_or_else(|| CliError::MissingValue("--pane-id".to_string()))?,
+    })
+}
+
+fn parse_remote_target_exited(args: Vec<String>) -> Result<RemoteTargetExitedCommand, CliError> {
+    let mut iter = args.into_iter();
+    let mut socket_name = None;
+    let mut session_name = None;
+    let mut target = None;
+    let mut pane_id = None;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--socket-name" => socket_name = Some(expect_value("--socket-name", &mut iter)?),
+            "--session-name" => session_name = Some(expect_value("--session-name", &mut iter)?),
+            "--target" => target = Some(expect_value("--target", &mut iter)?),
+            "--pane-id" => pane_id = Some(expect_value("--pane-id", &mut iter)?),
+            "--help" | "-h" => {}
+            _ => return Err(CliError::UnexpectedArgument(arg)),
+        }
+    }
+
+    Ok(RemoteTargetExitedCommand {
+        socket_name: socket_name
+            .ok_or_else(|| CliError::MissingValue("--socket-name".to_string()))?,
+        session_name: session_name
+            .ok_or_else(|| CliError::MissingValue("--session-name".to_string()))?,
+        target: target.ok_or_else(|| CliError::MissingValue("--target".to_string()))?,
+        pane_id,
+    })
+}
+
+fn parse_main_pane_watchdog(args: Vec<String>) -> Result<MainPaneWatchdogCommand, CliError> {
+    let mut iter = args.into_iter();
+    let mut socket_name = None;
+    let mut session_name = None;
+    let mut pane_id = None;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--socket-name" => socket_name = Some(expect_value("--socket-name", &mut iter)?),
+            "--session-name" => session_name = Some(expect_value("--session-name", &mut iter)?),
+            "--pane-id" => pane_id = Some(expect_value("--pane-id", &mut iter)?),
+            "--help" | "-h" => {}
+            _ => return Err(CliError::UnexpectedArgument(arg)),
+        }
+    }
+
+    Ok(MainPaneWatchdogCommand {
+        socket_name: socket_name
+            .ok_or_else(|| CliError::MissingValue("--socket-name".to_string()))?,
+        session_name: session_name
+            .ok_or_else(|| CliError::MissingValue("--session-name".to_string()))?,
+        pane_id: pane_id.ok_or_else(|| CliError::MissingValue("--pane-id".to_string()))?,
+    })
+}
+
 fn parse_close_session(args: Vec<String>) -> Result<CloseSessionCommand, CliError> {
     let mut iter = args.into_iter();
     let mut socket_name = None;
@@ -1663,6 +1815,32 @@ mod tests {
                 assert_eq!(command.socket_name, "wa-1");
                 assert_eq!(command.session_name, "waitagent-1");
                 assert_eq!(command.pane_id, "%9");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_hidden_remote_target_exited_command() {
+        match parse(&[
+            "waitagent",
+            "__remote-target-exited",
+            "--socket-name",
+            "wa-1",
+            "--session-name",
+            "waitagent-1",
+            "--target",
+            "remote-peer:10.1.29.130#7474:remote-a",
+            "--pane-id",
+            "%9",
+        ])
+        .command
+        {
+            Command::RemoteTargetExited(command) => {
+                assert_eq!(command.socket_name, "wa-1");
+                assert_eq!(command.session_name, "waitagent-1");
+                assert_eq!(command.target, "remote-peer:10.1.29.130#7474:remote-a");
+                assert_eq!(command.pane_id.as_deref(), Some("%9"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

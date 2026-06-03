@@ -247,7 +247,10 @@ pub(crate) fn exportable_local_sessions_for_socket(
     sessions
         .into_iter()
         .filter(|session| {
-            session.address.server_id() == socket_name && session.is_workspace_session()
+            session.address.server_id() == socket_name
+                && session.is_workspace_session()
+                && session.availability
+                    != crate::domain::session_catalog::SessionAvailability::Exited
         })
         .map(|session| {
             exported_session_record_for_socket(session, socket_name, published_target_store)
@@ -369,10 +372,16 @@ fn merge_cached_remote_identity_with_live_target_runtime(
     cached_remote_target.session_role = live_target.session_role;
     cached_remote_target.attached_clients = live_target.attached_clients;
     cached_remote_target.window_count = live_target.window_count;
-    cached_remote_target.command_name = live_target.command_name.clone();
-    cached_remote_target.current_path = live_target.current_path.clone();
-    cached_remote_target.task_state = live_target.task_state;
+    if !live_target_uses_internal_waitagent_runtime(live_target) {
+        cached_remote_target.command_name = live_target.command_name.clone();
+        cached_remote_target.current_path = live_target.current_path.clone();
+        cached_remote_target.task_state = live_target.task_state;
+    }
     cached_remote_target
+}
+
+fn live_target_uses_internal_waitagent_runtime(session: &ManagedSessionRecord) -> bool {
+    session.command_name.as_deref() == Some("waitagent")
 }
 
 #[derive(Debug)]

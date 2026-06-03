@@ -17,7 +17,6 @@ use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::str;
 use std::thread;
 use std::time::Duration;
@@ -920,13 +919,7 @@ pub(super) fn spawn_socket_chrome_refresh(
     current_executable: &std::path::Path,
     socket_name: &str,
 ) -> Result<(), LifecycleError> {
-    Command::new(current_executable)
-        .args(chrome_refresh_socket_args(socket_name))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+    spawn_waitagent_sidecar(current_executable, chrome_refresh_socket_args(socket_name))
         .map_err(remote_target_publication_error)
 }
 

@@ -30,6 +30,7 @@ pub use remote_publication::remote_transport_runtime;
 
 pub mod workspace;
 pub use workspace::footer_menu_runtime;
+pub use workspace::local_target_host_runtime;
 pub use workspace::main_slot_runtime;
 pub use workspace::native_pane_fullscreen_runtime;
 pub use workspace::sidecar_process_runtime;

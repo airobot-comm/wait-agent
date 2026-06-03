@@ -2,6 +2,7 @@ use crate::application::target_registry_service::TargetRegistryService;
 use crate::cli::{RemoteNetworkConfig, UiPaneCommand};
 use crate::domain::local_runtime::ChromeSurface;
 use crate::domain::workspace::WorkspaceInstanceId;
+use crate::infra::error_log::ERROR_LOG;
 use crate::infra::tmux::{TmuxChromeGateway, TmuxSessionName, TmuxSocketName, TmuxWorkspaceHandle};
 use crate::lifecycle::LifecycleError;
 use crate::runtime::event_driven_chrome_runtime::EventDrivenChromeRenderUpdate;
@@ -143,6 +144,17 @@ where
                 active_target.as_deref(),
             )
             .map_err(tmux_pane_error)?;
+        ERROR_LOG.log(format!(
+            "[diag-native] publish_session_snapshot: socket={} session={} active_target={:?} visible_sessions={} targets={:?}",
+            command.socket_name,
+            command.session_name,
+            active_target,
+            visible_sessions.len(),
+            visible_sessions
+                .iter()
+                .map(|session| session.address.qualified_target())
+                .collect::<Vec<_>>()
+        ));
         Ok(self.pane_runtime.publish_session_snapshot(
             &command.socket_name,
             &command.session_name,

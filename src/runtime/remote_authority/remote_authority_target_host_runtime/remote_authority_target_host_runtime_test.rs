@@ -1,7 +1,7 @@
 mod tests {
     use super::super::{
         authority_input_fifo_path, authority_output_ingest_socket_path,
-        pump_reader_to_ingest_socket, read_output_chunk_frame, remote_authority_error,
+        pump_stdin_to_ingest_socket, read_output_chunk_frame, remote_authority_error,
         remote_authority_output_pump_shell_command, remote_authority_target_host_args,
         render_bootstrap_replay, write_output_chunk_frame, LifecycleError,
         RemoteAuthorityPublicationGateway, RemoteAuthorityTargetHostRuntime,
@@ -204,6 +204,14 @@ mod tests {
             }
             Ok(())
         }
+
+        fn signal_source_session_closed(
+            &self,
+            socket_name: &str,
+            target_session_name: &str,
+        ) -> Result<(), LifecycleError> {
+            self.ensure_live_session_unregistered(socket_name, target_session_name)
+        }
     }
 
     #[test]
@@ -270,7 +278,7 @@ mod tests {
             read_output_chunk_frame(&mut stream).expect("frame should decode")
         });
 
-        pump_reader_to_ingest_socket(
+        pump_stdin_to_ingest_socket(
             Cursor::new(b"hello".to_vec()),
             socket_path.to_string_lossy().as_ref(),
         )

@@ -4,7 +4,7 @@ use crate::cli::{
     RemoteTargetReconcilePublicationsCommand, RemoteTargetUnbindPublicationCommand,
     SocketLifecycleHookCommand,
 };
-use crate::domain::session_catalog::{ManagedSessionRecord, SessionTransport};
+use crate::domain::session_catalog::{ManagedSessionRecord, SessionAvailability, SessionTransport};
 use crate::infra::published_target_store::{PublishedTargetSourceBinding, PublishedTargetStore};
 use crate::infra::remote_protocol::{ControlPlanePayload, NodeSessionChannel, ProtocolEnvelope};
 use crate::infra::remote_transport_codec::read_node_session_envelope;
@@ -362,6 +362,18 @@ impl RemoteTargetPublicationRuntime {
                 }
                 break;
             };
+
+            if session.availability == SessionAvailability::Exited {
+                let snapshot = publication_owner_snapshot(&binding, &session);
+                signal_publication_target_exited(
+                    &command.socket_name,
+                    &snapshot.authority_id,
+                    &snapshot.transport_session_id,
+                    Some(&command.target_session_name),
+                )?;
+                last_snapshot = Some(snapshot);
+                break;
+            }
 
             if owner_drain.stop_requested {
                 let snapshot = publication_owner_snapshot(&binding, &session);

@@ -442,6 +442,14 @@ impl RemoteAuthorityPublicationGateway for NoopAuthorityPublicationGateway {
     ) -> Result<(), LifecycleError> {
         Ok(())
     }
+
+    fn signal_source_session_closed(
+        &self,
+        _socket_name: &str,
+        _target_session_name: &str,
+    ) -> Result<(), LifecycleError> {
+        Ok(())
+    }
 }
 
 impl Drop for RemoteNodeSessionSyncGuard {

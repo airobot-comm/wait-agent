@@ -187,25 +187,21 @@ fn pad_right(text: &str, width: usize) -> String {
 }
 
 fn session_row_primary_label(session: &ManagedSessionRecord, width: usize) -> String {
+    if session.address.transport() == &SessionTransport::RemotePeer {
+        let candidates = remote_row_label_candidates(session);
+        for candidate in &candidates {
+            if display_width(candidate) <= width {
+                return pad_right(candidate, width);
+            }
+        }
+        if let Some(candidate) = candidates.first() {
+            return pad_right(&truncate_display_width(candidate, width), width);
+        }
+    }
+
     let full_label = session.display_label();
     if display_width(&full_label) <= width {
         return pad_right(&full_label, width);
-    }
-
-    if session.address.transport() == &SessionTransport::RemotePeer {
-        let command_host_port = remote_command_host_port_label(session);
-        if display_width(&command_host_port) <= width {
-            return pad_right(&command_host_port, width);
-        }
-        let command_host = format!(
-            "{}@{}",
-            session.command_name.as_deref().unwrap_or("bash"),
-            session.address.display_authority_id()
-        );
-        if display_width(&command_host) <= width {
-            return pad_right(&command_host, width);
-        }
-        return pad_right(&truncate_display_width(&command_host_port, width), width);
     }
 
     pad_right(&truncate_display_width(&full_label, width), width)
@@ -229,6 +225,33 @@ fn remote_command_host_port_label(session: &ManagedSessionRecord) -> String {
             session.command_name.as_deref().unwrap_or("bash"),
             host
         ),
+    }
+}
+
+fn remote_row_label_candidates(session: &ManagedSessionRecord) -> Vec<String> {
+    let command = session.command_name.as_deref().unwrap_or("bash");
+    let authority = session.address.authority_id();
+    let host = session.address.display_authority_id();
+    let short_session = short_remote_session_id(session.address.display_session_id());
+    let command_host_port = remote_command_host_port_label(session);
+    let command_host = format!("{}@{}", command, host);
+
+    let mut candidates = Vec::new();
+    if authority != host {
+        candidates.push(format!("{}#{}", command_host_port, short_session));
+        candidates.push(command_host_port.clone());
+    }
+    candidates.push(format!("{}#{}", command_host, short_session));
+    candidates.push(command_host);
+    candidates
+}
+
+fn short_remote_session_id(session_id: &str) -> &str {
+    const SHORT_ID_LEN: usize = 6;
+    if session_id.len() <= SHORT_ID_LEN {
+        session_id
+    } else {
+        &session_id[..SHORT_ID_LEN]
     }
 }
 
@@ -369,7 +392,7 @@ mod tests {
 
         assert!(output.contains("bash@192.168.31.182:7513"));
         assert!(output.contains("192.168.31.182"));
-        assert!(!output.contains("session 372645a93b9cd222"));
+        assert!(!output.contains("372645a93b9cd222"));
     }
 
     #[test]
@@ -402,5 +425,56 @@ mod tests {
 
         assert!(output.contains("192.168.31.182 INPUT"));
         assert!(!output.contains("bash@192.168.31.182:3726"));
+    }
+
+    #[test]
+    fn sidebar_ui_distinguishes_remote_sessions_from_same_host() {
+        let output = SidebarUi::render(
+            "wa-1",
+            "waitagent-1",
+            Some("10.1.26.84#7474:31a4ee8d182de4b6"),
+            Some("10.1.26.84#7474:284eee13328a1f82"),
+            &[
+                ManagedSessionRecord {
+                    address: ManagedSessionAddress::remote_peer(
+                        "10.1.26.84#7474",
+                        "284eee13328a1f82",
+                    ),
+                    selector: Some("10.1.26.84#7474:284eee13328a1f82".to_string()),
+                    availability: SessionAvailability::Online,
+                    workspace_dir: Some(PathBuf::from("/tmp/wa-rca-local")),
+                    workspace_key: Some("284eee13328a1f82".to_string()),
+                    session_role: None,
+                    opened_by: Vec::new(),
+                    attached_clients: 0,
+                    window_count: 1,
+                    command_name: Some("bash".to_string()),
+                    current_path: Some(PathBuf::from("/tmp/wa-rca-local")),
+                    task_state: ManagedSessionTaskState::Input,
+                },
+                ManagedSessionRecord {
+                    address: ManagedSessionAddress::remote_peer(
+                        "10.1.26.84#7474",
+                        "31a4ee8d182de4b6",
+                    ),
+                    selector: Some("10.1.26.84#7474:31a4ee8d182de4b6".to_string()),
+                    availability: SessionAvailability::Online,
+                    workspace_dir: Some(PathBuf::from("/tmp/wa-rca-local")),
+                    workspace_key: Some("31a4ee8d182de4b6".to_string()),
+                    session_role: None,
+                    opened_by: Vec::new(),
+                    attached_clients: 0,
+                    window_count: 1,
+                    command_name: Some("bash".to_string()),
+                    current_path: Some(PathBuf::from("/tmp/wa-rca-local")),
+                    task_state: ManagedSessionTaskState::Input,
+                },
+            ],
+            32,
+            7,
+        );
+
+        assert!(output.contains("> bash@10.1.26.84:7474"));
+        assert!(output.contains("* bash@10.1.26.84:7474"));
     }
 }

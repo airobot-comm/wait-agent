@@ -1,4 +1,5 @@
 use crate::domain::session_catalog::ManagedSessionRecord;
+use crate::domain::session_catalog::SessionAvailability;
 use crate::domain::session_catalog::SessionTransport;
 use crate::infra::error_log::ERROR_LOG;
 use crate::infra::tmux::TmuxSessionGateway;
@@ -65,7 +66,14 @@ impl TargetCatalogGateway for DefaultTargetCatalogGateway {
             Some(socket_name) => self
                 .remote_runtime_owner
                 .try_snapshot(socket_name)
-                .map(|snapshot| snapshot.sessions)
+                .map(|snapshot| {
+                    ERROR_LOG.log(format!(
+                        "[diag-native] list_targets: socket={} remote_snapshot_sessions={}",
+                        socket_name,
+                        snapshot.sessions.len()
+                    ));
+                    snapshot.sessions
+                })
                 .unwrap_or_else(|error| {
                     ERROR_LOG.log(format!(
                         "[diag] list_targets: remote snapshot failed for `{socket_name}`: {error}"
@@ -74,10 +82,14 @@ impl TargetCatalogGateway for DefaultTargetCatalogGateway {
                 }),
             None => Vec::new(),
         };
-        Ok(merge_targets_by_identity([
-            self.local_tmux.list_sessions()?,
-            remote_sessions,
-        ]))
+        let local_sessions = self.local_tmux.list_sessions()?;
+        let merged = merge_targets_by_identity([local_sessions, remote_sessions]);
+        ERROR_LOG.log(format!(
+            "[diag-native] list_targets: current_socket={:?} merged_targets={}",
+            self.current_socket_name,
+            merged.len()
+        ));
+        Ok(merged)
     }
 }
 
@@ -237,10 +249,11 @@ pub fn project_visible_targets(
     let mut visible_targets = targets
         .iter()
         .filter(|target| {
-            (target.address.transport() == &SessionTransport::LocalTmux
-                && target.address.authority_id() == authority_id
-                && target.is_target_host())
-                || target.address.transport() == &SessionTransport::RemotePeer
+            target.availability != SessionAvailability::Exited
+                && ((target.address.transport() == &SessionTransport::LocalTmux
+                    && target.address.authority_id() == authority_id
+                    && target.is_target_host())
+                    || target.address.transport() == &SessionTransport::RemotePeer)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -268,8 +281,9 @@ pub fn project_visible_targets(
 }
 
 pub fn is_activation_target(target: &ManagedSessionRecord) -> bool {
-    (target.address.transport() == &SessionTransport::LocalTmux && target.is_target_host())
-        || target.address.transport() == &SessionTransport::RemotePeer
+    target.availability != SessionAvailability::Exited
+        && ((target.address.transport() == &SessionTransport::LocalTmux && target.is_target_host())
+            || target.address.transport() == &SessionTransport::RemotePeer)
 }
 
 fn sort_targets_for_display(targets: &mut [ManagedSessionRecord]) {

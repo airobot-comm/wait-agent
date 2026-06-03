@@ -373,7 +373,7 @@ impl RemoteAuthorityTransportRuntime {
         )
     }
 
-    fn send_payload(
+    pub(crate) fn send_payload(
         &self,
         session_id: &str,
         target_id: &str,

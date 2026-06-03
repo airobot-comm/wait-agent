@@ -1,5 +1,6 @@
 use crate::domain::session_catalog::ManagedSessionRecord;
 use crate::domain::workspace::WorkspaceSessionRole;
+use crate::infra::error_log::ERROR_LOG;
 use crate::infra::remote_grpc_proto::v1::node_session_envelope::Body as GrpcBody;
 use crate::infra::remote_grpc_proto::v1::{
     ApplyPtyResize, CloseMirrorRequest, MirrorBootstrapChunk, MirrorBootstrapComplete,
@@ -271,6 +272,10 @@ impl RemoteNodeSessionRuntime {
         transport_session_id: &str,
         source_session_name: Option<&str>,
     ) -> Result<(), RemoteNodeSessionError> {
+        ERROR_LOG.log(format!(
+            "[diag-bug] send_target_exited: sending TargetExited via Publication channel, transport_session_id={}, source_session_name={:?}, node_id={}",
+            transport_session_id, source_session_name, self.node_id
+        ));
         let target_id = format!("remote-peer:{}:{transport_session_id}", self.node_id);
         self.send_payload(
             NodeSessionChannel::Publication,
@@ -630,10 +635,20 @@ pub(crate) fn map_inbound_grpc_authority_event(
                 message: payload.reason,
             },
         )),
+        Some(GrpcBody::TargetExited(_)) | Some(GrpcBody::TargetPublished(_)) => {
+            // Publication-channel messages — handled by the ingress worker's
+            // route_grpc_envelope, not by the authority event channel.
+            None
+        }
         Some(GrpcBody::ServerHello(_)) | Some(GrpcBody::Heartbeat(_)) => None,
-        Some(other) => Some(GrpcAuthorityEvent::Failed(format!(
-            "unexpected grpc authority envelope `{other:?}`",
-        ))),
+        Some(other) => {
+            ERROR_LOG.log(format!(
+                "[diag-bug] map_inbound_grpc_authority_event: UNHANDLED body type -> Failed, body={other:?}"
+            ));
+            Some(GrpcAuthorityEvent::Failed(format!(
+                "unexpected grpc authority envelope `{other:?}`",
+            )))
+        }
         None => None,
     }
 }

@@ -114,6 +114,7 @@ impl RemoteMainSlotIngressRuntime {
         let _grpc_guard = self.spawn_background_grpc_bridge(
             extract_authority_id_from_target(&command.target),
             authority_sink,
+            command.socket_name.clone(),
         )?;
         ERROR_LOG.log(format!(
             "[diag-timing] grpc bridge spawned, entering pane_runtime.run ({:?})",
@@ -136,6 +137,7 @@ impl RemoteMainSlotIngressRuntime {
         &self,
         authority_id: String,
         authority_sink: QueuedAuthorityStreamSink,
+        socket_name: String,
     ) -> Result<Option<GrpcAuthorityBridgeGuard>, LifecycleError> {
         let Some(endpoint_uri) = self.network.connect_endpoint_uri() else {
             return Ok(None);
@@ -143,6 +145,11 @@ impl RemoteMainSlotIngressRuntime {
         if authority_id.is_empty() {
             return Ok(None);
         }
+
+        let publication_sink = Arc::new(LiveRemotePublicationSink {
+            runtime: self.publication_runtime.clone(),
+            socket_name,
+        });
 
         thread::Builder::new()
             .name("grpc-bridge".into())
@@ -175,7 +182,7 @@ impl RemoteMainSlotIngressRuntime {
                             run_grpc_node_ingress_worker(
                                 event_rx,
                                 authority_sink.clone(),
-                                Arc::new(NoopPublicationSink),
+                                publication_sink.clone(),
                             );
                             ERROR_LOG.log(format!(
                                 "[diag-timing] grpc-bridge: ingress worker exited (worker={:?}, total={:?}), reconnecting in {:?}",
@@ -226,22 +233,11 @@ impl RemoteNodePublicationSink for LiveRemotePublicationSink {
 
 pub(crate) struct GrpcAuthorityBridgeGuard;
 
-struct NoopPublicationSink;
-
-impl RemoteNodePublicationSink for NoopPublicationSink {
-    fn publish(
-        &self,
-        _envelope: ProtocolEnvelope<ControlPlanePayload>,
-    ) -> Result<(), RemoteNodeSessionError> {
-        Ok(())
-    }
-}
-
 fn extract_authority_id_from_target(target: &str) -> String {
+    let target = target.strip_prefix("remote-peer:").unwrap_or(target);
     target
-        .strip_prefix("remote-peer:")
-        .and_then(|t| t.split_once(':'))
-        .map(|(id, _)| id.to_string())
+        .rsplit_once(':')
+        .map(|(authority_id, _)| authority_id.to_string())
         .unwrap_or_default()
 }
 

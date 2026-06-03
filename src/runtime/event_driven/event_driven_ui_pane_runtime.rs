@@ -191,6 +191,17 @@ impl EventDrivenUiPaneState {
             return;
         }
 
+        if let Some(active_target) = self.active_target.as_ref() {
+            let active_is_present = self
+                .sessions
+                .iter()
+                .any(|session| session.address.qualified_target() == *active_target);
+            if active_is_present && self.selected_target.as_ref() != Some(active_target) {
+                self.selected_target = Some(active_target.clone());
+                return;
+            }
+        }
+
         let selection_is_still_valid = self.selected_target.as_ref().map(|target| {
             self.sessions
                 .iter()

@@ -317,6 +317,12 @@ pub trait RemoteAuthorityPublicationGateway: Send + Sync + Clone + 'static {
         socket_name: &str,
         target_session_name: &str,
     ) -> Result<(), LifecycleError>;
+
+    fn signal_source_session_closed(
+        &self,
+        socket_name: &str,
+        target_session_name: &str,
+    ) -> Result<(), LifecycleError>;
 }
 
 impl RemoteAuthorityPublicationGateway for RemoteTargetPublicationRuntime {
@@ -348,6 +354,14 @@ impl RemoteAuthorityPublicationGateway for RemoteTargetPublicationRuntime {
         target_session_name: &str,
     ) -> Result<(), LifecycleError> {
         signal_publication_sender_live_session_unregistered(socket_name, target_session_name)
+    }
+
+    fn signal_source_session_closed(
+        &self,
+        socket_name: &str,
+        target_session_name: &str,
+    ) -> Result<(), LifecycleError> {
+        self.signal_source_session_closed(socket_name, target_session_name)
     }
 }
 
@@ -542,8 +556,8 @@ where
             .open(&input_fifo_path)
             .map_err(remote_authority_error)?;
 
-        const PANE_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(2);
-        const MAX_IDLE_WITHOUT_PANE_CHECK: Duration = Duration::from_secs(5);
+        const PANE_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+        const MAX_IDLE_WITHOUT_PANE_CHECK: Duration = Duration::from_secs(1);
 
         let health = Arc::new(EventLoopHealth::new());
         let mut pending_input: Vec<u8> = Vec::new();
@@ -856,6 +870,9 @@ where
         ));
         let _ = transport
             .send_target_exited(&command.transport_session_id, &command.target_session_name);
+        let _ = self
+            .publication_gateway
+            .signal_source_session_closed(&command.socket_name, &command.target_session_name);
         if matches!(mirror_state, MirrorState::Active { .. }) {
             let _ = deactivate_mirror(self, &command, &pane);
         }

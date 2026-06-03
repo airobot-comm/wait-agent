@@ -1,4 +1,5 @@
 pub mod footer_menu_runtime;
+pub mod local_target_host_runtime;
 pub mod main_slot_runtime;
 pub mod native_pane_fullscreen_runtime;
 pub mod sidecar_process_runtime;

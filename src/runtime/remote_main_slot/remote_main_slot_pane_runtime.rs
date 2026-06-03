@@ -665,7 +665,56 @@ impl RemoteMainSlotPaneRuntime {
                                         &mut io::stdout(),
                                         CLEAR_SCREEN_HOME_ESCAPE.as_bytes(),
                                     );
+                                    let _ = std::io::Write::write_all(
+                                        &mut io::stdout(),
+                                        b"\r\n-- session exited --\r\n",
+                                    );
                                     let _ = std::io::Write::flush(&mut io::stdout());
+
+                                    // Clean remote target exit is an explicit workspace
+                                    // state transition, not a pane-crash fallback.
+                                    let pane_id = std::env::var("TMUX_PANE")
+                                        .unwrap_or_else(|_| String::new());
+                                    ERROR_LOG.log(format!(
+                                        "[diag-native] session exit: TMUX_PANE={pane_id} socket={} target={}",
+                                        spec.socket_name,
+                                        spec.target
+                                    ));
+                                    let home = std::env::var("HOME")
+                                        .unwrap_or_else(|_| "/tmp".to_string());
+                                    let tmux = std::path::PathBuf::from(home)
+                                        .join(".local/share/waitagent/tmux");
+                                    let waitagent = std::env::current_exe()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_else(|_| "waitagent".to_string());
+                                    let shell_cmd = format!(
+                                        "'{}' __remote-target-exited --socket-name '{}' --session-name '{}' --target '{}' --pane-id '{}'",
+                                        waitagent,
+                                        spec.socket_name,
+                                        spec.surface_scope,
+                                        spec.target,
+                                        pane_id,
+                                    );
+                                    ERROR_LOG.log(format!(
+                                        "[diag-native] session exit: run-shell cmd={shell_cmd}"
+                                    ));
+                                    match std::process::Command::new(&tmux)
+                                        .args(["-L", &spec.socket_name, "run-shell", &shell_cmd])
+                                        .output()
+                                    {
+                                        Ok(o) => {
+                                            ERROR_LOG.log(format!(
+                                                "[diag-native] session exit: run-shell ok status={}",
+                                                o.status
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            ERROR_LOG.log(format!(
+                                                "[diag-native] session exit: run-shell FAILED: {e}"
+                                            ));
+                                        }
+                                    }
+
                                     return Ok(());
                                 }
                                 return Err(remote_protocol_error(e));
@@ -807,6 +856,10 @@ impl RemoteMainSlotPaneRuntime {
                         }
                         if should_exit_surface_locally(&spec, &bytes) {
                             return Ok(());
+                        }
+                        if slot_pane_helpers::is_local_navigation_sequence(&bytes) {
+                            slot_pane_helpers::try_local_navigation(&spec.socket_name, &bytes);
+                            continue;
                         }
                         if let Some(binding) = binding.as_ref() {
                             if bytes.is_empty() {

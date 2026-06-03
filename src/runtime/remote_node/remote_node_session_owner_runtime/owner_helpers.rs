@@ -3,6 +3,7 @@ use crate::domain::session_catalog::{
     ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState, SessionAvailability,
 };
 use crate::domain::workspace::WorkspaceSessionRole;
+use crate::infra::error_log::ERROR_LOG;
 use crate::infra::remote_protocol::{
     ControlPlanePayload, NodeSessionChannel, ProtocolEnvelope, REMOTE_PROTOCOL_VERSION,
 };
@@ -1163,6 +1164,38 @@ fn forward_host_output_to_shared_session(
                         &shared_session.publication_runtime,
                         &shared_session.routes,
                     );
+                }
+            }
+            ControlPlanePayload::TargetExited(payload) => {
+                ERROR_LOG.log(format!(
+                    "[diag-bug] forward_host_output_to_shared_session: received TargetExited, transport_session_id={}, source_session_name={:?}, has_session={}",
+                    payload.transport_session_id,
+                    payload.source_session_name,
+                    shared_session.current_session().is_some()
+                ));
+                let Some(session) = shared_session.current_session() else {
+                    ERROR_LOG.log("[diag-bug] forward_host_output_to_shared_session: TargetExited has NO session, skipping".to_string());
+                    continue;
+                };
+                ERROR_LOG.log(
+                    "[diag-bug] forward_host_output_to_shared_session: calling send_target_exited on session"
+                        .to_string(),
+                );
+                if session
+                    .send_target_exited(
+                        &payload.transport_session_id,
+                        payload.source_session_name.as_deref(),
+                    )
+                    .is_err()
+                {
+                    ERROR_LOG.log("[diag-bug] forward_host_output_to_shared_session: send_target_exited FAILED, disconnecting".to_string());
+                    shared_session.disconnect_session(&session);
+                    mark_live_routes_offline(
+                        &shared_session.publication_runtime,
+                        &shared_session.routes,
+                    );
+                } else {
+                    ERROR_LOG.log("[diag-bug] forward_host_output_to_shared_session: send_target_exited succeeded".to_string());
                 }
             }
             other => {

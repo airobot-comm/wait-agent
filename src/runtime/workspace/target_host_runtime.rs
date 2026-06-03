@@ -4,42 +4,71 @@ use crate::application::target_registry_service::{
 use crate::application::workspace_service::{BootstrappedWorkspace, WorkspaceService};
 use crate::domain::session_catalog::{ManagedSessionRecord, SessionTransport};
 use crate::domain::workspace::WorkspaceInstanceConfig;
-use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError, TmuxSocketName};
+use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError, TmuxLayoutGateway, TmuxSocketName};
 use crate::lifecycle::LifecycleError;
+use crate::runtime::local_target_host_runtime::local_target_host_program;
 use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
 use crate::runtime::workspace_runtime::WorkspaceRuntime;
 use std::io;
+use std::path::PathBuf;
 
 pub struct TargetHostRuntime {
     workspace_runtime: WorkspaceRuntime<EmbeddedTmuxBackend>,
     backend: EmbeddedTmuxBackend,
     remote_target_publication_runtime: RemoteTargetPublicationRuntime,
     target_registry: TargetRegistryService<DefaultTargetCatalogGateway>,
+    current_executable: PathBuf,
+    network: crate::cli::RemoteNetworkConfig,
 }
 
 impl TargetHostRuntime {
+    #[cfg(test)]
+    pub fn from_build_env(backend: EmbeddedTmuxBackend) -> Result<Self, LifecycleError> {
+        let current_executable = std::env::current_exe().map_err(|error| {
+            LifecycleError::Io(
+                "failed to locate current waitagent executable".to_string(),
+                error,
+            )
+        })?;
+        Self::from_build_env_with_network_and_executable(
+            backend,
+            crate::cli::RemoteNetworkConfig::default(),
+            current_executable,
+        )
+    }
+
     pub fn new(
         workspace_runtime: WorkspaceRuntime<EmbeddedTmuxBackend>,
         backend: EmbeddedTmuxBackend,
         remote_target_publication_runtime: RemoteTargetPublicationRuntime,
         target_registry: TargetRegistryService<DefaultTargetCatalogGateway>,
+        current_executable: PathBuf,
+        network: crate::cli::RemoteNetworkConfig,
     ) -> Self {
         Self {
             workspace_runtime,
             backend,
             remote_target_publication_runtime,
             target_registry,
+            current_executable,
+            network,
         }
     }
 
-    pub fn from_build_env(backend: EmbeddedTmuxBackend) -> Result<Self, LifecycleError> {
+    pub fn from_build_env_with_network_and_executable(
+        backend: EmbeddedTmuxBackend,
+        network: crate::cli::RemoteNetworkConfig,
+        current_executable: PathBuf,
+    ) -> Result<Self, LifecycleError> {
         Ok(Self::new(
             WorkspaceRuntime::new(WorkspaceService::new(backend.clone())),
             backend,
-            RemoteTargetPublicationRuntime::from_build_env()?,
+            RemoteTargetPublicationRuntime::from_build_env_with_network(network.clone())?,
             TargetRegistryService::new(
                 DefaultTargetCatalogGateway::from_build_env().map_err(target_host_error)?,
             ),
+            current_executable,
+            network,
         ))
     }
 
@@ -47,7 +76,21 @@ impl TargetHostRuntime {
         &self,
         config: WorkspaceInstanceConfig,
     ) -> Result<BootstrappedWorkspace, TmuxError> {
-        self.workspace_runtime.ensure_workspace_for_config(config)
+        let workspace = self.workspace_runtime.ensure_workspace_for_config(config)?;
+        let program = local_target_host_program(
+            &self.current_executable,
+            workspace.workspace_handle.socket_name.as_str(),
+            workspace.workspace_handle.session_name.as_str(),
+            &workspace.workspace_dir,
+            &self.network,
+        );
+        let pane = self.backend.target_main_pane_on_socket(
+            workspace.workspace_handle.socket_name.as_str(),
+            workspace.workspace_handle.session_name.as_str(),
+        )?;
+        self.backend
+            .respawn_pane(&workspace.workspace_handle, &pane, &program)?;
+        Ok(workspace)
     }
 
     pub fn refresh_published_target_session(

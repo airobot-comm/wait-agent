@@ -78,6 +78,14 @@ impl CommandDispatcher {
                 .pane_runtime
                 .run_footer(command)
                 .map_err(AppError::from),
+            Command::LocalTargetHost(command) => self
+                .workspace_runtime
+                .run_local_target_host(command)
+                .map_err(AppError::from),
+            Command::LocalTargetExited(command) => self
+                .workspace_runtime
+                .run_local_target_exited(command)
+                .map_err(AppError::from),
             Command::RemoteMainSlot(command) => self
                 .remote_main_slot_ingress_runtime
                 .run(command)
@@ -155,6 +163,14 @@ impl CommandDispatcher {
             Command::MainPaneDied(command) => self
                 .workspace_runtime
                 .run_main_pane_died(command)
+                .map_err(AppError::from),
+            Command::RemoteTargetExited(command) => self
+                .workspace_runtime
+                .run_remote_target_exited(command)
+                .map_err(AppError::from),
+            Command::MainPaneWatchdog(command) => self
+                .workspace_runtime
+                .run_main_pane_watchdog(command)
                 .map_err(AppError::from),
             Command::FooterMenu(command) => self
                 .footer_menu_runtime

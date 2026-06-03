@@ -5,12 +5,15 @@ use crate::application::target_registry_service::{
 use crate::application::workspace_path_service::WorkspacePathService;
 use crate::application::workspace_service::WorkspaceService;
 use crate::cli::{
-    ActivateTargetCommand, AttachCommand, DetachCommand, MainPaneDiedCommand, NewTargetCommand,
-    RemoteNetworkConfig, RemoteNodeIngressServerCommand, StopCommand, ToggleFullscreenCommand,
+    ActivateTargetCommand, AttachCommand, DetachCommand, LocalTargetExitedCommand,
+    LocalTargetHostCommand, MainPaneDiedCommand, MainPaneWatchdogCommand, NewTargetCommand,
+    RemoteNetworkConfig, RemoteNodeIngressServerCommand, RemoteTargetExitedCommand, StopCommand,
+    ToggleFullscreenCommand,
 };
 use crate::domain::session_catalog::{ManagedSessionRecord, SessionTransport};
 use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError, TmuxSocketName};
 use crate::lifecycle::LifecycleError;
+use crate::runtime::local_target_host_runtime::LocalTargetHostRuntime;
 use crate::runtime::main_slot_runtime::MainSlotRuntime;
 use crate::runtime::native_pane_fullscreen_runtime::NativePaneFullscreenRuntime;
 use crate::runtime::remote_node_ingress_server_runtime::RemoteNodeIngressServerRuntime;
@@ -30,6 +33,7 @@ pub struct WorkspaceCommandRuntime {
     path_service: WorkspacePathService,
     entry_runtime: WorkspaceEntryRuntime,
     main_slot_runtime: MainSlotRuntime,
+    local_target_host_runtime: LocalTargetHostRuntime,
     fullscreen_runtime: NativePaneFullscreenRuntime,
     remote_runtime_owner_runtime: RemoteRuntimeOwnerRuntime,
     remote_target_publication_runtime: RemoteTargetPublicationRuntime,
@@ -64,12 +68,27 @@ impl WorkspaceCommandRuntime {
             DefaultTargetCatalogGateway::from_build_env().map_err(tmux_runtime_error)?,
         );
         let main_slot_backend = backend.clone();
-        let target_host_runtime = TargetHostRuntime::from_build_env(backend.clone())?;
-        let command_target_host_runtime = TargetHostRuntime::from_build_env(backend.clone())?;
+        let target_host_runtime = TargetHostRuntime::from_build_env_with_network_and_executable(
+            backend.clone(),
+            network.clone(),
+            current_executable.clone(),
+        )?;
+        let command_target_host_runtime =
+            TargetHostRuntime::from_build_env_with_network_and_executable(
+                backend.clone(),
+                network.clone(),
+                current_executable.clone(),
+            )?;
         let remote_runtime_owner_runtime =
             RemoteRuntimeOwnerRuntime::from_build_env_with_network(network.clone())?;
         let remote_target_publication_runtime =
             RemoteTargetPublicationRuntime::from_build_env_with_network(network.clone())?;
+        let local_target_host_runtime = LocalTargetHostRuntime::new(
+            backend.clone(),
+            RemoteTargetPublicationRuntime::from_build_env_with_network(network.clone())?,
+            current_executable.clone(),
+            network.clone(),
+        );
 
         Ok(Self {
             path_service: WorkspacePathService::new(),
@@ -84,6 +103,7 @@ impl WorkspaceCommandRuntime {
                 current_executable,
                 network.clone(),
             ),
+            local_target_host_runtime,
             fullscreen_runtime: NativePaneFullscreenRuntime::new(
                 backend.clone(),
                 TargetRegistryService::new(
@@ -159,8 +179,36 @@ impl WorkspaceCommandRuntime {
         self.main_slot_runtime.run_new_target(command)
     }
 
+    pub fn run_local_target_host(
+        &self,
+        command: LocalTargetHostCommand,
+    ) -> Result<(), LifecycleError> {
+        self.local_target_host_runtime.run_host(command)
+    }
+
+    pub fn run_local_target_exited(
+        &self,
+        command: LocalTargetExitedCommand,
+    ) -> Result<(), LifecycleError> {
+        self.local_target_host_runtime.run_target_exited(command)
+    }
+
     pub fn run_main_pane_died(&self, command: MainPaneDiedCommand) -> Result<(), LifecycleError> {
         self.main_slot_runtime.run_main_pane_died(command)
+    }
+
+    pub fn run_remote_target_exited(
+        &self,
+        command: RemoteTargetExitedCommand,
+    ) -> Result<(), LifecycleError> {
+        self.main_slot_runtime.run_remote_target_exited(command)
+    }
+
+    pub fn run_main_pane_watchdog(
+        &self,
+        command: MainPaneWatchdogCommand,
+    ) -> Result<(), LifecycleError> {
+        self.main_slot_runtime.run_main_pane_watchdog(command)
     }
 
     pub fn run_toggle_fullscreen(

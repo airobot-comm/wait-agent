@@ -486,6 +486,14 @@ impl RawPtyInputRoute {
         if input_bytes.is_empty() {
             return Ok(true);
         }
+        // Never forward local navigation escape sequences to the remote PTY.
+        // When the terminal sends C-Right / Left and tmux does not intercept
+        // the binding (e.g. under certain terminal emulators or SSH configs),
+        // the bytes would otherwise reach the remote shell instead of switching
+        // the local chrome pane.
+        if is_local_navigation_sequence(&input_bytes) {
+            return Ok(false);
+        }
         let Some(route) = self
             .inner
             .lock()
@@ -533,8 +541,8 @@ pub(super) fn spawn_input_thread(tx: mpsc::Sender<RemotePaneEvent>, raw_input: R
                     {
                         Ok(forwarded) => {
                             ERROR_LOG.log(format!(
-                                "[diag-timing] input thread: read {} bytes, forwarded={}",
-                                read, forwarded
+                                "[diag-timing] input thread: read {} bytes, forwarded={}, bytes={:?}",
+                                read, forwarded, bytes
                             ));
                             forwarded
                         }
@@ -1161,6 +1169,41 @@ fn write_escape(sequence: &str) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(sequence.as_bytes())?;
     stdout.flush()
+}
+
+/// Escape sequences for local chrome navigation keys that must not be
+/// forwarded to the remote PTY.
+pub(super) fn is_local_navigation_sequence(bytes: &[u8]) -> bool {
+    // C-Right (focus sidebar): CSI 1;5 C
+    // Left (focus main):      CSI D
+    bytes == b"\x1b[1;5C" || bytes == b"\x1b[D"
+}
+
+/// Execute a tmux `select-pane` command for local chrome navigation.
+/// Called from the event loop when a navigation escape sequence is received
+/// and the raw input route refused to forward it.
+pub(super) fn try_local_navigation(socket_name: &str, bytes: &[u8]) {
+    let direction = if bytes == b"\x1b[1;5C" {
+        "-R"
+    } else if bytes == b"\x1b[D" {
+        "-L"
+    } else {
+        return;
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let tmux = std::path::PathBuf::from(home).join(".local/share/waitagent/tmux");
+    if std::process::Command::new(&tmux)
+        .args(["-L", socket_name, "select-pane", direction])
+        .output()
+        .is_err()
+    {
+        ERROR_LOG.log(format!(
+            "[diag] local navigation failed: tmux={} socket={} direction={}",
+            tmux.display(),
+            socket_name,
+            direction
+        ));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
