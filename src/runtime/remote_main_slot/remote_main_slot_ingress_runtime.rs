@@ -5,6 +5,10 @@ use crate::infra::remote_grpc_transport::{
 };
 use crate::lifecycle::LifecycleError;
 use crate::runtime::remote_authority_connection_runtime::QueuedAuthorityStreamSink;
+use crate::runtime::remote_authority_transport_runtime::{
+    authority_transport_socket_path, spawn_authority_transport_listener,
+    AuthorityTransportListenerGuard,
+};
 use crate::runtime::remote_main_slot_pane_runtime::RemoteMainSlotPaneRuntime;
 use crate::runtime::remote_node_ingress_runtime::run_grpc_node_ingress_worker;
 use crate::runtime::remote_node_session_runtime::{
@@ -71,13 +75,22 @@ impl RemoteMainSlotIngressRuntime {
             command.target
         ));
         let authority_sink = self.pane_runtime.external_authority_stream_submitter()?;
-        // Start gRPC bridge in background so the UI (run_surface) starts
-        // immediately instead of blocking on gRPC connection establishment.
-        let _grpc_guard = self.spawn_background_grpc_bridge(
-            extract_authority_id_from_target(&command.target),
-            authority_sink,
-            command.socket_name.clone(),
-        )?;
+        // In client mode (`--connect`), this pane owns a direct outbound gRPC
+        // bridge. In server/listener mode, it exposes the same scoped authority
+        // transport socket that the global node-ingress owner discovers via
+        // inotify and bridges into the already-open remote node session. Both
+        // paths feed accepted streams into the pane-owned queue.
+        let _authority_ingress = if self.network.connect_endpoint_uri().is_some() {
+            AuthorityIngressGuard::grpc(self.spawn_background_grpc_bridge(
+                extract_authority_id_from_target(&command.target),
+                authority_sink,
+                command.socket_name.clone(),
+            )?)
+        } else {
+            AuthorityIngressGuard::local(
+                self.start_local_authority_transport_listener(&command, authority_sink)?,
+            )
+        };
         ERROR_LOG.log(format!(
             "[diag-timing] grpc bridge spawned, entering pane_runtime.run ({:?})",
             t_run.elapsed()
@@ -95,6 +108,24 @@ impl RemoteMainSlotIngressRuntime {
     /// Each successful connection submits a fresh authority stream to the
     /// sink, which triggers a new `Connected` event in the pane event loop
     /// so the reconnecting phase can recover without user intervention.
+    fn start_local_authority_transport_listener(
+        &self,
+        command: &RemoteMainSlotCommand,
+        authority_sink: QueuedAuthorityStreamSink,
+    ) -> Result<AuthorityTransportListenerGuard, LifecycleError> {
+        let socket_path = authority_transport_socket_path(
+            &command.socket_name,
+            &command.session_name,
+            &command.target,
+        );
+        spawn_authority_transport_listener(socket_path, authority_sink).map_err(|error| {
+            LifecycleError::Io(
+                "failed to start remote main-slot authority transport listener".to_string(),
+                error,
+            )
+        })
+    }
+
     fn spawn_background_grpc_bridge(
         &self,
         authority_id: String,
@@ -193,6 +224,27 @@ impl RemoteNodePublicationSink for LiveRemotePublicationSink {
     }
 }
 
+struct AuthorityIngressGuard {
+    _grpc: Option<GrpcAuthorityBridgeGuard>,
+    _local: Option<AuthorityTransportListenerGuard>,
+}
+
+impl AuthorityIngressGuard {
+    fn grpc(guard: Option<GrpcAuthorityBridgeGuard>) -> Self {
+        Self {
+            _grpc: guard,
+            _local: None,
+        }
+    }
+
+    fn local(guard: AuthorityTransportListenerGuard) -> Self {
+        Self {
+            _grpc: None,
+            _local: Some(guard),
+        }
+    }
+}
+
 pub(crate) struct GrpcAuthorityBridgeGuard;
 
 fn extract_authority_id_from_target(target: &str) -> String {
@@ -209,7 +261,7 @@ mod tests {
     use crate::application::target_registry_service::{
         DefaultTargetCatalogGateway, TargetRegistryService,
     };
-    use crate::cli::RemoteNetworkConfig;
+    use crate::cli::{RemoteMainSlotCommand, RemoteNetworkConfig};
     use crate::domain::session_catalog::{
         ConsoleLocation, ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState,
         SessionAvailability,
@@ -224,7 +276,9 @@ mod tests {
     use crate::runtime::remote_authority_connection_runtime::{
         AuthorityConnectionRequest, AuthorityTransportEvent,
     };
-    use crate::runtime::remote_authority_transport_runtime::authority_transport_socket_path;
+    use crate::runtime::remote_authority_transport_runtime::{
+        authority_transport_socket_path, RemoteAuthorityTransportRuntime,
+    };
     use crate::runtime::remote_main_slot_pane_runtime::apply_authority_envelope;
     use crate::runtime::remote_main_slot_pane_runtime::RemoteMainSlotPaneRuntime;
     use crate::runtime::remote_main_slot_runtime::RemoteMainSlotRuntime;
@@ -244,8 +298,12 @@ mod tests {
     use tonic::Request;
 
     #[test]
-    fn ingress_runtime_owns_external_authority_stream_submission() {
-        let runtime = RemoteMainSlotIngressRuntime::from_build_env()
+    fn connected_client_ingress_runtime_owns_external_authority_stream_submission() {
+        let runtime =
+            RemoteMainSlotIngressRuntime::from_build_env_with_network(RemoteNetworkConfig {
+                port: 7474,
+                connect: Some("127.0.0.1:7474".to_string()),
+            })
             .expect("ingress runtime should build from build env");
         let (_client, server) = UnixStream::pair().expect("stream pair should open");
 
@@ -262,6 +320,88 @@ mod tests {
         assert!(rendered.contains("waitagent-remote-"));
         assert!(rendered.ends_with(".sock"));
         assert!(rendered.len() < 108);
+    }
+
+    #[test]
+    fn server_listener_mode_keeps_queued_stream_for_local_authority_transport_listener() {
+        let runtime = RemoteMainSlotIngressRuntime::from_build_env()
+            .expect("ingress runtime should build from build env");
+
+        assert!(runtime
+            .pane_runtime
+            .external_authority_stream_submitter()
+            .is_ok());
+    }
+
+    #[test]
+    fn connected_client_mode_uses_queued_authority_stream_source() {
+        let runtime =
+            RemoteMainSlotIngressRuntime::from_build_env_with_network(RemoteNetworkConfig {
+                port: 7474,
+                connect: Some("127.0.0.1:7474".to_string()),
+            })
+            .expect("ingress runtime should build from build env");
+
+        assert!(runtime
+            .pane_runtime
+            .external_authority_stream_submitter()
+            .is_ok());
+    }
+
+    #[test]
+    fn server_listener_authority_transport_listener_registers_with_pane_queue() {
+        let target_registry = TargetRegistryService::new(
+            DefaultTargetCatalogGateway::from_build_env()
+                .expect("build env target catalog should exist"),
+        );
+        let pane_runtime = RemoteMainSlotPaneRuntime::new_with_external_authority_streams(
+            target_registry,
+            PathBuf::from("/tmp/waitagent"),
+        );
+        let runtime = RemoteMainSlotIngressRuntime::new(
+            pane_runtime,
+            RemoteTargetPublicationRuntime::from_build_env()
+                .expect("publication runtime should build from env"),
+            RemoteNetworkConfig::default(),
+        );
+        let command = RemoteMainSlotCommand {
+            socket_name: unique_socket_name("server-main-slot-authority"),
+            session_name: "workspace-1".to_string(),
+            target: "remote-peer:peer-a:shell-1".to_string(),
+        };
+        let sink = runtime
+            .pane_runtime
+            .external_authority_stream_submitter()
+            .expect("pane queue should exist");
+        let (tx, rx) = mpsc::channel();
+        let _connection_guard = runtime
+            .pane_runtime
+            .start_authority_connection(
+                AuthorityConnectionRequest {
+                    socket_path: std::env::temp_dir().join("unused-server-main-slot.sock"),
+                    authority_id: "peer-a".to_string(),
+                },
+                RemoteConnectionRegistry::new(),
+                tx,
+            )
+            .expect("pane runtime should start queued authority connection");
+        let _listener = runtime
+            .start_local_authority_transport_listener(&command, sink)
+            .expect("server main-slot listener should bind");
+
+        let socket_path = authority_transport_socket_path(
+            &command.socket_name,
+            &command.session_name,
+            &command.target,
+        );
+        let _transport = RemoteAuthorityTransportRuntime::connect(socket_path, "peer-a")
+            .expect("ingress bridge should connect with authority transport protocol");
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("connected event should arrive"),
+            AuthorityTransportEvent::Connected
+        );
     }
 
     #[test]
@@ -590,6 +730,14 @@ mod tests {
                 cursor_visible: true,
             })),
         }
+    }
+
+    fn unique_socket_name(prefix: &str) -> String {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        format!("waitagent-test-{prefix}-{}-{millis}", std::process::id())
     }
 
     fn unused_local_addr() -> SocketAddr {
