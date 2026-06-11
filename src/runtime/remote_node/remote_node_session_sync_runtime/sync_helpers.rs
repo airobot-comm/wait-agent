@@ -28,6 +28,7 @@ use crate::runtime::remote_node_session_runtime::{
     map_inbound_grpc_authority_event, map_outbound_grpc_envelope,
 };
 use crate::runtime::remote_node_transport_runtime::{read_client_hello, write_server_hello};
+use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
 use std::collections::HashMap;
 use std::io;
 use std::net::Shutdown;
@@ -47,7 +48,7 @@ use super::{
 pub(super) fn run_remote_session_sync_loop<G, T>(
     gateway: G,
     transport: T,
-    _network: RemoteNetworkConfig,
+    network: RemoteNetworkConfig,
     node_id: String,
     endpoint_uri: String,
     poll_interval: Duration,
@@ -57,6 +58,16 @@ pub(super) fn run_remote_session_sync_loop<G, T>(
     G: LocalSessionCatalog,
     T: OutboundRemoteNodeTransport,
 {
+    let publication_runtime =
+        match RemoteTargetPublicationRuntime::from_build_env_with_network(network) {
+            Ok(rt) => Some(rt),
+            Err(error) => {
+                ERROR_LOG.log(format!(
+                    "[diag-sync] failed to create publication runtime: {error}"
+                ));
+                None
+            }
+        };
     let mut next_message_id = 0_u64;
     loop {
         if should_stop(&stop_rx) {
@@ -89,12 +100,22 @@ pub(super) fn run_remote_session_sync_loop<G, T>(
         while !should_reconnect {
             let wait_duration = next_sync_at.saturating_duration_since(Instant::now());
             if let Ok(event) = event_rx.recv_timeout(wait_duration) {
-                let outcome =
-                    handle_transport_event(event, &mut active_session, &mut authority_manager);
+                let outcome = handle_transport_event(
+                    event,
+                    &mut active_session,
+                    &mut authority_manager,
+                    publication_runtime.as_ref(),
+                    &node_id,
+                );
                 should_reconnect |= outcome.should_reconnect;
                 while let Ok(event) = event_rx.try_recv() {
-                    let outcome =
-                        handle_transport_event(event, &mut active_session, &mut authority_manager);
+                    let outcome = handle_transport_event(
+                        event,
+                        &mut active_session,
+                        &mut authority_manager,
+                        publication_runtime.as_ref(),
+                        &node_id,
+                    );
                     should_reconnect |= outcome.should_reconnect;
                 }
             }
@@ -139,6 +160,8 @@ pub(super) fn handle_transport_event(
     event: RemoteNodeTransportEvent,
     active_session: &mut Option<RemoteNodeSessionHandle>,
     authority_manager: &mut SessionSyncAuthorityManager,
+    publication_runtime: Option<&RemoteTargetPublicationRuntime>,
+    node_id: &str,
 ) -> TransportEventOutcome {
     match event {
         RemoteNodeTransportEvent::SessionOpened { session } => {
@@ -156,10 +179,18 @@ pub(super) fn handle_transport_event(
                 should_reconnect: false,
             }
         }
-        RemoteNodeTransportEvent::SessionClosed { node_id, .. } => {
+        RemoteNodeTransportEvent::SessionClosed {
+            node_id: event_node_id,
+            ..
+        } => {
+            let node_id = event_node_id.as_str();
             ERROR_LOG.log(format!(
                 "[diag-sync] SessionClosed for node {node_id}, will reconnect"
             ));
+            if let Some(publication_runtime) = publication_runtime {
+                let _ =
+                    publication_runtime.remove_discovered_remote_node_on_live_workspaces(node_id);
+            }
             authority_manager.shutdown();
             *active_session = None;
             TransportEventOutcome {
@@ -167,11 +198,18 @@ pub(super) fn handle_transport_event(
             }
         }
         RemoteNodeTransportEvent::TransportFailed {
-            node_id, message, ..
+            node_id: event_node_id,
+            message,
+            ..
         } => {
+            let node_id = event_node_id.as_deref().unwrap_or(node_id);
             ERROR_LOG.log(format!(
-                "[diag-sync] TransportFailed node={node_id:?} msg={message}, will reconnect"
+                "[diag-sync] TransportFailed node={node_id} msg={message}, will reconnect"
             ));
+            if let Some(publication_runtime) = publication_runtime {
+                let _ =
+                    publication_runtime.remove_discovered_remote_node_on_live_workspaces(node_id);
+            }
             authority_manager.shutdown();
             *active_session = None;
             TransportEventOutcome {

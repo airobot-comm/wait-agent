@@ -404,34 +404,17 @@ fn handle_transport_event(
             }
         }
         RemoteNodeTransportEvent::SessionClosed {
-            node_id,
             session_instance_id,
+            ..
         } => {
             sessions.remove(&session_instance_id);
-            if !sessions
-                .values()
-                .any(|active| active.session.node_id() == node_id)
-            {
-                let _ =
-                    publication_runtime.remove_discovered_remote_node_on_live_workspaces(&node_id);
-            }
         }
         RemoteNodeTransportEvent::TransportFailed {
-            node_id,
             session_instance_id,
             ..
         } => {
             if let Some(session_instance_id) = session_instance_id {
                 sessions.remove(&session_instance_id);
-            }
-            if let Some(node_id) = node_id {
-                if !sessions
-                    .values()
-                    .any(|active| active.session.node_id() == node_id)
-                {
-                    let _ = publication_runtime
-                        .remove_discovered_remote_node_on_live_workspaces(&node_id);
-                }
             }
         }
     }
