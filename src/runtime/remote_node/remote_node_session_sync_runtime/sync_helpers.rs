@@ -603,7 +603,6 @@ pub(super) fn spawn_live_authority_listener(
     running: Arc<AtomicBool>,
     writer: Arc<Mutex<Option<UnixStream>>>,
     writer_ready: Arc<Condvar>,
-    pending_commands: Arc<Mutex<Vec<RemoteAuthorityCommand>>>,
 ) {
     thread::spawn(move || {
         let Ok(listener) = bind_live_authority_listener(&socket_path) else {
@@ -619,7 +618,6 @@ pub(super) fn spawn_live_authority_listener(
                         running.clone(),
                         writer.clone(),
                         writer_ready.clone(),
-                        pending_commands.clone(),
                     );
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -647,7 +645,6 @@ fn bridge_live_authority_stream(
     running: Arc<AtomicBool>,
     writer: Arc<Mutex<Option<UnixStream>>>,
     writer_ready: Arc<Condvar>,
-    pending_commands: Arc<Mutex<Vec<RemoteAuthorityCommand>>>,
 ) -> Result<(), LifecycleError> {
     let _node_id = read_client_hello(&mut host_stream).map_err(remote_session_sync_error)?;
     write_server_hello(&mut host_stream, LIVE_AUTHORITY_SERVER_ID)
@@ -670,9 +667,7 @@ fn bridge_live_authority_stream(
         *writer_guard = Some(host_stream.try_clone().map_err(remote_session_sync_error)?);
     }
     writer_ready.notify_all();
-    // Flush any commands that were queued while the bridge was starting up.
-    flush_pending_authority_commands(&writer, &pending_commands);
-    ERROR_LOG.log("[diag-timing] bridge_live_authority_stream: writer set, pending flushed, starting forward_host_output_to_session".to_string());
+    ERROR_LOG.log("[diag-timing] bridge_live_authority_stream: writer set, ready signalled, starting forward_host_output_to_session".to_string());
     let result = forward_host_output_to_session(host_reader, session_handle, running.clone());
     ERROR_LOG.log(format!("[diag-timing] bridge_live_authority_stream: forward_host_output_to_session exited, result={:?}", result));
     let _ = host_stream.shutdown(Shutdown::Both);
@@ -727,52 +722,45 @@ fn forward_host_output_to_session(
     Ok(())
 }
 
-/// Drains the pending-command queue and writes each command through the
-/// authority bridge writer. Called once the bridge connection is established,
-/// after the writer field has been set.
-pub(super) fn flush_pending_authority_commands(
-    writer: &Arc<Mutex<Option<UnixStream>>>,
-    pending: &Arc<Mutex<Vec<RemoteAuthorityCommand>>>,
-) {
-    let commands = match pending.lock() {
-        Ok(mut guard) => std::mem::take(&mut *guard),
-        Err(poisoned) => {
-            ERROR_LOG.log(
-                "[session-sync] authority pending-commands mutex poisoned during flush, recovering"
-                    .to_string(),
-            );
-            std::mem::take(&mut *poisoned.into_inner())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AuthorityHostSignal {
+    Ready,
+    Starting,
+    Closed,
+}
+
+const AUTHORITY_HOST_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(super) fn authority_host_signal(host: &SessionSyncAuthorityHost) -> AuthorityHostSignal {
+    match host.writer.lock() {
+        Ok(guard) => {
+            if guard.is_some() {
+                AuthorityHostSignal::Ready
+            } else if host.running.load(Ordering::Relaxed) {
+                AuthorityHostSignal::Starting
+            } else {
+                AuthorityHostSignal::Closed
+            }
         }
-    };
-    if commands.is_empty() {
-        return;
-    }
-    let mut guard = match writer.lock() {
-        Ok(guard) => guard,
         Err(poisoned) => {
-            ERROR_LOG.log(
-                "[session-sync] authority writer mutex poisoned during pending flush, recovering"
-                    .to_string(),
-            );
-            poisoned.into_inner()
-        }
-    };
-    let Some(writer) = guard.as_mut() else {
-        return;
-    };
-    for command in &commands {
-        if write_control_plane_envelope(writer, &authority_command_envelope(command.clone()))
-            .is_err()
-        {
-            break;
+            ERROR_LOG.log("[session-sync] authority writer mutex poisoned, recovering".to_string());
+            let guard = poisoned.into_inner();
+            if guard.is_some() {
+                AuthorityHostSignal::Ready
+            } else if host.running.load(Ordering::Relaxed) {
+                AuthorityHostSignal::Starting
+            } else {
+                AuthorityHostSignal::Closed
+            }
         }
     }
 }
 
-pub(super) fn send_command_to_host(
+pub(super) fn deliver_command_to_ready_host(
     host: &SessionSyncAuthorityHost,
     command: RemoteAuthorityCommand,
-) -> Result<(), LifecycleError> {
+) -> Result<AuthorityHostSignal, LifecycleError> {
+    let target_id = authority_command_target_id(&command).to_string();
     let mut guard = match host.writer.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -781,42 +769,37 @@ pub(super) fn send_command_to_host(
         }
     };
 
-    if let Some(writer) = guard.as_mut() {
-        // Fast path: bridge ready, send immediately
-        let target_id = authority_command_target_id(&command).to_string();
-        let envelope = authority_command_envelope(command);
-        write_control_plane_envelope(writer, &envelope).map_err(remote_session_sync_error)?;
-        ERROR_LOG.log(format!(
-            "[diag-timing] send_command_to_host: sent command to target={target_id}"
-        ));
-        Ok(())
-    } else if !host.running.load(Ordering::Relaxed) {
-        // Bridge has already stopped — host is stale
-        Err(LifecycleError::Protocol(format!(
-            "authority host for `{}` already stopped",
-            authority_command_target_id(&command)
-        )))
-    } else {
-        // Bridge still starting up (or has already shut down) — queue the
-        // command for later delivery. flush_pending_authority_commands()
-        // will drain these when the bridge completes.
-        ERROR_LOG.log(format!(
-            "[diag-timing] send_command_to_host: writer not ready for target={}, queuing",
-            authority_command_target_id(&command)
-        ));
-        drop(guard);
-        match host.pending_commands.lock() {
-            Ok(mut pending) => pending.push(command),
-            Err(poisoned) => {
-                ERROR_LOG.log(
-                    "[session-sync] authority pending-commands mutex poisoned, recovering"
-                        .to_string(),
-                );
-                poisoned.into_inner().push(command);
-            }
+    while guard.is_none() && host.running.load(Ordering::Relaxed) {
+        let wait_result = host
+            .writer_ready
+            .wait_timeout(guard, AUTHORITY_HOST_READY_TIMEOUT)
+            .map_err(|_| {
+                LifecycleError::Protocol(
+                    "authority writer mutex poisoned while waiting for ready signal".to_string(),
+                )
+            })?;
+        guard = wait_result.0;
+        if wait_result.1.timed_out() {
+            return Ok(AuthorityHostSignal::Starting);
         }
-        Ok(())
     }
+
+    let Some(writer) = guard.as_mut() else {
+        return Ok(AuthorityHostSignal::Closed);
+    };
+    let envelope = authority_command_envelope(command);
+    if let Err(error) = write_control_plane_envelope(writer, &envelope) {
+        let _ = writer.shutdown(Shutdown::Both);
+        *guard = None;
+        ERROR_LOG.log(format!(
+            "[diag-timing] send_command_to_host: write failed for target={target_id}: {error}"
+        ));
+        return Ok(AuthorityHostSignal::Closed);
+    }
+    ERROR_LOG.log(format!(
+        "[diag-timing] send_command_to_host: sent command to target={target_id}"
+    ));
+    Ok(AuthorityHostSignal::Ready)
 }
 
 fn authority_command_envelope(

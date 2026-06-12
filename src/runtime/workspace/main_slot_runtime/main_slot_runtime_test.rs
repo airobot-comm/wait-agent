@@ -1,6 +1,6 @@
 mod tests {
     use super::super::{
-        next_remote_fallback_target, next_target_host_session, remote_main_slot_program,
+        next_remote_target, next_target_host_session, remote_main_slot_program,
         split_qualified_target, target_socket_name, CurrentWorkspace, MainSlotRuntime,
         FOOTER_PANE_TITLE, SIDEBAR_PANE_TITLE, WAITAGENT_ACTIVE_TARGET_OPTION,
         WAITAGENT_MAIN_PANE_GENERATION_OPTION, WAITAGENT_MAIN_PANE_OPTION,
@@ -23,6 +23,7 @@ mod tests {
         TmuxWorkspaceHandle,
     };
     use crate::runtime::current_executable::waitagent_test_executable;
+    use crate::runtime::network_state_runtime::persist_workspace_network_config;
     use crate::runtime::remote_runtime_owner_runtime::RemoteRuntimeOwnerRuntime;
     use crate::runtime::target_host_runtime::TargetHostRuntime;
     use crate::runtime::workspace_entry_runtime::WorkspaceEntryRuntime;
@@ -46,7 +47,7 @@ mod tests {
         ];
 
         let next = next_target_host_session(&sessions, "wa-1", Some("wa-1:target-a"))
-            .expect("fallback target should exist");
+            .expect("next target should exist");
 
         assert_eq!(next.address.qualified_target(), "wa-1:target-b");
     }
@@ -86,7 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn next_remote_fallback_target_prefers_another_remote_target() {
+    fn next_remote_target_prefers_another_remote_target() {
         let _guard = crate::test_support::integration_test_lock();
         let sessions = vec![
             session("wa-1", "workspace", WorkspaceSessionRole::WorkspaceChrome),
@@ -95,14 +96,14 @@ mod tests {
             remote_session("10.1.29.130#7474", "remote-b"),
         ];
 
-        let next = next_remote_fallback_target(&sessions, Some("10.1.29.130#7474:remote-a"))
-            .expect("remote fallback target should exist");
+        let next = next_remote_target(&sessions, Some("10.1.29.130#7474:remote-a"))
+            .expect("remote next target should exist");
 
         assert_eq!(next.address.qualified_target(), "10.1.29.130#7474:remote-b");
     }
 
     #[test]
-    fn next_remote_fallback_target_returns_none_without_another_remote_target() {
+    fn next_remote_target_returns_none_without_another_remote_target() {
         let _guard = crate::test_support::integration_test_lock();
         let sessions = vec![
             session("wa-1", "workspace", WorkspaceSessionRole::WorkspaceChrome),
@@ -110,9 +111,7 @@ mod tests {
             remote_session("10.1.29.130#7474", "remote-a"),
         ];
 
-        assert!(
-            next_remote_fallback_target(&sessions, Some("10.1.29.130#7474:remote-a")).is_none()
-        );
+        assert!(next_remote_target(&sessions, Some("10.1.29.130#7474:remote-a")).is_none());
     }
 
     #[test]
@@ -1836,7 +1835,7 @@ mod tests {
         );
         assert!(
             remote_sessions.contains(&remote_target_2.address.qualified_target()),
-            "fallback remote target should remain in the runtime owner snapshot"
+            "next remote target should remain in the runtime owner snapshot"
         );
         wait_for_condition(|| {
             workspace_main_pane_command(&backend, &workspace.workspace_handle).as_deref()
@@ -1865,6 +1864,185 @@ mod tests {
             .as_deref(),
             Some("on")
         );
+
+        kill_server(&backend, &workspace.workspace_handle);
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
+    #[test]
+    fn remote_target_exit_activates_existing_next_remote_pane() {
+        let _guard = crate::test_support::integration_test_lock();
+        let backend = EmbeddedTmuxBackend::from_build_env()
+            .expect("vendored tmux backend should discover build env");
+        let workspace_config = unique_workspace_config("remote-exit-next-remote-pane");
+        let workspace_dir = workspace_config.workspace_dir.clone();
+
+        let waitagent_executable = waitagent_test_executable();
+        let network = unique_remote_network_config(&workspace_config.workspace_key);
+        let entry_runtime = WorkspaceEntryRuntime::new(
+            WorkspaceRuntime::new(WorkspaceService::new(backend.clone())),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                network.clone(),
+            )
+            .expect("workspace layout runtime should build"),
+        );
+        let workspace = entry_runtime
+            .bootstrap_workspace(&workspace_dir)
+            .expect("workspace bootstrap should succeed");
+        persist_workspace_network_config(&backend, &workspace.workspace_handle, &network)
+            .expect("workspace network config should persist");
+        let target_host = backend
+            .ensure_workspace(
+                &WorkspaceInstanceConfig::for_new_target_on_socket_with_size(
+                    &workspace_dir,
+                    workspace.workspace_handle.socket_name.as_str(),
+                    None,
+                    None,
+                ),
+            )
+            .expect("target host bootstrap should succeed");
+
+        let runtime = MainSlotRuntime::new(
+            backend.clone(),
+            TargetHostRuntime::from_build_env(backend.clone())
+                .expect("target host runtime should build"),
+            WorkspaceLayoutRuntime::new_for_tests(
+                backend.clone(),
+                waitagent_executable.clone(),
+                network.clone(),
+            )
+            .expect("workspace layout runtime should build"),
+            TargetRegistryService::new(
+                DefaultTargetCatalogGateway::from_build_env_with_socket_name(
+                    workspace.workspace_handle.socket_name.as_str(),
+                )
+                .expect("target catalog gateway should build"),
+            ),
+            waitagent_executable.clone(),
+            network.clone(),
+        );
+
+        let local_target = format!(
+            "{}:{}",
+            workspace.workspace_handle.socket_name.as_str(),
+            target_host.session_name.as_str()
+        );
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: local_target.clone(),
+            })
+            .expect("local target activation should succeed");
+
+        let remote_runtime_owner =
+            RemoteRuntimeOwnerRuntime::new_for_tests(waitagent_executable.clone(), network.clone());
+        let remote_authority = format!("127.0.0.1#{}", network.port);
+        let next_target = remote_session_with_selector(
+            remote_authority.as_str(),
+            "remote-exit-next-a",
+            &local_target,
+            ManagedSessionTaskState::Input,
+        );
+        let exiting_target = remote_session_with_selector(
+            remote_authority.as_str(),
+            "remote-exit-next-b",
+            &local_target,
+            ManagedSessionTaskState::Running,
+        );
+        remote_runtime_owner
+            .upsert_session(remote_authority.as_str(), &next_target)
+            .expect("next remote target should be discoverable");
+        remote_runtime_owner
+            .upsert_session(remote_authority.as_str(), &exiting_target)
+            .expect("exiting remote target should be discoverable");
+
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: next_target.address.qualified_target(),
+            })
+            .expect("next target activation should create its session pane");
+        wait_for_condition(|| {
+            backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read")
+                .as_deref()
+                == Some(next_target.address.qualified_target().as_str())
+        });
+        let next_pane_option = format!(
+            "@waitagent_session_pane_{}",
+            next_target.address.qualified_target().replace(':', ".")
+        );
+        let next_pane_before = backend
+            .show_session_option(&workspace.workspace_handle, &next_pane_option)
+            .expect("next pane option should read")
+            .expect("next pane option should be populated");
+        backend
+            .run_on_socket(
+                &workspace.workspace_handle.socket_name,
+                &[
+                    "respawn-pane".to_string(),
+                    "-k".to_string(),
+                    "-t".to_string(),
+                    next_pane_before.clone(),
+                    "sleep 60".to_string(),
+                ],
+            )
+            .expect("next pane should remain live for activation");
+        wait_for_condition(|| {
+            pane_is_live(&backend, &workspace.workspace_handle, &next_pane_before)
+        });
+
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: exiting_target.address.qualified_target(),
+            })
+            .expect("exiting target activation should succeed");
+        wait_for_condition(|| {
+            backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read")
+                .as_deref()
+                == Some(exiting_target.address.qualified_target().as_str())
+        });
+        let exiting_pane = backend
+            .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
+            .expect("main pane option should read")
+            .expect("main pane option should be populated");
+        assert_ne!(next_pane_before, exiting_pane);
+
+        runtime
+            .run_remote_target_exited(RemoteTargetExitedCommand {
+                socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: exiting_target.address.qualified_target(),
+                pane_id: Some(exiting_pane.clone()),
+            })
+            .expect("remote target exit should activate existing next pane");
+
+        wait_for_condition(|| {
+            backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read")
+                .as_deref()
+                == Some(next_target.address.qualified_target().as_str())
+        });
+        let next_pane_after = backend
+            .show_session_option(&workspace.workspace_handle, &next_pane_option)
+            .expect("next pane option should read after exit")
+            .expect("next pane option should stay populated after exit");
+        assert_eq!(next_pane_after, next_pane_before);
+        let main_pane_after = backend
+            .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
+            .expect("main pane option should read after exit")
+            .expect("main pane option should remain populated after exit");
+        assert_eq!(main_pane_after, next_pane_before);
 
         kill_server(&backend, &workspace.workspace_handle);
         let _ = fs::remove_dir_all(workspace_dir);
@@ -1991,7 +2169,7 @@ mod tests {
                 sidebar_pane.as_str(),
             )
             .expect("session pane option should accept corrupted sidebar owner");
-        let invalid_recovery = runtime.remote_target_exit_content_pane(
+        let invalid_recovery = runtime.exited_remote_content_pane(
             &workspace.workspace_handle,
             remote_target_a.address.qualified_target().as_str(),
             Some(sidebar_pane.as_str()),
@@ -1999,7 +2177,7 @@ mod tests {
         );
         assert!(invalid_recovery.is_err());
         let recovery_pane = runtime
-            .remote_target_exit_content_pane(
+            .exited_remote_content_pane(
                 &workspace.workspace_handle,
                 remote_target_a.address.qualified_target().as_str(),
                 Some(sidebar_pane.as_str()),
@@ -2412,6 +2590,16 @@ mod tests {
             command_name: Some("bash".to_string()),
             current_path: None,
             task_state,
+        }
+    }
+
+    fn unique_remote_network_config(seed: &str) -> RemoteNetworkConfig {
+        let hash = seed.bytes().fold(0u16, |acc, byte| {
+            acc.wrapping_mul(31).wrapping_add(byte as u16)
+        });
+        RemoteNetworkConfig {
+            port: 20000 + (hash % 20000),
+            connect: None,
         }
     }
 

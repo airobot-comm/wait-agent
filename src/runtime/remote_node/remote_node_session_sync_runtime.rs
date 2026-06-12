@@ -132,9 +132,7 @@ pub(super) struct SessionSyncAuthorityManager {
 pub(super) struct SessionSyncAuthorityHost {
     pub(super) writer: Arc<Mutex<Option<UnixStream>>>,
     pub(super) running: Arc<AtomicBool>,
-    #[allow(dead_code)]
     pub(super) writer_ready: Arc<Condvar>,
-    pub(super) pending_commands: Arc<Mutex<Vec<RemoteAuthorityCommand>>>,
 }
 
 #[derive(Clone, Default)]
@@ -342,15 +340,12 @@ impl SessionSyncAuthorityManager {
         let running = Arc::new(AtomicBool::new(true));
         let writer = Arc::new(Mutex::new(None));
         let writer_ready = Arc::new(Condvar::new());
-        let pending_commands: Arc<Mutex<Vec<RemoteAuthorityCommand>>> =
-            Arc::new(Mutex::new(Vec::new()));
         spawn_live_authority_listener(
             authority_socket_path.clone(),
             session_handle.clone(),
             running.clone(),
             writer.clone(),
             writer_ready.clone(),
-            pending_commands.clone(),
         );
         spawn_in_process_authority_target_host(
             running.clone(),
@@ -372,7 +367,6 @@ impl SessionSyncAuthorityManager {
                 writer,
                 running,
                 writer_ready,
-                pending_commands,
             },
         );
         Ok(())
@@ -387,34 +381,53 @@ impl SessionSyncAuthorityManager {
         if !self.running_hosts.contains_key(&target_id) {
             self.ensure_authority_host(session_handle, &target_id)?;
         }
-        let result = self
+        self.deliver_with_host_rebuild(session_handle, &target_id, command, false)
+    }
+
+    fn deliver_with_host_rebuild(
+        &mut self,
+        session_handle: &RemoteNodeSessionHandle,
+        target_id: &str,
+        command: RemoteAuthorityCommand,
+        rebuilt: bool,
+    ) -> Result<(), LifecycleError> {
+        let signal = self
             .running_hosts
-            .get(&target_id)
-            .map(|host| send_command_to_host(host, command.clone()))
-            .unwrap_or_else(|| {
-                Err(LifecycleError::Protocol(
-                    "authority host cache lost entry".to_string(),
-                ))
-            });
-        if result.is_err() {
-            self.running_hosts.remove(&target_id);
-            // Self-heal: authority host exited (e.g. authority transport
-            // closed due to a transient disconnect). Recreate the host
-            // and retry once so the command doesn't get lost.
-            if self
-                .ensure_authority_host(session_handle, &target_id)
-                .is_ok()
-            {
-                if let Some(host) = self.running_hosts.get(&target_id) {
-                    let retry = send_command_to_host(host, command);
-                    if retry.is_err() {
-                        self.running_hosts.remove(&target_id);
-                    }
-                    return retry;
+            .get(target_id)
+            .map(authority_host_signal)
+            .unwrap_or(AuthorityHostSignal::Closed);
+
+        if matches!(signal, AuthorityHostSignal::Closed) {
+            if rebuilt {
+                return Err(LifecycleError::Protocol(format!(
+                    "authority host for `{target_id}` closed before accepting command"
+                )));
+            }
+            self.running_hosts.remove(target_id);
+            self.ensure_authority_host(session_handle, target_id)?;
+            return self.deliver_with_host_rebuild(session_handle, target_id, command, true);
+        }
+
+        let host = self.running_hosts.get(target_id).ok_or_else(|| {
+            LifecycleError::Protocol("authority host cache lost entry".to_string())
+        })?;
+        match deliver_command_to_ready_host(host, command.clone())? {
+            AuthorityHostSignal::Ready => Ok(()),
+            AuthorityHostSignal::Starting => Err(LifecycleError::Protocol(format!(
+                "authority host for `{target_id}` did not become ready"
+            ))),
+            AuthorityHostSignal::Closed => {
+                if rebuilt {
+                    self.running_hosts.remove(target_id);
+                    return Err(LifecycleError::Protocol(format!(
+                        "authority host for `{target_id}` closed before accepting command"
+                    )));
                 }
+                self.running_hosts.remove(target_id);
+                self.ensure_authority_host(session_handle, target_id)?;
+                self.deliver_with_host_rebuild(session_handle, target_id, command, true)
             }
         }
-        result
     }
 }
 

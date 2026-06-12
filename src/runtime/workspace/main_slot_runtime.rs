@@ -780,14 +780,13 @@ impl MainSlotRuntime {
             "[diag-bug] fallback: found {} visible workspace sessions, active_target={active_target:?}",
             sessions.len()
         ));
-        let next_target =
-            next_remote_fallback_target(&sessions, active_target.as_deref()).or_else(|| {
-                next_target_host_session(
-                    &sessions,
-                    workspace.socket_name.as_str(),
-                    active_target.as_deref(),
-                )
-            });
+        let next_target = next_remote_target(&sessions, active_target.as_deref()).or_else(|| {
+            next_target_host_session(
+                &sessions,
+                workspace.socket_name.as_str(),
+                active_target.as_deref(),
+            )
+        });
         ERROR_LOG.log(format!(
             "[diag-bug] fallback: next_target={}",
             next_target.as_ref().map_or("none".to_string(), |t| t
@@ -866,30 +865,36 @@ impl MainSlotRuntime {
 
         self.remove_remote_target_runtime_record(&command.socket_name, &command.target)?;
         let session_pane = self.read_session_pane(&workspace, &command.target)?;
-        let fallback =
+        let next_target =
             self.next_target_after_remote_exit(&workspace, Some(command.target.as_str()))?;
         let mut cleanup_pane = session_pane.clone();
 
-        match fallback {
+        match next_target {
             Some(target) => {
                 let is_remote = target.address.transport() == &SessionTransport::RemotePeer
                     || target.address.authority_id().contains('#');
                 if is_remote {
-                    let recovery_pane = self.remote_target_exit_content_pane(
+                    match self.next_remote_target_pane_after_exit(
                         &workspace,
-                        &command.target,
-                        command.pane_id.as_deref(),
+                        &command,
                         cleanup_pane.as_ref(),
-                    )?;
-                    self.recover_remote_target_in_workspace(
-                        &current_workspace,
-                        &workspace,
-                        &recovery_pane,
                         &target,
-                    )?;
-                    cleanup_pane = None;
+                    )? {
+                        RemoteTargetExitPanePlan::ActivateTargetSessionPane => {
+                            self.activate_remote_target_in_workspace(&current_workspace, &target)?;
+                        }
+                        RemoteTargetExitPanePlan::AssignExitedPaneToNextTarget(pane) => {
+                            self.assign_remote_target_to_content_pane(
+                                &current_workspace,
+                                &workspace,
+                                &pane,
+                                &target,
+                            )?;
+                            cleanup_pane = None;
+                        }
+                    }
                 } else {
-                    let recovery_pane = self.remote_target_exit_content_pane(
+                    let recovery_pane = self.exited_remote_content_pane(
                         &workspace,
                         &command.target,
                         command.pane_id.as_deref(),
@@ -927,7 +932,7 @@ impl MainSlotRuntime {
         Ok(())
     }
 
-    fn remote_target_exit_content_pane(
+    fn exited_remote_content_pane(
         &self,
         workspace: &TmuxWorkspaceHandle,
         target: &str,
@@ -1164,6 +1169,31 @@ impl MainSlotRuntime {
         result
     }
 
+    fn next_remote_target_pane_after_exit(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        command: &RemoteTargetExitedCommand,
+        exited_pane: Option<&TmuxPaneId>,
+        target: &ManagedSessionRecord,
+    ) -> Result<RemoteTargetExitPanePlan, LifecycleError> {
+        let qualified_target = target.address.qualified_target();
+        if self
+            .live_session_pane(workspace, qualified_target.as_str())?
+            .filter(|pane| Some(pane) != exited_pane)
+            .is_some()
+        {
+            return Ok(RemoteTargetExitPanePlan::ActivateTargetSessionPane);
+        }
+
+        let pane = self.exited_remote_content_pane(
+            workspace,
+            &command.target,
+            command.pane_id.as_deref(),
+            exited_pane,
+        )?;
+        Ok(RemoteTargetExitPanePlan::AssignExitedPaneToNextTarget(pane))
+    }
+
     fn recover_remote_target_in_workspace(
         &self,
         current_workspace: &CurrentWorkspace,
@@ -1175,19 +1205,41 @@ impl MainSlotRuntime {
             self.clear_session_pane(workspace, target.address.qualified_target().as_str())?;
             return self.activate_remote_target_in_workspace(current_workspace, target);
         }
-        if self.pane_is_chrome(workspace, recovery_pane.as_str())? {
+        self.assign_remote_target_to_content_pane(
+            current_workspace,
+            workspace,
+            recovery_pane,
+            target,
+        )
+    }
+
+    fn assign_remote_target_to_content_pane(
+        &self,
+        current_workspace: &CurrentWorkspace,
+        workspace: &TmuxWorkspaceHandle,
+        pane: &TmuxPaneId,
+        target: &ManagedSessionRecord,
+    ) -> Result<(), LifecycleError> {
+        if !self.pane_exists_on_socket(workspace, pane.as_str())? {
             return Err(LifecycleError::Protocol(format!(
-                "refusing to recover remote target `{}` in chrome pane `{}`",
+                "next remote target `{}` has no content pane `{}` to activate",
                 target.address.qualified_target(),
-                recovery_pane.as_str()
+                pane.as_str()
+            )));
+        }
+        if self.pane_is_chrome(workspace, pane.as_str())? {
+            return Err(LifecycleError::Protocol(format!(
+                "refusing to assign remote target `{}` to chrome pane `{}`",
+                target.address.qualified_target(),
+                pane.as_str()
             )));
         }
 
-        self.clear_remote_recovery_pane_state(workspace, recovery_pane);
+        self.clear_remote_recovery_pane_state(workspace, pane);
         self.backend
             .respawn_pane(
                 workspace,
-                recovery_pane,
+                pane,
                 &remote_main_slot_program(
                     &self.current_executable,
                     current_workspace,
@@ -1196,15 +1248,11 @@ impl MainSlotRuntime {
                 ),
             )
             .map_err(main_slot_error)?;
-        self.set_session_pane(
-            workspace,
-            target.address.qualified_target().as_str(),
-            recovery_pane,
-        )?;
+        self.set_session_pane(workspace, target.address.qualified_target().as_str(), pane)?;
         self.restore_workspace_main_pane(
             current_workspace,
             workspace,
-            recovery_pane,
+            pane,
             Some(target.address.qualified_target().as_str()),
         )
     }
@@ -1522,7 +1570,7 @@ impl MainSlotRuntime {
             workspace.session_name.as_str(),
             active_target,
         )?;
-        Ok(next_remote_fallback_target(&sessions, active_target))
+        Ok(next_remote_target(&sessions, active_target))
     }
 
     fn current_workspace(
@@ -1721,6 +1769,16 @@ impl MainSlotRuntime {
             .map_err(main_slot_error)?
             .filter(|pane| !pane.is_empty())
             .map(TmuxPaneId::new))
+    }
+
+    fn live_session_pane(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        qualified_target: &str,
+    ) -> Result<Option<TmuxPaneId>, LifecycleError> {
+        Ok(self
+            .read_session_pane(workspace, qualified_target)?
+            .filter(|pane| self.pane_is_live(workspace, pane.as_str())))
     }
 
     fn find_session_pane(
@@ -1983,6 +2041,11 @@ impl MainSlotRuntime {
     }
 }
 
+enum RemoteTargetExitPanePlan {
+    ActivateTargetSessionPane,
+    AssignExitedPaneToNextTarget(TmuxPaneId),
+}
+
 struct CurrentWorkspace {
     socket_name: String,
     session_name: String,
@@ -2049,7 +2112,7 @@ fn next_target_host_session(
     same_socket_targets.into_iter().next()
 }
 
-fn next_remote_fallback_target(
+fn next_remote_target(
     sessions: &[ManagedSessionRecord],
     active_target: Option<&str>,
 ) -> Option<ManagedSessionRecord> {

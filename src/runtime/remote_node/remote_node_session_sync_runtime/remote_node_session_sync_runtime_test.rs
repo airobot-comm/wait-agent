@@ -1,10 +1,11 @@
 mod tests {
     use super::super::{
-        compute_session_sync_delta, exportable_local_sessions_for_socket,
-        local_sessions_by_local_id, overlay_workspace_runtime_onto_active_local_target_hosts,
-        remote_session_exited_envelope, remote_session_published_envelope,
-        remote_session_sync_owner_available, remote_session_sync_owner_socket_path,
-        LocalSessionCatalog, OutboundRemoteNodeTransport, RemoteNodeSessionSyncRuntime,
+        authority_host_signal, compute_session_sync_delta, deliver_command_to_ready_host,
+        exportable_local_sessions_for_socket, local_sessions_by_local_id,
+        overlay_workspace_runtime_onto_active_local_target_hosts, remote_session_exited_envelope,
+        remote_session_published_envelope, remote_session_sync_owner_available,
+        remote_session_sync_owner_socket_path, AuthorityHostSignal, LocalSessionCatalog,
+        OutboundRemoteNodeTransport, RemoteNodeSessionSyncRuntime, SessionSyncAuthorityHost,
     };
     use crate::cli::RemoteNetworkConfig;
     use crate::domain::session_catalog::{
@@ -16,11 +17,17 @@ mod tests {
     use crate::infra::remote_grpc_transport::{
         OutboundNodeSessionRequest, RemoteNodeSessionHandle, RemoteNodeTransportEvent,
     };
+    use crate::infra::remote_protocol::{
+        BootstrapMode, ControlPlanePayload, OpenMirrorRequestPayload,
+    };
+    use crate::infra::remote_transport_codec::read_control_plane_envelope;
+    use crate::runtime::remote_authority_transport_runtime::RemoteAuthorityCommand;
     use std::collections::HashMap;
     use std::fs;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, SystemTime};
 
@@ -145,6 +152,63 @@ mod tests {
             )
             .as_deref(),
             Some("6a1b816eb1111435")
+        );
+    }
+
+    #[test]
+    fn authority_host_starting_signal_waits_for_ready_before_delivery() {
+        let (reader, writer) = UnixStream::pair().expect("unix stream pair should open");
+        let host = SessionSyncAuthorityHost {
+            writer: Arc::new(Mutex::new(None)),
+            running: Arc::new(AtomicBool::new(true)),
+            writer_ready: Arc::new(Condvar::new()),
+        };
+        assert_eq!(authority_host_signal(&host), AuthorityHostSignal::Starting);
+
+        let host_writer = host.writer.clone();
+        let host_ready = host.writer_ready.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            *host_writer
+                .lock()
+                .expect("writer mutex should not be poisoned") = Some(writer);
+            host_ready.notify_all();
+        });
+
+        let command = open_mirror_command("remote-peer:peer-a:shell-1", "shell-1");
+        assert_eq!(
+            deliver_command_to_ready_host(&host, command).expect("delivery should complete"),
+            AuthorityHostSignal::Ready
+        );
+
+        let mut reader = reader;
+        let envelope =
+            read_control_plane_envelope(&mut reader).expect("delivered command should be readable");
+        match envelope.payload {
+            ControlPlanePayload::OpenMirrorRequest(payload) => {
+                assert_eq!(payload.target_id, "remote-peer:peer-a:shell-1");
+                assert_eq!(payload.session_id, "shell-1");
+            }
+            other => panic!("unexpected payload {}", other.message_type()),
+        }
+    }
+
+    #[test]
+    fn authority_host_closed_signal_is_explicit() {
+        let host = SessionSyncAuthorityHost {
+            writer: Arc::new(Mutex::new(None)),
+            running: Arc::new(AtomicBool::new(false)),
+            writer_ready: Arc::new(Condvar::new()),
+        };
+
+        assert_eq!(authority_host_signal(&host), AuthorityHostSignal::Closed);
+        assert_eq!(
+            deliver_command_to_ready_host(
+                &host,
+                open_mirror_command("remote-peer:peer-a:shell-1", "shell-1")
+            )
+            .expect("closed host should return a signal"),
+            AuthorityHostSignal::Closed
         );
     }
 
@@ -382,6 +446,18 @@ mod tests {
                 .map_err(|_| "failed to deliver session open event")?;
             Ok(FakeGuard)
         }
+    }
+
+    fn open_mirror_command(target_id: &str, session_id: &str) -> RemoteAuthorityCommand {
+        RemoteAuthorityCommand::OpenMirror(OpenMirrorRequestPayload {
+            session_id: session_id.to_string(),
+            target_id: target_id.to_string(),
+            console_id: "console-a".to_string(),
+            cols: 80,
+            rows: 24,
+            raw_pty_passthrough: true,
+            bootstrap_mode: BootstrapMode::Full,
+        })
     }
 
     fn try_take_envelope(
