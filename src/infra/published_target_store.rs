@@ -70,22 +70,6 @@ impl PublishedTargetStore {
             .collect()
     }
 
-    pub fn list_records_for_source_socket(
-        &self,
-        socket_name: &str,
-    ) -> Result<Vec<PublishedTargetRecord>, TmuxError> {
-        Ok(self
-            .list_records()?
-            .into_iter()
-            .filter(|record| {
-                record
-                    .source_bindings
-                    .iter()
-                    .any(|binding| binding.socket_name == socket_name)
-            })
-            .collect())
-    }
-
     pub fn list_records_for_source_binding(
         &self,
         socket_name: &str,
@@ -105,6 +89,7 @@ impl PublishedTargetStore {
             .collect())
     }
 
+    #[cfg(test)]
     pub fn upsert_target_from_source(
         &self,
         source_socket_name: &str,
@@ -148,6 +133,7 @@ impl PublishedTargetStore {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn remove_target_from_source(
         &self,
         source_socket_name: &str,
@@ -414,6 +400,7 @@ fn parse_published_target_record(line: &str) -> Result<PublishedTargetRecord, Tm
     })
 }
 
+#[cfg(test)]
 fn validate_published_remote_target(target: &ManagedSessionRecord) -> Result<(), TmuxError> {
     if target.address.transport() != &crate::domain::session_catalog::SessionTransport::RemotePeer {
         return Err(TmuxError::new(format!(
