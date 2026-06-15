@@ -421,12 +421,12 @@ mod tests {
         assert!(update
             .footer
             .as_ref()
-            .map(|buffer| buffer.contains("keys: ^N new"))
+            .map(|buffer| buffer.contains("Ctrl-N") && buffer.contains("Ctrl-M"))
             .unwrap_or(false));
         assert!(update
             .fullscreen_status
             .as_ref()
-            .map(|buffer| buffer.contains("[Ctrl-o] fullscreen off"))
+            .map(|buffer| buffer.contains("Ctrl-O") && buffer.contains("Exit fullscreen"))
             .unwrap_or(false));
     }
 
