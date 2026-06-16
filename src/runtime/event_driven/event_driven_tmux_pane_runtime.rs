@@ -428,7 +428,9 @@ mod tests {
         assert!(update
             .fullscreen_status
             .as_ref()
-            .map(|buffer| buffer.contains("Ctrl-O") && buffer.contains("Exit fullscreen"))
+            .map(|buffer| buffer.contains("Ctrl-O")
+                && buffer.contains("Esc")
+                && buffer.contains("Exit"))
             .unwrap_or(false));
     }
 

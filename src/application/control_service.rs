@@ -2,8 +2,8 @@ use crate::domain::workspace_layout::WorkspaceChromeLayout;
 use crate::infra::tmux::{TmuxControlGateway, TmuxWorkspaceHandle};
 use crate::ui::chrome::{TMUX_MENU_BORDER_STYLE, TMUX_MENU_SELECTED_STYLE, TMUX_MENU_STYLE};
 
-const FULLSCREEN_TOGGLE_KEY: &str = "C-o";
-const FULLSCREEN_TOGGLE_PREFIX_KEY: &str = "z";
+const HISTORY_TOGGLE_KEY: &str = "C-o";
+const HISTORY_TOGGLE_PREFIX_KEY: &str = "z";
 const SIDEBAR_FOCUS_KEY: &str = "C-Right";
 const MAIN_FOCUS_KEY: &str = "Left";
 const SIDEBAR_HIDE_KEY: &str = "h";
@@ -51,11 +51,11 @@ where
         &self,
         workspace: &TmuxWorkspaceHandle,
         layout: &WorkspaceChromeLayout,
-        fullscreen_toggle_command: &str,
+        history_toggle_command: &str,
         footer_bindings: Option<&FooterMenuBindings>,
     ) -> Result<(), G::Error> {
         self.configure_session_chrome(workspace, layout)?;
-        self.bind_main_pane_fullscreen_toggle(workspace, fullscreen_toggle_command)?;
+        self.bind_main_pane_history_toggle(workspace, history_toggle_command)?;
         self.bind_waitagent_sidebar_controls(workspace, layout)?;
         self.bind_waitagent_footer_controls(workspace, layout, footer_bindings)
     }
@@ -95,18 +95,22 @@ where
         )
     }
 
-    fn bind_main_pane_fullscreen_toggle(
+    fn bind_main_pane_history_toggle(
         &self,
         workspace: &TmuxWorkspaceHandle,
         command: &str,
     ) -> Result<(), G::Error> {
-        self.tmux.bind_key_without_prefix(
-            workspace,
-            FULLSCREEN_TOGGLE_KEY,
-            &[command.to_string()],
-        )?;
         self.tmux
-            .bind_command_with_prefix(workspace, FULLSCREEN_TOGGLE_PREFIX_KEY, command)
+            .bind_key_without_prefix(workspace, HISTORY_TOGGLE_KEY, &[command.to_string()])?;
+        self.tmux
+            .bind_command_with_prefix(workspace, HISTORY_TOGGLE_PREFIX_KEY, command)?;
+        for table in ["copy-mode", "copy-mode-vi"] {
+            self.tmux
+                .bind_copy_mode_cancel_key(workspace, table, HISTORY_TOGGLE_KEY)?;
+            self.tmux
+                .bind_copy_mode_cancel_key(workspace, table, "Escape")?;
+        }
+        Ok(())
     }
 
     fn bind_waitagent_sidebar_controls(
@@ -211,6 +215,7 @@ mod tests {
         BindWaitagentSidebarBack(String, String, String),
         BindWaitagentSidebarHide(String, String, String, u16),
         BindWaitagentFooterAction(String, String, String),
+        BindCopyModeCancelKey(String, String),
     }
 
     #[derive(Clone, Default)]
@@ -565,10 +570,23 @@ mod tests {
                 ));
             Ok(())
         }
+
+        fn bind_copy_mode_cancel_key(
+            &self,
+            _workspace: &TmuxWorkspaceHandle,
+            table: &str,
+            key: &str,
+        ) -> Result<(), Self::Error> {
+            self.calls.borrow_mut().push(Call::BindCopyModeCancelKey(
+                table.to_string(),
+                key.to_string(),
+            ));
+            Ok(())
+        }
     }
 
     #[test]
-    fn control_service_binds_ctrl_o_to_fullscreen_command() {
+    fn control_service_binds_ctrl_o_to_history_command() {
         let gateway = FakeGateway::default();
         let service = ControlService::new(gateway.clone());
         let workspace = TmuxWorkspaceHandle {
@@ -628,6 +646,10 @@ mod tests {
                     "z".to_string(),
                     "run-shell -b \"waitagent __toggle-fullscreen\"".to_string(),
                 ),
+                Call::BindCopyModeCancelKey("copy-mode".to_string(), "C-o".to_string()),
+                Call::BindCopyModeCancelKey("copy-mode".to_string(), "Escape".to_string()),
+                Call::BindCopyModeCancelKey("copy-mode-vi".to_string(), "C-o".to_string()),
+                Call::BindCopyModeCancelKey("copy-mode-vi".to_string(), "Escape".to_string()),
                 Call::BindWaitagentFocusSidebar(
                     "C-Right".to_string(),
                     "%1".to_string(),

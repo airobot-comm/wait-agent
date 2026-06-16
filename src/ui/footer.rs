@@ -1,6 +1,6 @@
 use crate::domain::chrome::FooterViewModel;
 use crate::domain::session_catalog::ManagedSessionRecord;
-use crate::ui::chrome::style_status_line;
+use crate::ui::chrome::{display_width, style_status_line, truncate_display_width};
 
 pub struct FooterUi;
 
@@ -135,11 +135,11 @@ fn left_status_text(
 ) -> String {
     let base = match projection {
         FooterProjection::Pane => {
-            "Ctrl-N New · Ctrl-W Conn · Ctrl-S Remote · Ctrl-O Full · Ctrl-E Logs · Ctrl-M Menu"
+            "Ctrl-N New · Ctrl-W Conn · Ctrl-S Remote · Ctrl-O Hist · Ctrl-E Logs · Ctrl-M Menu"
                 .to_string()
         }
         FooterProjection::FullscreenStatus => {
-            "View  Ctrl-O Exit fullscreen · PgUp/PgDn Page · Up/Down Line · q Close · Ctrl-N New"
+            "History  Ctrl-O/Esc Exit · PgUp/PgDn Page · Up/Down Line · q Close · Ctrl-N New"
                 .to_string()
         }
     };
@@ -162,21 +162,19 @@ fn join_left_right(left: &str, right: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let right_width = right.chars().count().min(width.saturating_div(2).max(16));
+
+    let right_width = display_width(right).min(width.saturating_div(2).max(16));
     let right = truncate_path_from_left(right, right_width.min(width));
-    let right_len = right.chars().count();
+    let right_len = display_width(&right);
     if right_len >= width {
         return right;
     }
 
     let spacer = 1;
     let left_width = width.saturating_sub(right_len + spacer);
-    let left = truncate_from_right(left, left_width);
-    format!("{left:<left_width$} {right}")
-}
-
-fn truncate_from_right(value: &str, width: usize) -> String {
-    value.chars().take(width).collect()
+    let left = truncate_display_width(left, left_width);
+    let padding = left_width.saturating_sub(display_width(&left));
+    format!("{}{} {}", left, " ".repeat(padding), right)
 }
 
 fn truncate_path_from_left(value: &str, width: usize) -> String {
@@ -233,7 +231,7 @@ mod tests {
         assert!(output.contains("Ctrl-S"));
         assert!(output.contains("Remote"));
         assert!(output.contains("Ctrl-O"));
-        assert!(output.contains("Full"));
+        assert!(output.contains("Hist"));
         assert!(output.contains("Ctrl-M"));
         assert!(output.contains("Menu"));
         assert!(!output.contains("Prefix-s"));
@@ -271,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_footer_ui_shows_page_and_exit_page_keys() {
+    fn history_footer_ui_shows_page_and_exit_keys() {
         let output = FooterUi::render_fullscreen(
             "wa-1",
             "waitagent-1",
@@ -312,7 +310,8 @@ mod tests {
         );
 
         assert!(output.contains("Ctrl-O"));
-        assert!(output.contains("Exit fullscreen"));
+        assert!(output.contains("Esc"));
+        assert!(output.contains("Exit"));
         assert!(output.contains("PgUp/PgDn"));
         assert!(output.contains("Up/Down"));
         assert!(output.contains("q"));

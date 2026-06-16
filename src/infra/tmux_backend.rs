@@ -320,6 +320,7 @@ impl EmbeddedTmuxBackend {
         Ok(None)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn show_session_local_option_names(
         &self,
         workspace: &TmuxWorkspaceHandle,
@@ -346,6 +347,7 @@ impl EmbeddedTmuxBackend {
             .collect())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn unset_session_option(
         &self,
         workspace: &TmuxWorkspaceHandle,
@@ -796,6 +798,7 @@ impl EmbeddedTmuxBackend {
     /// to the current content. When the pane is in alt-screen mode, the normal
     /// (pre-alt-screen) buffer is captured; use `capture_pane_alt_history_on_socket`
     /// for the alt-screen buffer.
+    #[allow(dead_code)]
     pub fn capture_pane_full_history_on_socket(
         &self,
         socket_name: &str,
@@ -971,6 +974,7 @@ impl EmbeddedTmuxBackend {
         .map(|_| ())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn send_keys_copy_mode_on_socket(
         &self,
         socket_name: &str,

@@ -449,4 +449,11 @@ pub trait TmuxControlGateway: TmuxLayoutGateway {
         footer: &TmuxPaneId,
         command: &str,
     ) -> Result<(), Self::Error>;
+
+    fn bind_copy_mode_cancel_key(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        table: &str,
+        key: &str,
+    ) -> Result<(), Self::Error>;
 }
