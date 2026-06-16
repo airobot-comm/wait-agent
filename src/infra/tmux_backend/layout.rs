@@ -1,4 +1,7 @@
-use super::{parse_tmux_id, validate_percent, EmbeddedTmuxBackend, TmuxError};
+use super::{
+    parse_tmux_id, validate_percent, EmbeddedTmuxBackend, TmuxError,
+    WAITAGENT_PANE_PIPE_OWNER_OPTION,
+};
 use crate::infra::tmux_types::{
     TmuxLayoutGateway, TmuxPaneId, TmuxPaneInfo, TmuxProgram, TmuxSplitSize, TmuxWindowHandle,
     TmuxWindowId, TmuxWorkspaceHandle,
@@ -85,23 +88,68 @@ impl EmbeddedTmuxBackend {
         Ok(())
     }
 
-    pub(crate) fn clear_pane_pipe(
+    pub(crate) fn clear_pane_pipe_if_owner(
         &self,
         workspace: &TmuxWorkspaceHandle,
         pane: &TmuxPaneId,
+        expected_owner: &str,
+    ) -> Result<bool, TmuxError> {
+        let owner = self.show_pane_option_on_socket(
+            &workspace.socket_name,
+            pane,
+            WAITAGENT_PANE_PIPE_OWNER_OPTION,
+        )?;
+        if owner.as_deref() != Some(expected_owner) {
+            return Ok(false);
+        }
+        self.run_workspace_command(workspace, &clear_pane_pipe_args(pane))?;
+        self.unset_pane_option_on_socket(
+            &workspace.socket_name,
+            pane,
+            WAITAGENT_PANE_PIPE_OWNER_OPTION,
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn set_pane_pipe_owned(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        pane: &TmuxPaneId,
+        owner: &str,
+        command: &str,
     ) -> Result<(), TmuxError> {
         self.run_workspace_command(workspace, &clear_pane_pipe_args(pane))?;
+        self.set_pane_option_on_socket(
+            &workspace.socket_name,
+            pane,
+            WAITAGENT_PANE_PIPE_OWNER_OPTION,
+            owner,
+        )?;
+        self.run_workspace_command(workspace, &set_pane_pipe_args(pane, command))?;
         Ok(())
     }
 
-    pub(crate) fn set_pane_pipe(
+    pub(crate) fn set_pane_pipe_owned_if_available(
         &self,
         workspace: &TmuxWorkspaceHandle,
         pane: &TmuxPaneId,
+        owner: &str,
         command: &str,
-    ) -> Result<(), TmuxError> {
-        self.run_workspace_command(workspace, &set_pane_pipe_args(pane, command))?;
-        Ok(())
+    ) -> Result<bool, TmuxError> {
+        let current_owner = self.show_pane_option_on_socket(
+            &workspace.socket_name,
+            pane,
+            WAITAGENT_PANE_PIPE_OWNER_OPTION,
+        )?;
+        let pipe_state = self.pane_pipe_state(workspace, pane)?;
+        if current_owner.is_some() && current_owner.as_deref() != Some(owner) {
+            return Ok(false);
+        }
+        if current_owner.is_none() && pipe_state != "0" {
+            return Ok(false);
+        }
+        self.set_pane_pipe_owned(workspace, pane, owner, command)?;
+        Ok(true)
     }
 
     #[allow(dead_code)]

@@ -1,4 +1,4 @@
-use super::{EmbeddedTmuxBackend, TmuxError};
+use super::{EmbeddedTmuxBackend, TmuxError, WAITAGENT_PANE_PIPE_OWNER_OPTION};
 use crate::infra::tmux::{TmuxPaneId, TmuxSocketName};
 use std::str;
 
@@ -172,28 +172,59 @@ impl EmbeddedTmuxBackend {
         Ok(())
     }
 
-    pub(crate) fn clear_pane_pipe_on_socket(
+    pub(crate) fn clear_pane_pipe_on_socket_if_owner(
         &self,
         socket_name: &str,
         pane: &TmuxPaneId,
-    ) -> Result<(), TmuxError> {
-        self.run_on_socket(
-            &TmuxSocketName::new(socket_name),
-            &clear_pane_pipe_args(pane),
-        )?;
-        Ok(())
+        expected_owner: &str,
+    ) -> Result<bool, TmuxError> {
+        let socket = TmuxSocketName::new(socket_name);
+        let owner =
+            self.show_pane_option_on_socket(&socket, pane, WAITAGENT_PANE_PIPE_OWNER_OPTION)?;
+        if owner.as_deref() != Some(expected_owner) {
+            return Ok(false);
+        }
+        self.run_on_socket(&socket, &clear_pane_pipe_args(pane))?;
+        self.unset_pane_option_on_socket(&socket, pane, WAITAGENT_PANE_PIPE_OWNER_OPTION)?;
+        Ok(true)
     }
 
-    pub(crate) fn set_pane_pipe_on_socket(
+    pub(crate) fn pane_pipe_is_live_on_socket_for_owner(
         &self,
         socket_name: &str,
         pane: &TmuxPaneId,
+        expected_owner: &str,
+    ) -> Result<bool, TmuxError> {
+        let socket = TmuxSocketName::new(socket_name);
+        let owner =
+            self.show_pane_option_on_socket(&socket, pane, WAITAGENT_PANE_PIPE_OWNER_OPTION)?;
+        if owner.as_deref() != Some(expected_owner) {
+            return Ok(false);
+        }
+        let output = self.run_on_socket(
+            &socket,
+            &[
+                "display-message".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                pane.as_str().to_string(),
+                "#{pane_pipe}".to_string(),
+            ],
+        )?;
+        Ok(output.stdout.trim() == "1")
+    }
+
+    pub(crate) fn set_pane_pipe_on_socket_owned(
+        &self,
+        socket_name: &str,
+        pane: &TmuxPaneId,
+        owner: &str,
         command: &str,
     ) -> Result<(), TmuxError> {
-        self.run_on_socket(
-            &TmuxSocketName::new(socket_name),
-            &set_pane_pipe_args(pane, command),
-        )?;
+        let socket = TmuxSocketName::new(socket_name);
+        self.run_on_socket(&socket, &clear_pane_pipe_args(pane))?;
+        self.set_pane_option_on_socket(&socket, pane, WAITAGENT_PANE_PIPE_OWNER_OPTION, owner)?;
+        self.run_on_socket(&socket, &set_pane_pipe_args(pane, command))?;
         Ok(())
     }
 

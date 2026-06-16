@@ -11,8 +11,8 @@ use crate::infra::tmux_glue::{
     TmuxGlueArtifacts, TmuxGlueBuildConfig, TmuxGlueBuildStatus, VendoredTmuxSource,
 };
 use crate::infra::tmux_types::{
-    TmuxLayoutGateway, TmuxProgram, TmuxSessionGateway, TmuxSessionName, TmuxSocketName,
-    TmuxWorkspaceHandle,
+    TmuxLayoutGateway, TmuxPaneId, TmuxProgram, TmuxSessionGateway, TmuxSessionName,
+    TmuxSocketName, TmuxWorkspaceHandle,
 };
 use crate::runtime::remote_authority_target_host_runtime::RemoteTargetTerminalFlags;
 use std::fs;
@@ -31,6 +31,7 @@ const WAITAGENT_WORKSPACE_KEY_ENV: &str = "WAITAGENT_WORKSPACE_KEY";
 const WAITAGENT_SESSION_ROLE_ENV: &str = "WAITAGENT_SESSION_ROLE";
 const WAITAGENT_TRANSPORT_ENV: &str = "WAITAGENT_SESSION_TRANSPORT";
 const WAITAGENT_TRANSPORT_LOCAL_TMUX: &str = "local-tmux";
+pub(crate) const WAITAGENT_PANE_PIPE_OWNER_OPTION: &str = "@waitagent_pane_pipe_owner";
 pub(crate) const WAITAGENT_REMOTE_PUBLICATION_AUTHORITY_ID_ENV: &str =
     "WAITAGENT_REMOTE_PUBLICATION_AUTHORITY_ID";
 pub(crate) const WAITAGENT_REMOTE_PUBLICATION_TRANSPORT_SESSION_ID_ENV: &str =
@@ -256,6 +257,70 @@ impl EmbeddedTmuxBackend {
         } else {
             Ok(Some(value.to_string()))
         }
+    }
+
+    pub(crate) fn show_pane_option_on_socket(
+        &self,
+        socket_name: &TmuxSocketName,
+        pane: &TmuxPaneId,
+        option_name: &str,
+    ) -> Result<Option<String>, TmuxError> {
+        let output = self.run_on_socket(
+            socket_name,
+            &[
+                "show-options".to_string(),
+                "-pqv".to_string(),
+                "-t".to_string(),
+                pane.as_str().to_string(),
+                option_name.to_string(),
+            ],
+        )?;
+        let value = output.stdout.trim();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value.to_string()))
+        }
+    }
+
+    pub(crate) fn set_pane_option_on_socket(
+        &self,
+        socket_name: &TmuxSocketName,
+        pane: &TmuxPaneId,
+        option_name: &str,
+        value: &str,
+    ) -> Result<(), TmuxError> {
+        self.run_on_socket(
+            socket_name,
+            &[
+                "set-option".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                pane.as_str().to_string(),
+                option_name.to_string(),
+                value.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn unset_pane_option_on_socket(
+        &self,
+        socket_name: &TmuxSocketName,
+        pane: &TmuxPaneId,
+        option_name: &str,
+    ) -> Result<(), TmuxError> {
+        self.run_on_socket(
+            socket_name,
+            &[
+                "set-option".to_string(),
+                "-pu".to_string(),
+                "-t".to_string(),
+                pane.as_str().to_string(),
+                option_name.to_string(),
+            ],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn set_global_option_on_socket(

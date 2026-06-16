@@ -38,6 +38,7 @@ mod tests {
     struct FakeGateway {
         resize_calls: Arc<Mutex<Vec<(usize, usize)>>>,
         pipe_calls: Arc<Mutex<Vec<String>>>,
+        pipe_live: Arc<Mutex<bool>>,
         clear_calls: Arc<Mutex<usize>>,
         input_calls: Arc<Mutex<Vec<Vec<u8>>>>,
         hook_calls: Arc<Mutex<Vec<String>>>,
@@ -72,17 +73,30 @@ mod tests {
             Ok(())
         }
 
-        fn clear_output_pipe(
+        fn clear_output_pipe_if_owner(
             &self,
             _socket_name: &str,
             _pane: &TmuxPaneId,
-        ) -> Result<(), Self::Error> {
+            _owner: &str,
+        ) -> Result<bool, Self::Error> {
             let mut clear_calls = self
                 .clear_calls
                 .lock()
                 .expect("clear calls mutex should not be poisoned");
             *clear_calls += 1;
-            Ok(())
+            Ok(true)
+        }
+
+        fn output_pipe_is_live(
+            &self,
+            _socket_name: &str,
+            _pane: &TmuxPaneId,
+            _owner: &str,
+        ) -> Result<bool, Self::Error> {
+            Ok(*self
+                .pipe_live
+                .lock()
+                .expect("pipe live mutex should not be poisoned"))
         }
 
         fn capture_bootstrap_screen(
@@ -120,16 +134,21 @@ mod tests {
                 .expect("terminal flags mutex should not be poisoned"))
         }
 
-        fn set_output_pipe(
+        fn set_output_pipe_owned(
             &self,
             _socket_name: &str,
             _pane: &TmuxPaneId,
+            _owner: &str,
             command: &str,
         ) -> Result<(), Self::Error> {
             self.pipe_calls
                 .lock()
                 .expect("pipe calls mutex should not be poisoned")
                 .push(command.to_string());
+            *self
+                .pipe_live
+                .lock()
+                .expect("pipe live mutex should not be poisoned") = true;
             Ok(())
         }
 
@@ -883,6 +902,143 @@ mod tests {
         assert_eq!(accepted_count, 2);
         assert_eq!(bootstrap_chunk_count, 2);
         assert_eq!(bootstrap_complete_count, 2);
+        assert_eq!(
+            fake_gateway
+                .resize_calls
+                .lock()
+                .expect("resize calls mutex should not be poisoned")
+                .clone(),
+            vec![(80, 24), (80, 24)]
+        );
+        assert_eq!(
+            fake_gateway
+                .pipe_calls
+                .lock()
+                .expect("pipe calls mutex should not be poisoned")
+                .len(),
+            1
+        );
+        let _ = fs::remove_file(&transport_socket_path);
+    }
+
+    #[test]
+    fn authority_host_runtime_reactivates_repeated_open_when_output_pipe_is_missing() {
+        let socket_name = unique_test_socket_name("wa-reopen-missing-pipe");
+        let transport_socket_path = transport_socket_path("host-reopen-missing-pipe");
+        let transport_listener =
+            UnixListener::bind(&transport_socket_path).expect("transport listener should bind");
+        let fake_gateway = FakeGateway {
+            capture_bootstrap_screen: Arc::new(Mutex::new("\u{1b}[32mbash\u{1b}[0m".to_string())),
+            cursor_position: Arc::new(Mutex::new((4, 0))),
+            terminal_flags: Arc::new(Mutex::new(RemoteTargetTerminalFlags {
+                alternate_screen_active: false,
+                application_cursor_keys: false,
+                cursor_visible: true,
+            })),
+            ..FakeGateway::default()
+        };
+        let fake_gateway_for_server = fake_gateway.clone();
+        let runtime = RemoteAuthorityTargetHostRuntime::new(
+            fake_gateway.clone(),
+            FakePublicationGateway::default(),
+            PathBuf::from("/tmp/waitagent"),
+        );
+        let command = RemoteAuthorityTargetHostCommand {
+            socket_name: socket_name.clone(),
+            target_session_name: "target-1".to_string(),
+            transport_session_id: "target-1".to_string(),
+            authority_id: "peer-a".to_string(),
+            target_id: "remote-peer:peer-a:target-1".to_string(),
+            transport_socket_path: transport_socket_path.to_string_lossy().into_owned(),
+        };
+        let (server_tx, server_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = transport_listener
+                .accept()
+                .expect("transport should accept");
+            let hello = read_control_plane_envelope(&mut stream).expect("hello should decode");
+            match hello.payload {
+                ControlPlanePayload::ClientHello(ClientHelloPayload { .. }) => {}
+                other => panic!("unexpected hello payload: {other:?}"),
+            }
+            write_server_hello(&mut stream, "waitagent-remote-node-session")
+                .expect("server hello should encode");
+
+            write_node_session_envelope(
+                &mut stream,
+                &NodeSessionEnvelope {
+                    channel: NodeSessionChannel::Authority,
+                    envelope: open_mirror_envelope(),
+                },
+            )
+            .expect("first open mirror should encode");
+
+            let mut accepted_count = 0usize;
+            let mut bootstrap_complete_count = 0usize;
+            while accepted_count < 2 || bootstrap_complete_count < 2 {
+                let envelope =
+                    read_node_session_envelope(&mut stream).expect("node session should decode");
+                match envelope.envelope.payload {
+                    ControlPlanePayload::OpenMirrorAccepted(_) => {
+                        accepted_count += 1;
+                        if accepted_count == 1 {
+                            *fake_gateway_for_server
+                                .pipe_live
+                                .lock()
+                                .expect("pipe live mutex should not be poisoned") = false;
+                            write_node_session_envelope(
+                                &mut stream,
+                                &NodeSessionEnvelope {
+                                    channel: NodeSessionChannel::Authority,
+                                    envelope: open_mirror_envelope(),
+                                },
+                            )
+                            .expect("second open mirror should encode");
+                        }
+                    }
+                    ControlPlanePayload::MirrorBootstrapComplete(_) => {
+                        bootstrap_complete_count += 1;
+                        if bootstrap_complete_count == 2 {
+                            write_node_session_envelope(
+                                &mut stream,
+                                &NodeSessionEnvelope {
+                                    channel: NodeSessionChannel::Authority,
+                                    envelope: close_mirror_envelope(),
+                                },
+                            )
+                            .expect("close mirror should encode");
+                        }
+                    }
+                    ControlPlanePayload::MirrorBootstrapChunk(_) => {}
+                    other => panic!("unexpected node-session payload: {other:?}"),
+                }
+            }
+            stream
+                .shutdown(Shutdown::Both)
+                .expect("server shutdown should succeed");
+            server_tx
+                .send((accepted_count, bootstrap_complete_count))
+                .expect("counts should send");
+        });
+
+        runtime
+            .run_target_host(command)
+            .expect("runtime should finish cleanly");
+
+        let (accepted_count, bootstrap_complete_count) = server_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("server harness should complete");
+
+        assert_eq!(accepted_count, 2);
+        assert_eq!(bootstrap_complete_count, 2);
+        assert_eq!(
+            fake_gateway
+                .pipe_calls
+                .lock()
+                .expect("pipe calls mutex should not be poisoned")
+                .len(),
+            2
+        );
         assert_eq!(
             fake_gateway
                 .resize_calls

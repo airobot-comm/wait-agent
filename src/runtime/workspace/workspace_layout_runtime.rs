@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 const STARTUP_CHROME_READY_TIMEOUT: Duration = Duration::from_millis(300);
 const WAITAGENT_MAIN_PANE_OPTION: &str = "@waitagent_main_pane_id";
 const WAITAGENT_MAIN_PANE_PIPE_OPTION: &str = "@waitagent_main_pane_pipe_id";
+const WORKSPACE_MAIN_BRIDGE_PIPE_OWNER: &str = "workspace-main-bridge";
 const WAITAGENT_MAIN_PANE_OUTPUT_BRIDGE_OPTION: &str = "@waitagent_main_pane_output_bridge";
 const WAITAGENT_MAIN_PANE_GENERATION_OPTION: &str = "@waitagent_main_pane_generation";
 const WAITAGENT_MAIN_PANE_TRANSITION_OPTION: &str = "@waitagent_main_pane_transition";
@@ -166,14 +167,25 @@ impl WorkspaceLayoutRuntime {
         else {
             return Ok(());
         };
-        match self.backend.clear_pane_pipe(workspace, &main_pane) {
-            Ok(()) => {}
-            Err(error) if error.is_command_failure() => {}
-            Err(error) => return Err(tmux_layout_error(error)),
+        let bridge_pipe = self
+            .backend
+            .show_session_option(workspace, WAITAGENT_MAIN_PANE_PIPE_OPTION)
+            .map_err(tmux_layout_error)?;
+        if bridge_pipe.as_deref() == Some(main_pane.as_str()) {
+            match self.backend.clear_pane_pipe_if_owner(
+                workspace,
+                &main_pane,
+                WORKSPACE_MAIN_BRIDGE_PIPE_OWNER,
+            ) {
+                Ok(_) => {}
+                Err(error) if error.is_command_failure() => {}
+                Err(error) => return Err(tmux_layout_error(error)),
+            }
+            self.backend
+                .set_session_option(workspace, WAITAGENT_MAIN_PANE_PIPE_OPTION, "")
+                .map_err(tmux_layout_error)?;
         }
-        self.backend
-            .set_session_option(workspace, WAITAGENT_MAIN_PANE_PIPE_OPTION, "")
-            .map_err(tmux_layout_error)
+        Ok(())
     }
 
     pub fn disable_main_pane_output_bridge(
@@ -456,32 +468,41 @@ impl WorkspaceLayoutRuntime {
             .map_err(tmux_layout_error)?;
         if let Some(previous_pipe) = previous_pipe.as_deref() {
             if previous_pipe != main_pane.as_str() {
-                match self
-                    .backend
-                    .clear_pane_pipe(workspace, &TmuxPaneId::new(previous_pipe))
-                {
-                    Ok(()) => {}
+                match self.backend.clear_pane_pipe_if_owner(
+                    workspace,
+                    &TmuxPaneId::new(previous_pipe),
+                    WORKSPACE_MAIN_BRIDGE_PIPE_OWNER,
+                ) {
+                    Ok(_) => {}
                     Err(error) if error.is_command_failure() => {}
                     Err(error) => return Err(tmux_layout_error(error)),
                 }
             }
         }
 
-        match self.backend.clear_pane_pipe(workspace, main_pane) {
-            Ok(()) => {}
-            Err(error) if error.is_command_failure() => {}
+        let installed = match self.backend.set_pane_pipe_owned_if_available(
+            workspace,
+            main_pane,
+            WORKSPACE_MAIN_BRIDGE_PIPE_OWNER,
+            command,
+        ) {
+            Ok(installed) => installed,
+            Err(error) if error.is_command_failure() => false,
             Err(error) => return Err(tmux_layout_error(error)),
+        };
+        if installed {
+            self.backend
+                .set_session_option(
+                    workspace,
+                    WAITAGENT_MAIN_PANE_PIPE_OPTION,
+                    main_pane.as_str(),
+                )
+                .map_err(tmux_layout_error)?;
+        } else if previous_pipe.as_deref() == Some(main_pane.as_str()) {
+            self.backend
+                .set_session_option(workspace, WAITAGENT_MAIN_PANE_PIPE_OPTION, "")
+                .map_err(tmux_layout_error)?;
         }
-        self.backend
-            .set_pane_pipe(workspace, main_pane, command)
-            .map_err(tmux_layout_error)?;
-        self.backend
-            .set_session_option(
-                workspace,
-                WAITAGENT_MAIN_PANE_PIPE_OPTION,
-                main_pane.as_str(),
-            )
-            .map_err(tmux_layout_error)?;
 
         Ok(())
     }

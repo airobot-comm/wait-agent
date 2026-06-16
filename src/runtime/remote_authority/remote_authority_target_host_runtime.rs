@@ -159,12 +159,25 @@ pub trait RemoteTargetPtyGateway: Send + Sync + Clone + 'static {
         pane: &TmuxPaneId,
     ) -> Result<RemoteTargetTerminalFlags, Self::Error>;
 
-    fn clear_output_pipe(&self, socket_name: &str, pane: &TmuxPaneId) -> Result<(), Self::Error>;
-
-    fn set_output_pipe(
+    fn clear_output_pipe_if_owner(
         &self,
         socket_name: &str,
         pane: &TmuxPaneId,
+        owner: &str,
+    ) -> Result<bool, Self::Error>;
+
+    fn output_pipe_is_live(
+        &self,
+        socket_name: &str,
+        pane: &TmuxPaneId,
+        owner: &str,
+    ) -> Result<bool, Self::Error>;
+
+    fn set_output_pipe_owned(
+        &self,
+        socket_name: &str,
+        pane: &TmuxPaneId,
+        owner: &str,
         command: &str,
     ) -> Result<(), Self::Error>;
 
@@ -236,17 +249,32 @@ impl RemoteTargetPtyGateway for EmbeddedTmuxBackend {
         self.pane_terminal_flags_on_socket(socket_name, pane.as_str())
     }
 
-    fn clear_output_pipe(&self, socket_name: &str, pane: &TmuxPaneId) -> Result<(), Self::Error> {
-        self.clear_pane_pipe_on_socket(socket_name, pane)
-    }
-
-    fn set_output_pipe(
+    fn clear_output_pipe_if_owner(
         &self,
         socket_name: &str,
         pane: &TmuxPaneId,
+        owner: &str,
+    ) -> Result<bool, Self::Error> {
+        self.clear_pane_pipe_on_socket_if_owner(socket_name, pane, owner)
+    }
+
+    fn output_pipe_is_live(
+        &self,
+        socket_name: &str,
+        pane: &TmuxPaneId,
+        owner: &str,
+    ) -> Result<bool, Self::Error> {
+        self.pane_pipe_is_live_on_socket_for_owner(socket_name, pane, owner)
+    }
+
+    fn set_output_pipe_owned(
+        &self,
+        socket_name: &str,
+        pane: &TmuxPaneId,
+        owner: &str,
         command: &str,
     ) -> Result<(), Self::Error> {
-        self.set_pane_pipe_on_socket(socket_name, pane, command)
+        self.set_pane_pipe_on_socket_owned(socket_name, pane, owner, command)
     }
 
     fn send_input(
@@ -377,6 +405,7 @@ where
     gateway: G,
     socket_name: String,
     pane: TmuxPaneId,
+    owner: String,
     ingest_socket_path: PathBuf,
     event_socket_path: PathBuf,
 }
@@ -448,6 +477,7 @@ where
             gateway: self.gateway.clone(),
             socket_name: command.socket_name.clone(),
             pane: pane.clone(),
+            owner: remote_mirror_pipe_owner(&command.target_id),
             ingest_socket_path: ingest_socket_path.clone(),
             event_socket_path: event_socket_path.clone(),
         };
@@ -523,36 +553,48 @@ where
                 )) => {
                     health.record_event();
                     if matches!(mirror_state, MirrorState::Active { .. }) {
-                        if let Err(error) = self
+                        match self
                             .gateway
-                            .resize_pty(&command.socket_name, &pane, payload.cols, payload.rows)
-                            .map_err(remote_authority_error)
-                        {
-                            break Err(error);
-                        }
-                        if let Err(error) = transport
-                            .send_open_mirror_accepted(
-                                &payload.session_id,
-                                &payload.target_id,
-                                "online",
+                            .output_pipe_is_live(
+                                &command.socket_name,
+                                &pane,
+                                &remote_mirror_pipe_owner(&command.target_id),
                             )
                             .map_err(remote_authority_error)
                         {
-                            break Err(error);
+                            Ok(true) => {
+                                if let Err(error) = self
+                                    .gateway
+                                    .resize_pty(
+                                        &command.socket_name,
+                                        &pane,
+                                        payload.cols,
+                                        payload.rows,
+                                    )
+                                    .map_err(remote_authority_error)
+                                {
+                                    break Err(error);
+                                }
+                                if let Err(error) = send_mirror_accepted_and_bootstrap(
+                                    self, &command, &pane, &transport, &payload,
+                                ) {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                            Ok(false) => {
+                                ERROR_LOG.log(format!(
+                                    "[diag-pipe] authority active mirror has no live output pipe; reactivating target={} session={} socket={} pane={}",
+                                    command.target_id,
+                                    command.target_session_name,
+                                    command.socket_name,
+                                    pane.as_str()
+                                ));
+                                mirror_state = MirrorState::Inactive;
+                                health.mirror_active.store(false, Ordering::Relaxed);
+                            }
+                            Err(error) => break Err(error),
                         }
-                        if let Err(error) = emit_bootstrap(
-                            self,
-                            &command.socket_name,
-                            &pane,
-                            &transport,
-                            &command.transport_session_id,
-                            &command.target_id,
-                            payload.bootstrap_mode
-                                == crate::infra::remote_protocol::BootstrapMode::VisibleOnly,
-                        ) {
-                            break Err(error);
-                        }
-                        continue;
                     }
                     if payload.target_id != command.target_id
                         || payload.session_id != command.transport_session_id
@@ -598,25 +640,8 @@ where
                         raw_pty_passthrough: payload.raw_pty_passthrough,
                     };
                     health.mirror_active.store(true, Ordering::Relaxed);
-                    if let Err(error) = transport
-                        .send_open_mirror_accepted(
-                            &payload.session_id,
-                            &payload.target_id,
-                            "online",
-                        )
-                        .map_err(remote_authority_error)
-                    {
-                        break Err(error);
-                    }
-                    if let Err(error) = emit_bootstrap(
-                        self,
-                        &command.socket_name,
-                        &pane,
-                        &transport,
-                        &command.transport_session_id,
-                        &command.target_id,
-                        payload.bootstrap_mode
-                            == crate::infra::remote_protocol::BootstrapMode::VisibleOnly,
+                    if let Err(error) = send_mirror_accepted_and_bootstrap(
+                        self, &command, &pane, &transport, &payload,
                     ) {
                         break Err(error);
                     }
@@ -828,7 +853,7 @@ where
     fn drop(&mut self) {
         let _ = self
             .gateway
-            .clear_output_pipe(&self.socket_name, &self.pane);
+            .clear_output_pipe_if_owner(&self.socket_name, &self.pane, &self.owner);
         let _ = fs::remove_file(&self.ingest_socket_path);
         let _ = self
             .gateway
@@ -1084,6 +1109,31 @@ fn send_pane_died_event(event_socket_path: &str, pane_id: &str) {
     }
 }
 
+fn send_mirror_accepted_and_bootstrap<G, P>(
+    runtime: &RemoteAuthorityTargetHostRuntime<G, P>,
+    command: &RemoteAuthorityTargetHostCommand,
+    pane: &TmuxPaneId,
+    transport: &RemoteAuthorityTransportRuntime,
+    payload: &crate::infra::remote_protocol::OpenMirrorRequestPayload,
+) -> Result<(), LifecycleError>
+where
+    G: RemoteTargetPtyGateway,
+    P: RemoteAuthorityPublicationGateway,
+{
+    transport
+        .send_open_mirror_accepted(&payload.session_id, &payload.target_id, "online")
+        .map_err(remote_authority_error)?;
+    emit_bootstrap(
+        runtime,
+        &command.socket_name,
+        pane,
+        transport,
+        &command.transport_session_id,
+        &command.target_id,
+        payload.bootstrap_mode == crate::infra::remote_protocol::BootstrapMode::VisibleOnly,
+    )
+}
+
 fn activate_mirror<G, P>(
     runtime: &RemoteAuthorityTargetHostRuntime<G, P>,
     command: &RemoteAuthorityTargetHostCommand,
@@ -1102,10 +1152,7 @@ where
         &command.socket_name,
         stream_id,
     );
-    runtime
-        .gateway
-        .clear_output_pipe(&command.socket_name, pane)
-        .map_err(remote_authority_error)?;
+    let owner = remote_mirror_pipe_owner(&command.target_id);
     // Resize BEFORE setting up pipe-pane.  pipe-pane -I -O triggers a
     // layout recalculation in tmux that can override a subsequent resize.
     runtime
@@ -1114,7 +1161,7 @@ where
         .map_err(remote_authority_error)?;
     runtime
         .gateway
-        .set_output_pipe(&command.socket_name, pane, &pipe_command)
+        .set_output_pipe_owned(&command.socket_name, pane, &owner, &pipe_command)
         .map_err(remote_authority_error)?;
     Ok(())
 }
@@ -1192,11 +1239,16 @@ where
     G: RemoteTargetPtyGateway,
     P: RemoteAuthorityPublicationGateway,
 {
+    let owner = remote_mirror_pipe_owner(&command.target_id);
     runtime
         .gateway
-        .clear_output_pipe(&command.socket_name, pane)
+        .clear_output_pipe_if_owner(&command.socket_name, pane, &owner)
         .map_err(remote_authority_error)?;
     Ok(())
+}
+
+fn remote_mirror_pipe_owner(target_id: &str) -> String {
+    format!("remote-authority-mirror:{target_id}")
 }
 
 fn shell_escape(value: &str) -> String {
