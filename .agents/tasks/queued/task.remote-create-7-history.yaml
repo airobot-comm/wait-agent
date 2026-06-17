@@ -1,8 +1,8 @@
 id: task.remote-create-7-history
 kind: task
 version: 1
-title: add user-level remote host connection history without persisting secrets
-status: pending
+title: add user-level remote host connection history with secure-store credential persistence
+status: done
 priority: high
 design_ref:
   doc: docs/remote-host-connect-and-session-creation-design.md
@@ -18,7 +18,7 @@ linked_primitives:
   - primitive.verification-refresh
   - primitive.task-board-sync
 done_criteria:
-  - Remote host profiles are stored under ~/.config/waitagent/remote-hosts.toml without plaintext SSH or sudo passwords.
+  - Remote host profiles are stored under ~/.config/waitagent/remote-hosts.toml with only secret references; SSH and sudo password values are stored only through RemoteHostSecretStore.
 verification:
   - cargo test remote_host_history -- --test-threads=1
   - cargo build

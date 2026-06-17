@@ -2,7 +2,7 @@ id: task.remote-create-8-ctrl-w-bootstrap
 kind: task
 version: 1
 title: implement Ctrl-W remote host bootstrap, install/start, endpoint reuse, and remote session creation
-status: pending
+status: done
 priority: high
 design_ref:
   doc: docs/remote-host-connect-and-session-creation-design.md

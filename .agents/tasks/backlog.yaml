@@ -367,7 +367,7 @@ next:
         target-host session before existing session sync publishes it.
   - id: task.remote-create-5-server-service
     title: implement server-side remote session creation service and catalog convergence wait
-    status: in_progress
+    status: done
     design_ref:
       file: docs/remote-host-connect-and-session-creation-design.md
       section: 9.4, 10
@@ -378,7 +378,7 @@ next:
         the synced target without fabricating catalog rows.
   - id: task.remote-create-6-ctrl-s
     title: wire Ctrl-S to create a session on the selected connected remote endpoint
-    status: pending
+    status: done
     design_ref:
       file: docs/remote-host-connect-and-session-creation-design.md
       section: 5.2, 10.2, 12
@@ -387,18 +387,18 @@ next:
         Ctrl-S is the explicit command for selected remote endpoint creation and
         must fail clearly for local, missing, offline, or exited selections.
   - id: task.remote-create-7-history
-    title: add user-level remote host connection history without persisting secrets
-    status: pending
+    title: add user-level remote host connection history with secure-store credential persistence
+    status: done
     design_ref:
       file: docs/remote-host-connect-and-session-creation-design.md
       section: 7
       status: accepted
       reason: >
-        Ctrl-W needs reusable host profiles while preserving the rule that SSH
-        and sudo passwords are runtime-only and never stored.
+        Ctrl-W needs reusable host profiles and Xshell-style remembered credentials,
+        with SSH and sudo password values stored only in a dedicated secure store.
   - id: task.remote-create-8-ctrl-w-bootstrap
     title: implement Ctrl-W remote host bootstrap, install/start, endpoint reuse, and remote session creation
-    status: pending
+    status: done
     design_ref:
       file: docs/remote-host-connect-and-session-creation-design.md
       section: 5.3, 6.3, 8, 15

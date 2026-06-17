@@ -1,3 +1,6 @@
+use crate::application::remote_session_creation_service::{
+    GrpcRemoteSessionCreationTransport, RemoteSessionCreationRequest, RemoteSessionCreationService,
+};
 use crate::application::session_service::SessionService;
 use crate::application::target_registry_service::{
     DefaultTargetCatalogGateway, TargetRegistryService,
@@ -11,13 +14,21 @@ use crate::cli::{
     RemoteNodeIngressServerCommand, RemoteTargetExitedCommand, StopCommand,
     ToggleFullscreenCommand,
 };
-use crate::domain::session_catalog::{ManagedSessionRecord, SessionTransport};
-use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError, TmuxSocketName};
+use crate::domain::session_catalog::{ManagedSessionRecord, SessionAvailability, SessionTransport};
+use crate::domain::workspace::WorkspaceInstanceId;
+use crate::infra::tmux::{
+    EmbeddedTmuxBackend, TmuxError, TmuxSessionName, TmuxSocketName, TmuxWorkspaceHandle,
+};
 use crate::lifecycle::LifecycleError;
 use crate::runtime::current_executable::current_waitagent_executable;
 use crate::runtime::local_target_host_runtime::LocalTargetHostRuntime;
 use crate::runtime::main_slot_runtime::MainSlotRuntime;
 use crate::runtime::native_pane_fullscreen_runtime::NativePaneFullscreenRuntime;
+use crate::runtime::remote_host::remote_host_connect_runtime::{
+    request_from_command, RemoteHostConnectRuntime, SshRemotePortProbeFactory,
+};
+use crate::runtime::remote_host::remote_host_history_store::RemoteHostHistoryStore;
+use crate::runtime::remote_host::ssh_remote_host_bootstrapper::SshRemoteHostBootstrapper;
 use crate::runtime::remote_node_ingress_server_runtime::RemoteNodeIngressServerRuntime;
 use crate::runtime::remote_node_session_sync_runtime::RemoteNodeSessionSyncRuntime;
 use crate::runtime::remote_runtime_owner_runtime::RemoteRuntimeOwnerRuntime;
@@ -27,6 +38,8 @@ use crate::runtime::workspace_entry_runtime::WorkspaceEntryRuntime;
 use crate::runtime::workspace_layout_runtime::WorkspaceLayoutRuntime;
 use crate::runtime::workspace_runtime::WorkspaceRuntime;
 use std::io;
+
+const WAITAGENT_SIDEBAR_SELECTED_TARGET_OPTION: &str = "@waitagent_sidebar_selected_target";
 
 // This runtime owns the accepted default local command path for workspace
 // bootstrap, attach, target activation, fullscreen, and detach semantics.
@@ -187,32 +200,104 @@ impl WorkspaceCommandRuntime {
 
     pub fn run_new_selected_remote_session(
         &self,
-        _command: NewSelectedRemoteSessionCommand,
+        command: NewSelectedRemoteSessionCommand,
     ) -> Result<(), LifecycleError> {
-        Err(LifecycleError::Protocol(
-            "Ctrl-S remote session creation is not implemented in this slice".to_string(),
-        ))
+        let selected_target = self.selected_sidebar_target(&command)?;
+        let selected_session = self
+            .target_registry
+            .find_target(&selected_target)
+            .map_err(tmux_runtime_error)?
+            .ok_or_else(|| {
+                LifecycleError::Protocol(format!(
+                    "selected target `{selected_target}` is no longer available"
+                ))
+            })?;
+        if selected_session.address.transport() == &SessionTransport::LocalTmux {
+            return Err(LifecycleError::Protocol(
+                "selected target is local; use Ctrl-N for a local session".to_string(),
+            ));
+        }
+        if selected_session.availability != SessionAvailability::Online {
+            return Err(LifecycleError::Protocol(format!(
+                "selected remote target `{}` is {}",
+                selected_session.address.qualified_target(),
+                selected_session.availability.as_str()
+            )));
+        }
+
+        let service = RemoteSessionCreationService::new(
+            GrpcRemoteSessionCreationTransport::new(self.network.clone()),
+            self.target_registry.clone(),
+        );
+        let created = service
+            .create_session(RemoteSessionCreationRequest {
+                authority_node_id: selected_session.address.authority_id().to_string(),
+                cwd_hint: selected_session
+                    .current_path
+                    .clone()
+                    .or_else(|| selected_session.workspace_dir.clone()),
+                cols: 0,
+                rows: 0,
+            })
+            .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+
+        self.main_slot_runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: command.current_socket_name,
+                current_session_name: command.current_session_name,
+                target: created.address.qualified_target(),
+            })
+    }
+
+    fn selected_sidebar_target(
+        &self,
+        command: &NewSelectedRemoteSessionCommand,
+    ) -> Result<String, LifecycleError> {
+        let selected = self
+            .backend
+            .show_session_option(
+                &workspace_handle(&command.current_socket_name, &command.current_session_name),
+                WAITAGENT_SIDEBAR_SELECTED_TARGET_OPTION,
+            )
+            .map_err(tmux_runtime_error)?
+            .unwrap_or_default();
+        let selected = selected.trim();
+        if selected.is_empty() {
+            return Err(LifecycleError::Protocol(
+                "no remote target is selected in the session sidebar".to_string(),
+            ));
+        }
+        Ok(selected.to_string())
     }
 
     pub fn run_connect_remote_host(
         &self,
         command: ConnectRemoteHostCommand,
     ) -> Result<(), LifecycleError> {
-        let requested_target = command
-            .profile
-            .as_deref()
-            .or(command.host.as_deref())
-            .unwrap_or("unspecified remote host");
-        let _future_bootstrap_inputs = (
-            command.ssh_user.as_deref(),
-            command.auth.as_deref(),
-            command.key_path.as_deref(),
-            command.remote_port.as_deref(),
-            command.save_profile.as_deref(),
+        let cwd_hint = Some(self.resolve_workspace_dir(None)?);
+        let request =
+            request_from_command(&command, self.network.advertised_listener_label(), cwd_hint)?;
+        let catalog = TargetRegistryService::new(
+            DefaultTargetCatalogGateway::from_build_env_with_network(self.network.clone())
+                .map_err(tmux_runtime_error)?,
         );
-        Err(LifecycleError::Protocol(format!(
-            "Ctrl-W remote host connect for `{requested_target}` is not implemented in this slice"
-        )))
+        let runtime = RemoteHostConnectRuntime::new(
+            RemoteHostHistoryStore::new(RemoteHostHistoryStore::default_path()),
+            SshRemotePortProbeFactory,
+            SshRemoteHostBootstrapper::default(),
+            catalog.clone(),
+            RemoteSessionCreationService::new(
+                GrpcRemoteSessionCreationTransport::new(self.network.clone()),
+                catalog,
+            ),
+        );
+        let outcome = runtime.connect(request)?;
+        self.main_slot_runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: command.current_socket_name,
+                current_session_name: command.current_session_name,
+                target: outcome.created_target.address.qualified_target(),
+            })
     }
 
     pub fn run_local_target_host(
@@ -390,6 +475,14 @@ impl WorkspaceCommandRuntime {
 
     pub fn network_config(&self) -> RemoteNetworkConfig {
         self.network.clone()
+    }
+}
+
+fn workspace_handle(socket_name: &str, session_name: &str) -> TmuxWorkspaceHandle {
+    TmuxWorkspaceHandle {
+        workspace_id: WorkspaceInstanceId::new(session_name),
+        socket_name: TmuxSocketName::new(socket_name),
+        session_name: TmuxSessionName::new(session_name),
     }
 }
 

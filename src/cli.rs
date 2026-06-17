@@ -338,6 +338,8 @@ pub struct ConnectRemoteHostCommand {
     pub ssh_user: Option<String>,
     pub auth: Option<String>,
     pub key_path: Option<String>,
+    pub ssh_password_secret_id: Option<String>,
+    pub sudo_password_secret_id: Option<String>,
     pub remote_port: Option<String>,
     pub save_profile: Option<String>,
 }
@@ -1269,6 +1271,8 @@ fn parse_connect_remote_host(args: Vec<String>) -> Result<ConnectRemoteHostComma
     let mut ssh_user = None;
     let mut auth = None;
     let mut key_path = None;
+    let mut ssh_password_secret_id = None;
+    let mut sudo_password_secret_id = None;
     let mut remote_port = None;
     let mut save_profile = None;
 
@@ -1285,6 +1289,13 @@ fn parse_connect_remote_host(args: Vec<String>) -> Result<ConnectRemoteHostComma
             "--ssh-user" => ssh_user = Some(expect_value("--ssh-user", &mut iter)?),
             "--auth" => auth = Some(expect_value("--auth", &mut iter)?),
             "--key-path" => key_path = Some(expect_value("--key-path", &mut iter)?),
+            "--ssh-password-secret-id" => {
+                ssh_password_secret_id = Some(expect_value("--ssh-password-secret-id", &mut iter)?)
+            }
+            "--sudo-password-secret-id" => {
+                sudo_password_secret_id =
+                    Some(expect_value("--sudo-password-secret-id", &mut iter)?)
+            }
             "--remote-port" => remote_port = Some(expect_value("--remote-port", &mut iter)?),
             "--save-profile" => save_profile = Some(expect_value("--save-profile", &mut iter)?),
             "--help" | "-h" => {}
@@ -1302,6 +1313,8 @@ fn parse_connect_remote_host(args: Vec<String>) -> Result<ConnectRemoteHostComma
         ssh_user,
         auth,
         key_path,
+        ssh_password_secret_id,
+        sudo_password_secret_id,
         remote_port,
         save_profile,
     })
@@ -1690,6 +1703,10 @@ mod tests {
             "key",
             "--key-path",
             "~/.ssh/id_ed25519",
+            "--ssh-password-secret-id",
+            "waitagent.remote-host.130.ssh-password",
+            "--sudo-password-secret-id",
+            "waitagent.remote-host.130.sudo-password",
             "--remote-port",
             "auto",
             "--save-profile",
@@ -1702,6 +1719,14 @@ mod tests {
                 assert_eq!(command.ssh_user.as_deref(), Some("kk"));
                 assert_eq!(command.auth.as_deref(), Some("key"));
                 assert_eq!(command.key_path.as_deref(), Some("~/.ssh/id_ed25519"));
+                assert_eq!(
+                    command.ssh_password_secret_id.as_deref(),
+                    Some("waitagent.remote-host.130.ssh-password")
+                );
+                assert_eq!(
+                    command.sudo_password_secret_id.as_deref(),
+                    Some("waitagent.remote-host.130.sudo-password")
+                );
                 assert_eq!(command.remote_port.as_deref(), Some("auto"));
                 assert_eq!(command.save_profile.as_deref(), Some("130"));
             }

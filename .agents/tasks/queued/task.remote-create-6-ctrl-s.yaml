@@ -2,7 +2,7 @@ id: task.remote-create-6-ctrl-s
 kind: task
 version: 1
 title: wire Ctrl-S to create a session on the selected connected remote endpoint
-status: pending
+status: done
 priority: high
 design_ref:
   doc: docs/remote-host-connect-and-session-creation-design.md

@@ -5,6 +5,7 @@ pub use event_driven::event_driven_tmux_pane_runtime;
 pub use event_driven::event_driven_ui_pane_runtime;
 
 pub mod remote_authority;
+pub mod remote_host;
 pub use remote_authority::remote_authority_connection_runtime;
 pub use remote_authority::remote_authority_target_host_runtime;
 pub use remote_authority::remote_authority_transport_runtime;

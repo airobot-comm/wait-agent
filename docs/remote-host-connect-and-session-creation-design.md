@@ -264,8 +264,12 @@ collect:
 - key path when auth is key based
 - preferred remote port: auto or explicit
 - optional profile name
+- whether to remember the SSH password when password auth is used
+- whether to remember the sudo password when remote install/start requires sudo
 
-Passwords are collected only at runtime and are not saved.
+Passwords may be remembered, Xshell-style, but password values must be written
+only to the dedicated secure store. The profile/history file stores only stable
+secret references.
 
 ## 7. Connection History Design
 
@@ -292,6 +296,8 @@ name = "130"
 host = "10.1.29.130"
 ssh_user = "kk"
 auth_kind = "password"
+ssh_password_secret_id = "waitagent.remote-host.130.ssh-password"
+sudo_password_secret_id = "waitagent.remote-host.130.sudo-password"
 key_path = ""
 preferred_remote_port = "auto"
 last_remote_port = 7476
@@ -314,19 +320,62 @@ struct RemoteHostProfile {
 }
 
 enum RemoteHostAuthProfile {
-    Password,
+    Password { password_secret_id: Option<RemoteHostSecretId> },
     Key { key_path: PathBuf },
     Agent,
 }
 ```
 
+The profile file may store:
+
+- host, username, auth kind, key path, and port preferences
+- stable secret ids for remembered SSH or sudo passwords
+- last successful endpoint and timestamps
+
+The profile file must not store:
+
+- SSH password values
+- sudo password values
+- one-time prompt answers
+- generated SSH command lines containing secrets
+
 ### 7.3 Security Rules
 
 - never store plaintext SSH passwords
 - never store sudo passwords
+- remembered SSH and sudo passwords are allowed only through
+  `RemoteHostSecretStore`
+- `RemoteHostHistoryStore` stores secret ids, never secret values
+- secure-store backends must keep secret values outside
+  `remote-hosts.toml`
 - key paths may be stored
 - runtime logs must redact secrets
 - command construction must avoid printing shell commands containing secrets
+
+### 7.4 Secure Store Boundary
+
+Introduce a dedicated secret boundary:
+
+```rust
+trait RemoteHostSecretStore {
+    fn put_secret(&self, id: &RemoteHostSecretId, secret: RemoteHostSecretValue) -> Result<(), Error>;
+    fn get_secret(&self, id: &RemoteHostSecretId) -> Result<Option<RemoteHostSecretValue>, Error>;
+    fn delete_secret(&self, id: &RemoteHostSecretId) -> Result<(), Error>;
+}
+```
+
+Production code should prefer the platform secure store. On Linux the first
+backend can use the FreeDesktop Secret Service through `secret-tool`; other
+platforms can add native backends behind the same trait later. Tests use an
+in-memory implementation.
+
+Rules:
+
+- secret values are passed to secure-store commands through stdin or native APIs
+- secret values are never embedded in shell command strings
+- secret ids are stable and non-secret, suitable for storage in profiles
+- failure to save a remembered password must fail clearly or continue without
+  remembering it according to the user's explicit choice
 
 ## 8. Remote Host Bootstrap Design
 
@@ -338,13 +387,16 @@ Introduce a host bootstrap boundary separate from session creation:
 runtime/remote_host/
   remote_host_connect_runtime.rs
   remote_host_history_store.rs
+  remote_host_secret_store.rs
   ssh_remote_host_bootstrapper.rs
   remote_port_probe.rs
 ```
 
 Expected responsibilities:
 
-- `RemoteHostHistoryStore`: read/write user profiles
+- `RemoteHostHistoryStore`: read/write user profiles and secret references
+- `RemoteHostSecretStore`: persist remembered SSH/sudo passwords in a dedicated
+  secure store
 - `RemoteHostConnectRuntime`: orchestrate profile selection results,
   bootstrap, endpoint wait, and remote session creation
 - `SshRemoteHostBootstrapper`: execute SSH commands and file-safe remote checks
@@ -589,7 +641,9 @@ constraints.
 Unit tests:
 
 - CLI parsing for new commands
-- profile history read/write and secret omission
+- profile history read/write and secret value omission
+- secure-store boundary tests for storing/retrieving remembered SSH/sudo
+  passwords without writing them to the profile file
 - sidebar selected-target option update behavior
 - endpoint resolver local/remote/offline cases
 - create-session proto/domain mapping
@@ -642,7 +696,8 @@ Recommended order:
    - failure handling for local/offline selection
 7. Connection history store
    - TOML profile storage
-   - no secret persistence
+   - secret references in profiles
+   - remembered passwords only through `RemoteHostSecretStore`
 8. Remote host bootstrap runtime
    - SSH abstraction
    - install/update via install script
@@ -665,7 +720,8 @@ The task is complete when:
   activates it
 - `Ctrl-S` on local/offline/missing selection fails clearly
 - `Ctrl-W` can reuse a saved host profile
-- `Ctrl-W` can add a new host profile without storing passwords
+- `Ctrl-W` can add a new host profile and optionally remember SSH/sudo
+  passwords through the secure store
 - `Ctrl-W` installs or updates remote WaitAgent using:
 
 ```bash

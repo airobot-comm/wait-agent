@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NODE_SESSION_SERVER_ID: &str = "waitagent-remote-node-session";
 
@@ -147,38 +147,72 @@ impl RemoteNodeSessionRuntime {
                         )
                     })?;
                 match event {
-                    GrpcAuthorityEvent::Command(command) => {
-                        Ok(RemoteNodeAuthorityEvent::Command(command))
-                    }
-                    GrpcAuthorityEvent::CreateSessionRequest {
-                        payload,
-                        correlation_id,
-                    } => Ok(RemoteNodeAuthorityEvent::CreateSessionRequest {
-                        payload,
-                        correlation_id,
-                    }),
-                    GrpcAuthorityEvent::CreateSessionAccepted(payload) => {
-                        Ok(RemoteNodeAuthorityEvent::CreateSessionAccepted(payload))
-                    }
-                    GrpcAuthorityEvent::CreateSessionRejected(payload) => {
-                        Ok(RemoteNodeAuthorityEvent::CreateSessionRejected(payload))
-                    }
-                    GrpcAuthorityEvent::MirrorAccepted => Err(RemoteNodeSessionError::new(
-                        "unexpected grpc mirror acceptance while waiting for authority event",
-                    )),
-                    GrpcAuthorityEvent::MirrorRejected(payload) => {
-                        Err(RemoteNodeSessionError::new(format!(
-                            "remote mirror request for `{}` was rejected: {}",
-                            payload.target_id, payload.message
-                        )))
-                    }
-                    GrpcAuthorityEvent::Failed(message) => {
-                        Err(RemoteNodeSessionError::new(message))
-                    }
-                    GrpcAuthorityEvent::Closed => Err(RemoteNodeSessionError::new(
-                        "grpc node session closed by remote peer",
-                    )),
+                    event => grpc_authority_event_to_node_event(event),
                 }
+            }
+        }
+    }
+
+    pub fn request_create_session(
+        &self,
+        request: CreateSessionRequestPayload,
+        accept_timeout: Duration,
+    ) -> Result<RemoteNodeAuthorityEvent, RemoteNodeSessionError> {
+        let request_id = request.request_id.clone();
+        self.send_payload_with_correlation(
+            NodeSessionChannel::Authority,
+            None,
+            None,
+            "authority-msg",
+            Some(&request_id),
+            ControlPlanePayload::CreateSessionRequest(request),
+        )?;
+        loop {
+            match self.recv_authority_event_timeout(accept_timeout)? {
+                RemoteNodeAuthorityEvent::CreateSessionAccepted(payload)
+                    if payload.request_id == request_id =>
+                {
+                    return Ok(RemoteNodeAuthorityEvent::CreateSessionAccepted(payload));
+                }
+                RemoteNodeAuthorityEvent::CreateSessionRejected(payload)
+                    if payload.request_id == request_id =>
+                {
+                    return Ok(RemoteNodeAuthorityEvent::CreateSessionRejected(payload));
+                }
+                RemoteNodeAuthorityEvent::CreateSessionAccepted(_)
+                | RemoteNodeAuthorityEvent::CreateSessionRejected(_) => continue,
+                other => {
+                    return Err(RemoteNodeSessionError::new(format!(
+                        "unexpected authority event while waiting for create-session reply `{request_id}`: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn recv_authority_event_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<RemoteNodeAuthorityEvent, RemoteNodeSessionError> {
+        match &self.transport {
+            RemoteNodeSessionTransport::Local(transport) => {
+                recv_local_authority_event_timeout(transport, timeout)
+            }
+            RemoteNodeSessionTransport::Grpc(transport) => {
+                let event = transport
+                    .authority_rx
+                    .lock()
+                    .expect("grpc authority receiver mutex should not be poisoned")
+                    .recv_timeout(timeout)
+                    .map_err(|error| match error {
+                        mpsc::RecvTimeoutError::Timeout => RemoteNodeSessionError::new(format!(
+                            "timed out waiting {timeout:?} for create-session reply"
+                        )),
+                        mpsc::RecvTimeoutError::Disconnected => RemoteNodeSessionError::new(
+                            "grpc node session authority stream closed unexpectedly",
+                        ),
+                    })?;
+                grpc_authority_event_to_node_event(event)
             }
         }
     }
@@ -548,6 +582,38 @@ fn connect_local_node_session(
     })
 }
 
+fn grpc_authority_event_to_node_event(
+    event: GrpcAuthorityEvent,
+) -> Result<RemoteNodeAuthorityEvent, RemoteNodeSessionError> {
+    match event {
+        GrpcAuthorityEvent::Command(command) => Ok(RemoteNodeAuthorityEvent::Command(command)),
+        GrpcAuthorityEvent::CreateSessionRequest {
+            payload,
+            correlation_id,
+        } => Ok(RemoteNodeAuthorityEvent::CreateSessionRequest {
+            payload,
+            correlation_id,
+        }),
+        GrpcAuthorityEvent::CreateSessionAccepted(payload) => {
+            Ok(RemoteNodeAuthorityEvent::CreateSessionAccepted(payload))
+        }
+        GrpcAuthorityEvent::CreateSessionRejected(payload) => {
+            Ok(RemoteNodeAuthorityEvent::CreateSessionRejected(payload))
+        }
+        GrpcAuthorityEvent::MirrorAccepted => Err(RemoteNodeSessionError::new(
+            "unexpected grpc mirror acceptance while waiting for authority event",
+        )),
+        GrpcAuthorityEvent::MirrorRejected(payload) => Err(RemoteNodeSessionError::new(format!(
+            "remote mirror request for `{}` was rejected: {}",
+            payload.target_id, payload.message
+        ))),
+        GrpcAuthorityEvent::Failed(message) => Err(RemoteNodeSessionError::new(message)),
+        GrpcAuthorityEvent::Closed => Err(RemoteNodeSessionError::new(
+            "grpc node session closed by remote peer",
+        )),
+    }
+}
+
 fn connect_grpc_node_session(
     node_id: &str,
     endpoint_uri: &str,
@@ -615,6 +681,33 @@ fn connect_grpc_node_session(
     })
 }
 
+fn recv_local_authority_event_timeout(
+    transport: &LocalRemoteNodeSessionTransport,
+    timeout: Duration,
+) -> Result<RemoteNodeAuthorityEvent, RemoteNodeSessionError> {
+    let mut reader = transport
+        .reader
+        .lock()
+        .expect("node session reader mutex should not be poisoned");
+    let previous_timeout = reader.read_timeout()?;
+    reader.set_read_timeout(Some(timeout))?;
+    let result = read_node_session_envelope(&mut *reader);
+    let restore_result = reader.set_read_timeout(previous_timeout);
+    if let Err(error) = restore_result {
+        return Err(RemoteNodeSessionError::new(error.to_string()));
+    }
+    let session_envelope = match result {
+        Ok(envelope) => envelope,
+        Err(error) if error.is_read_timeout() => {
+            return Err(RemoteNodeSessionError::new(format!(
+                "timed out waiting {timeout:?} for create-session reply"
+            )));
+        }
+        Err(error) => return Err(RemoteNodeSessionError::from(error)),
+    };
+    map_local_authority_event(session_envelope)
+}
+
 fn recv_local_authority_event(
     transport: &LocalRemoteNodeSessionTransport,
 ) -> Result<RemoteNodeAuthorityEvent, RemoteNodeSessionError> {
@@ -623,6 +716,12 @@ fn recv_local_authority_event(
         .lock()
         .expect("node session reader mutex should not be poisoned");
     let session_envelope = read_node_session_envelope(&mut *reader)?;
+    map_local_authority_event(session_envelope)
+}
+
+fn map_local_authority_event(
+    session_envelope: NodeSessionEnvelope,
+) -> Result<RemoteNodeAuthorityEvent, RemoteNodeSessionError> {
     if session_envelope.channel != NodeSessionChannel::Authority {
         return Err(RemoteNodeSessionError::new(format!(
             "unexpected node session channel `{}` while waiting for authority command",
