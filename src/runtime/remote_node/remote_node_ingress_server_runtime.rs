@@ -379,7 +379,8 @@ fn run_node_ingress_server_loop(
     start_authority_socket_watcher: bool,
 ) {
     let mut sessions = HashMap::<String, ActiveNodeIngressSession>::new();
-    let mut authority_manager = SessionSyncAuthorityManager::new(RemoteNetworkConfig::default());
+    let mut authority_manager =
+        SessionSyncAuthorityManager::new(RemoteNetworkConfig::default(), None);
     let mut pending_create_sessions =
         HashMap::<String, mpsc::Sender<GrpcNodeSessionEnvelope>>::new();
     let (event_tx, event_rx) = mpsc::channel::<IngressServerEvent>();

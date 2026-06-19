@@ -45,6 +45,10 @@ pub trait LocalSessionCatalog: Send + 'static {
     type Error: ToString;
 
     fn list_local_sessions(&self) -> Result<Vec<ManagedSessionRecord>, Self::Error>;
+
+    fn local_target_socket_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -88,6 +92,10 @@ where
             self.socket_name.as_str(),
             &self.published_target_store,
         ))
+    }
+
+    fn local_target_socket_name(&self) -> Option<&str> {
+        Some(self.socket_name.as_str())
     }
 }
 
@@ -181,6 +189,7 @@ pub struct RemoteNodeSessionSyncGuard {
 pub(super) struct SessionSyncAuthorityManager {
     pub(super) running_hosts: HashMap<String, SessionSyncAuthorityHost>,
     network: RemoteNetworkConfig,
+    local_target_socket_name: Option<String>,
 }
 
 pub(super) struct SessionSyncAuthorityHost {
@@ -377,10 +386,14 @@ fn sync_now_millis() -> u128 {
 }
 
 impl SessionSyncAuthorityManager {
-    pub(super) fn new(network: RemoteNetworkConfig) -> Self {
+    pub(super) fn new(
+        network: RemoteNetworkConfig,
+        local_target_socket_name: Option<String>,
+    ) -> Self {
         Self {
             running_hosts: HashMap::new(),
             network,
+            local_target_socket_name,
         }
     }
 
@@ -509,10 +522,15 @@ impl SessionSyncAuthorityManager {
             self.network.clone(),
             current_waitagent_executable()?,
         )?;
+        let socket_name = self.local_target_socket_name.as_deref().ok_or_else(|| {
+            LifecycleError::Protocol(
+                "create-session requires a socket-scoped local session catalog".to_string(),
+            )
+        })?;
         let workspace = runtime
             .ensure_target_host(WorkspaceInstanceConfig::for_new_target_on_socket_with_size(
                 &cwd,
-                session_handle.node_id().to_string(),
+                socket_name,
                 u16::try_from(payload.rows).ok().filter(|rows| *rows > 0),
                 u16::try_from(payload.cols).ok().filter(|cols| *cols > 0),
             ))

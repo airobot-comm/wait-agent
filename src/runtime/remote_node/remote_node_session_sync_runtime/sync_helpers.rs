@@ -72,6 +72,7 @@ pub(super) fn run_remote_session_sync_loop<G, T, O>(
                 None
             }
         };
+    let local_target_socket_name = gateway.local_target_socket_name().map(str::to_string);
     let mut next_message_id = 0_u64;
     loop {
         if should_stop(&stop_rx) {
@@ -97,7 +98,8 @@ pub(super) fn run_remote_session_sync_loop<G, T, O>(
 
         let mut active_session = None;
         let mut synced_sessions = HashMap::<String, ManagedSessionRecord>::new();
-        let mut authority_manager = SessionSyncAuthorityManager::new(network.clone());
+        let mut authority_manager =
+            SessionSyncAuthorityManager::new(network.clone(), local_target_socket_name.clone());
         let mut should_reconnect = false;
         let mut next_sync_at = Instant::now() + poll_interval;
 
