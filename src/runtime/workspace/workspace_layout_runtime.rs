@@ -664,9 +664,8 @@ impl WorkspaceLayoutRuntime {
                 tmux_quote_argument(&create_target_shell_command)
             ),
             connect_remote_host_command: connect_remote_host_popup_command,
-            create_remote_session_command: format!(
-                "run-shell -b {}",
-                tmux_quote_argument(&create_remote_session_shell_command)
+            create_remote_session_command: create_remote_session_tmux_command(
+                &create_remote_session_shell_command,
             ),
             open_sessions_menu_command: format!(
                 "run-shell -b {}",
@@ -756,6 +755,13 @@ impl WorkspaceLayoutRuntime {
             .window_zoomed_on_socket(workspace.socket_name.as_str(), main_pane.as_str())
             .map_err(tmux_layout_error)
     }
+}
+
+fn create_remote_session_tmux_command(shell_command: &str) -> String {
+    format!(
+        "run-shell -b {}",
+        tmux_quote_argument(&format!("{shell_command} >/dev/null 2>&1 || true"))
+    )
 }
 
 fn fullscreen_toggle_tmux_command(
@@ -1028,10 +1034,10 @@ fn should_refresh_workspace_chrome(
 mod tests {
     use super::{
         connect_remote_host_popup_command, create_remote_session_shell_command,
-        footer_menu_shell_command, fullscreen_toggle_tmux_command,
-        layout_reconcile_hook_shell_command, main_pane_died_hook_shell_command,
-        main_pane_output_bridge_shell_command, should_refresh_workspace_chrome,
-        tmux_quote_argument,
+        create_remote_session_tmux_command, footer_menu_shell_command,
+        fullscreen_toggle_tmux_command, layout_reconcile_hook_shell_command,
+        main_pane_died_hook_shell_command, main_pane_output_bridge_shell_command,
+        should_refresh_workspace_chrome, tmux_quote_argument,
     };
     use crate::cli::RemoteNetworkConfig;
     use crate::domain::session_catalog::{
@@ -1103,6 +1109,10 @@ mod tests {
         assert!(remote_new.contains("'__new-selected-remote-session'"));
         assert!(remote_new.contains("'--current-session-name' 'session-1'"));
         assert!(remote_new.contains("'--port' '9001'"));
+
+        let tmux_command = create_remote_session_tmux_command(&remote_new);
+        assert!(tmux_command.contains("__new-selected-remote-session"));
+        assert!(tmux_command.contains(">/dev/null 2>&1 || true"));
     }
 
     #[test]

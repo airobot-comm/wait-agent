@@ -225,6 +225,17 @@ impl WorkspaceCommandRuntime {
         &self,
         command: NewSelectedRemoteSessionCommand,
     ) -> Result<(), LifecycleError> {
+        let result = self.create_selected_remote_session(command.clone());
+        if let Err(error) = &result {
+            self.display_remote_session_creation_error(&command, error);
+        }
+        result
+    }
+
+    fn create_selected_remote_session(
+        &self,
+        command: NewSelectedRemoteSessionCommand,
+    ) -> Result<(), LifecycleError> {
         let selected_target = self.selected_sidebar_target(&command)?;
         let selected_session = self
             .target_registry
@@ -270,6 +281,25 @@ impl WorkspaceCommandRuntime {
                 current_session_name: command.current_session_name,
                 target: created.address.qualified_target(),
             })
+    }
+
+    fn display_remote_session_creation_error(
+        &self,
+        command: &NewSelectedRemoteSessionCommand,
+        error: &LifecycleError,
+    ) {
+        let workspace =
+            workspace_handle(&command.current_socket_name, &command.current_session_name);
+        let message = format!("Ctrl-S: {error}");
+        let _ = self.backend.run_socket_command(
+            &workspace.socket_name,
+            &[
+                "display-message".to_string(),
+                "-t".to_string(),
+                workspace.session_name.as_str().to_string(),
+                message,
+            ],
+        );
     }
 
     fn selected_sidebar_target(
