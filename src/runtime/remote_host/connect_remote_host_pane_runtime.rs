@@ -500,7 +500,7 @@ impl ConnectRemoteHostState {
             KeyCode::Enter => {
                 self.set_focus(self.focus.next(self.auth, self.has_saved_selection()))
             }
-            KeyCode::Backspace => {
+            code if is_backspace_key(code, key.modifiers) => {
                 edit_buffer(self, field).pop();
             }
             KeyCode::Char(ch) if !ch.is_control() => edit_buffer(self, field).push(ch),
@@ -523,7 +523,7 @@ impl ConnectRemoteHostState {
             KeyCode::Enter => {
                 self.set_focus(self.focus.next(self.auth, self.has_saved_selection()))
             }
-            KeyCode::Backspace => {
+            code if is_backspace_key(code, key.modifiers) => {
                 self.sudo_password.pop();
             }
             KeyCode::Char(ch) if !ch.is_control() => self.sudo_password.push(ch),
@@ -1207,7 +1207,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, state: &ConnectRemoteHostSt
 
 fn render_connection(frame: &mut Frame<'_>, area: Rect, state: &ConnectRemoteHostState) {
     let rows = [
-        detail_row("Host", &state.host, state, Focus::Host),
+        detail_row("Host", &host_display(state), state, Focus::Host),
         detail_row("Port", &state.remote_port, state, Focus::Port),
         detail_row("SSH User", &state.ssh_user, state, Focus::User),
     ];
@@ -1335,7 +1335,7 @@ fn password_control_display(
                 &state.ssh_password,
                 state.password_mode == PasswordMode::Loading,
                 state.show_ssh_password,
-                "",
+                PASSWORD_EMPTY_PLACEHOLDER,
             ),
             show_plaintext: state.show_ssh_password,
             field_focus: Focus::Password,
@@ -1347,7 +1347,7 @@ fn password_control_display(
                 sudo_password_value(state),
                 state.sudo_mode == SudoMode::Loading,
                 state.show_sudo_password,
-                "",
+                PASSWORD_EMPTY_PLACEHOLDER,
             ),
             show_plaintext: state.show_sudo_password,
             field_focus: Focus::Sudo,
@@ -1485,13 +1485,24 @@ fn segmented_for_test(segments: &[ChoiceSegment]) -> String {
         .join("  ")
 }
 
+const HOST_EMPTY_PLACEHOLDER: &str = "__________";
+const PASSWORD_EMPTY_PLACEHOLDER: &str = "________";
+
+fn host_display(state: &ConnectRemoteHostState) -> String {
+    if state.host.is_empty() {
+        HOST_EMPTY_PLACEHOLDER.to_string()
+    } else {
+        state.host.clone()
+    }
+}
+
 fn password_display(state: &ConnectRemoteHostState) -> String {
     match state.auth {
         AuthChoice::Password => password_field_with_toggle_display(
             &state.ssh_password,
             state.password_mode == PasswordMode::Loading,
             state.show_ssh_password,
-            "",
+            PASSWORD_EMPTY_PLACEHOLDER,
         ),
         AuthChoice::Key => {
             if state.key_path.is_empty() {
@@ -1512,7 +1523,7 @@ fn sudo_password_display(state: &ConnectRemoteHostState) -> String {
         sudo_password_value(state),
         state.sudo_mode == SudoMode::Loading,
         state.show_sudo_password,
-        "",
+        PASSWORD_EMPTY_PLACEHOLDER,
     )
 }
 
@@ -1584,13 +1595,13 @@ fn password_visibility_button_hit(
             state.ssh_password.as_str(),
             state.password_mode == PasswordMode::Loading,
             state.show_ssh_password,
-            "",
+            PASSWORD_EMPTY_PLACEHOLDER,
         ),
         PasswordField::Sudo if state.sudo_mode != SudoMode::None => (
             sudo_password_value(state),
             state.sudo_mode == SudoMode::Loading,
             state.show_sudo_password,
-            "",
+            PASSWORD_EMPTY_PLACEHOLDER,
         ),
         _ => return false,
     };
@@ -1760,6 +1771,12 @@ fn shift_value<T: Copy + Eq>(values: &[T], current: T, step: i32) -> T {
     let len = values.len() as i32;
     let shifted = (index + step).rem_euclid(len) as usize;
     values[shifted]
+}
+
+fn is_backspace_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    code == KeyCode::Backspace
+        || matches!(code, KeyCode::Char('h') if modifiers.contains(KeyModifiers::CONTROL))
+        || matches!(code, KeyCode::Char('\u{7f}'))
 }
 
 fn edit_buffer(state: &mut ConnectRemoteHostState, field: EditField) -> &mut String {
@@ -2704,7 +2721,21 @@ mod tests {
     }
 
     #[test]
-    fn password_and_sudo_empty_states_leave_input_display_empty() {
+    fn empty_host_uses_placeholder_only_for_display() {
+        let mut state = ConnectRemoteHostState::load();
+        state.profiles.clear();
+        state.selected = 0;
+        let _ = state.sync_selected_profile();
+
+        assert_eq!(host_display(&state), HOST_EMPTY_PLACEHOLDER);
+
+        state.host = "example.internal".to_string();
+
+        assert_eq!(host_display(&state), "example.internal");
+    }
+
+    #[test]
+    fn password_and_sudo_empty_states_use_placeholder_only_for_display() {
         let mut state = ConnectRemoteHostState::load();
         state.profiles.clear();
         state.selected = 0;
@@ -2712,15 +2743,43 @@ mod tests {
         state.set_focus(Focus::Password);
 
         let password_line = password_control_line(PasswordField::Ssh, &state);
-        assert_eq!(password_line.spans[1].content.as_ref(), "");
+        assert_eq!(
+            password_line.spans[1].content.as_ref(),
+            PASSWORD_EMPTY_PLACEHOLDER
+        );
         assert_eq!(password_line.spans[3].content.as_ref(), "Show");
-        assert_eq!(password_display(&state), "  Show");
+        assert_eq!(
+            password_display(&state),
+            format!("{PASSWORD_EMPTY_PLACEHOLDER}  Show")
+        );
 
         state.set_focus(Focus::Sudo);
         let sudo_line = password_control_line(PasswordField::Sudo, &state);
-        assert_eq!(sudo_line.spans[1].content.as_ref(), "");
+        assert_eq!(
+            sudo_line.spans[1].content.as_ref(),
+            PASSWORD_EMPTY_PLACEHOLDER
+        );
         assert_eq!(sudo_line.spans[3].content.as_ref(), "Show");
-        assert_eq!(sudo_password_display(&state), "  Show");
+        assert_eq!(
+            sudo_password_display(&state),
+            format!("{PASSWORD_EMPTY_PLACEHOLDER}  Show")
+        );
+    }
+
+    #[test]
+    fn empty_host_cursor_starts_at_input_origin() {
+        let mut state = ConnectRemoteHostState::load();
+        state.profiles.clear();
+        state.selected = 0;
+        let _ = state.sync_selected_profile();
+        state.set_focus(Focus::Host);
+        let geometry = PopupGeometry::from_terminal_size((80, 24), &state);
+
+        let (x, y) = cursor_position(geometry.details, &state).unwrap();
+        let details = DetailsGeometry::from_area(geometry.details, &state);
+
+        assert_eq!(y, geometry.details.y + details.rows.host);
+        assert_eq!(x, geometry.details.x + 14);
     }
 
     #[test]
@@ -2737,6 +2796,56 @@ mod tests {
 
         assert_eq!(y, geometry.details.y + details.rows.password);
         assert_eq!(x, geometry.details.x + 14);
+    }
+
+    #[test]
+    fn edit_backspace_accepts_terminal_control_h_encoding() {
+        let mut state = ConnectRemoteHostState::load();
+        state.profiles.clear();
+        state.selected = 0;
+        let _ = state.sync_selected_profile();
+
+        state.host = "abc".to_string();
+        state.set_focus(Focus::Host);
+        assert_eq!(
+            state.apply_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            PaneAction::None
+        );
+        assert_eq!(state.host, "ab");
+
+        state.ssh_password = "secret".to_string();
+        state.set_focus(Focus::Password);
+        assert_eq!(
+            state.apply_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            PaneAction::None
+        );
+        assert_eq!(state.ssh_password, "secre");
+
+        state.sudo_password = "rootpw".to_string();
+        state.sudo_mode = SudoMode::Replace;
+        state.set_focus(Focus::Sudo);
+        assert_eq!(
+            state.apply_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            PaneAction::None
+        );
+        assert_eq!(state.sudo_password, "rootp");
+    }
+
+    #[test]
+    fn edit_backspace_accepts_terminal_del_character_encoding() {
+        let mut state = ConnectRemoteHostState::load();
+        state.profiles.clear();
+        state.selected = 0;
+        let _ = state.sync_selected_profile();
+        state.host = "abc".to_string();
+        state.set_focus(Focus::Host);
+
+        assert_eq!(
+            state.apply_key(KeyEvent::from(KeyCode::Char('\u{7f}'))),
+            PaneAction::None
+        );
+
+        assert_eq!(state.host, "ab");
     }
 
     #[test]
