@@ -4,6 +4,7 @@ use crate::application::target_registry_service::{
 use crate::application::workspace_service::{BootstrappedWorkspace, WorkspaceService};
 use crate::domain::session_catalog::{ManagedSessionRecord, SessionTransport};
 use crate::domain::workspace::WorkspaceInstanceConfig;
+use crate::infra::error_log::ERROR_LOG;
 use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError, TmuxLayoutGateway, TmuxSocketName};
 use crate::lifecycle::LifecycleError;
 #[cfg(test)]
@@ -13,6 +14,7 @@ use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRu
 use crate::runtime::workspace_runtime::WorkspaceRuntime;
 use std::io;
 use std::path::PathBuf;
+use std::time::Instant;
 
 pub struct TargetHostRuntime {
     workspace_runtime: WorkspaceRuntime<EmbeddedTmuxBackend>,
@@ -74,7 +76,14 @@ impl TargetHostRuntime {
         &self,
         config: WorkspaceInstanceConfig,
     ) -> Result<BootstrappedWorkspace, TmuxError> {
+        let t_total = Instant::now();
         let workspace = self.workspace_runtime.ensure_workspace_for_config(config)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] target_host ensure_workspace socket={} session={} elapsed={:?}",
+            workspace.workspace_handle.socket_name.as_str(),
+            workspace.workspace_handle.session_name.as_str(),
+            t_total.elapsed()
+        ));
         let program = local_target_host_program(
             &self.current_executable,
             workspace.workspace_handle.socket_name.as_str(),
@@ -82,12 +91,30 @@ impl TargetHostRuntime {
             &workspace.workspace_dir,
             &self.network,
         );
+        let t_pane = Instant::now();
         let pane = self.backend.target_main_pane_on_socket(
             workspace.workspace_handle.socket_name.as_str(),
             workspace.workspace_handle.session_name.as_str(),
         )?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] target_host target_main_pane socket={} session={} pane={} elapsed={:?} total={:?}",
+            workspace.workspace_handle.socket_name.as_str(),
+            workspace.workspace_handle.session_name.as_str(),
+            pane.as_str(),
+            t_pane.elapsed(),
+            t_total.elapsed()
+        ));
+        let t_respawn = Instant::now();
         self.backend
             .respawn_pane(&workspace.workspace_handle, &pane, &program)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] target_host respawn_pane socket={} session={} pane={} elapsed={:?} total={:?}",
+            workspace.workspace_handle.socket_name.as_str(),
+            workspace.workspace_handle.session_name.as_str(),
+            pane.as_str(),
+            t_respawn.elapsed(),
+            t_total.elapsed()
+        ));
         Ok(workspace)
     }
 

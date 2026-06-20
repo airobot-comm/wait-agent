@@ -101,7 +101,7 @@ pub(super) fn run_remote_session_sync_loop<G, T, O>(
         let mut authority_manager =
             SessionSyncAuthorityManager::new(network.clone(), local_target_socket_name.clone());
         let mut should_reconnect = false;
-        let mut next_sync_at = Instant::now() + poll_interval;
+        let mut next_sync_at = Instant::now();
 
         while !should_reconnect {
             let wait_duration = next_sync_at.saturating_duration_since(Instant::now());
@@ -113,6 +113,9 @@ pub(super) fn run_remote_session_sync_loop<G, T, O>(
                     publication_runtime.as_ref(),
                     &node_id,
                 );
+                if active_session.is_some() {
+                    next_sync_at = Instant::now();
+                }
                 should_reconnect |= outcome.should_reconnect;
                 while let Ok(event) = event_rx.try_recv() {
                     let outcome = handle_transport_event(
@@ -122,6 +125,9 @@ pub(super) fn run_remote_session_sync_loop<G, T, O>(
                         publication_runtime.as_ref(),
                         &node_id,
                     );
+                    if active_session.is_some() {
+                        next_sync_at = Instant::now();
+                    }
                     should_reconnect |= outcome.should_reconnect;
                 }
             }
@@ -236,17 +242,33 @@ where
     G: LocalSessionCatalog,
     O: LocalTargetExitObserver,
 {
+    let t_sync = Instant::now();
+    ERROR_LOG.log(format!(
+        "[diag-newhost] sync_local_sessions start node={}",
+        node_id
+    ));
     let local_sessions = match gateway.list_local_sessions() {
         Ok(sessions) => {
             ERROR_LOG.log(format!(
                 "[diag-timing] sync_local_sessions: found {} local sessions",
                 sessions.len()
             ));
+            ERROR_LOG.log(format!(
+                "[diag-newhost] sync_local_sessions list_local_sessions node={} sessions={} elapsed={:?}",
+                node_id,
+                sessions.len(),
+                t_sync.elapsed()
+            ));
             sessions
         }
         Err(_) => {
             ERROR_LOG
                 .log("[diag-timing] sync_local_sessions: list_local_sessions FAILED".to_string());
+            ERROR_LOG.log(format!(
+                "[diag-newhost] sync_local_sessions list_local_sessions FAILED node={} elapsed={:?}",
+                node_id,
+                t_sync.elapsed()
+            ));
             return Ok(());
         }
     };
@@ -258,8 +280,28 @@ where
         "[diag-timing] sync_local_sessions: after filter {} local sessions",
         local_sessions.len()
     ));
+    ERROR_LOG.log(format!(
+        "[diag-newhost] sync_local_sessions filter node={} local_sessions={} elapsed={:?}",
+        node_id,
+        local_sessions.len(),
+        t_sync.elapsed()
+    ));
     let current_sessions = local_sessions_by_local_id(local_sessions);
     let delta = compute_session_sync_delta(synced_sessions, &current_sessions);
+    ERROR_LOG.log(format!(
+        "[diag-newhost] sync_local_sessions delta node={} publish={} exit={} elapsed={:?}",
+        node_id,
+        delta.publish.len(),
+        delta.exit.len(),
+        t_sync.elapsed()
+    ));
+    for session in &delta.publish {
+        ERROR_LOG.log(format!(
+            "[diag-sync] publishing target node={} target={}",
+            node_id,
+            session.address.qualified_target()
+        ));
+    }
     ERROR_LOG.log(format!(
         "[diag-timing] sync_local_sessions: delta publish={} exit={}",
         delta.publish.len(),
@@ -267,6 +309,7 @@ where
     ));
 
     for session in &delta.publish {
+        let t_send = Instant::now();
         next_message_id_increment(next_message_id);
         if let Err(error) = session_handle.send(remote_session_published_envelope(
             node_id,
@@ -275,8 +318,22 @@ where
             session,
         )) {
             ERROR_LOG.log(format!("[diag-sync] session_handle.send failed: {error}"));
+            ERROR_LOG.log(format!(
+                "[diag-newhost] sync_local_sessions publish_send FAILED node={} target={} elapsed={:?} total={:?}",
+                node_id,
+                session.address.qualified_target(),
+                t_send.elapsed(),
+                t_sync.elapsed()
+            ));
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()));
         }
+        ERROR_LOG.log(format!(
+            "[diag-newhost] sync_local_sessions publish_send node={} target={} elapsed={:?} total={:?}",
+            node_id,
+            session.address.qualified_target(),
+            t_send.elapsed(),
+            t_sync.elapsed()
+        ));
     }
 
     for previous in &delta.exit {
@@ -304,6 +361,11 @@ where
     }
 
     *synced_sessions = current_sessions;
+    ERROR_LOG.log(format!(
+        "[diag-newhost] sync_local_sessions done node={} elapsed={:?}",
+        node_id,
+        t_sync.elapsed()
+    ));
     Ok(())
 }
 

@@ -7,7 +7,6 @@ use crate::domain::local_runtime::{
 };
 use crate::domain::session_catalog::ManagedSessionRecord;
 use crate::event::EventEnvelope;
-use crate::infra::error_log::ERROR_LOG;
 use crate::runtime::event_driven_chrome_runtime::{
     EventDrivenChromeRenderUpdate, EventDrivenChromeRuntime,
 };
@@ -87,21 +86,11 @@ impl EventDrivenUiPaneRuntime {
 
     pub fn apply_sidebar_input_bytes(&mut self, bytes: &[u8]) -> EventDrivenSidebarInputOutcome {
         let mut outcome = EventDrivenSidebarInputOutcome::default();
-        ERROR_LOG.log(format!(
-            "[diag] apply_sidebar_input_bytes: bytes={bytes:?} pending_len={}",
-            self.pending_sidebar_input.len()
-        ));
 
         for action in sidebar_actions(&mut self.pending_sidebar_input, bytes) {
-            ERROR_LOG.log(format!(
-                "[diag] apply_sidebar_input_bytes: action={action:?}"
-            ));
             match action {
                 SidebarInputAction::Previous => {
                     if let Some(target) = self.state.step_selection(-1) {
-                        ERROR_LOG.log(format!(
-                            "[diag] apply_sidebar_input_bytes: Previous -> target={target}"
-                        ));
                         merge_render_update(
                             &mut outcome.render,
                             self.publish(LocalRuntimeEvent::Chrome(
@@ -109,16 +98,10 @@ impl EventDrivenUiPaneRuntime {
                             )),
                         );
                     } else {
-                        ERROR_LOG.log(
-                            "[diag] apply_sidebar_input_bytes: Previous -> no target".to_string(),
-                        );
                     }
                 }
                 SidebarInputAction::Next => {
                     if let Some(target) = self.state.step_selection(1) {
-                        ERROR_LOG.log(format!(
-                            "[diag] apply_sidebar_input_bytes: Next -> target={target}"
-                        ));
                         merge_render_update(
                             &mut outcome.render,
                             self.publish(LocalRuntimeEvent::Chrome(
@@ -126,16 +109,10 @@ impl EventDrivenUiPaneRuntime {
                             )),
                         );
                     } else {
-                        ERROR_LOG
-                            .log("[diag] apply_sidebar_input_bytes: Next -> no target".to_string());
                     }
                 }
                 SidebarInputAction::Submit => {
                     outcome.activation = self.state.activation();
-                    ERROR_LOG.log(format!(
-                        "[diag] apply_sidebar_input_bytes: Submit -> activation={:?}",
-                        outcome.activation
-                    ));
                 }
             }
         }
@@ -186,18 +163,18 @@ impl EventDrivenUiPaneState {
                 listener_display,
                 connect_endpoint: _,
             }) => {
-                ERROR_LOG.log(format!("[diag] observe SnapshotUpdated: sessions={} active_socket={active_socket} active_session={active_session} active_target={active_target:?}", sessions.len()));
+                let previous_active_target = self.active_target.clone();
                 self.active_socket = active_socket.clone();
                 self.active_session = active_session.clone();
                 self.active_target = active_target.clone();
                 self.sessions = sessions.clone();
                 self.listener_display = listener_display.clone();
                 self.ensure_active_target();
+                let selection_was_visible = self.selection_is_visible();
+                if !selection_was_visible && self.active_target != previous_active_target {
+                    self.selected_target = self.active_target.clone();
+                }
                 self.ensure_selected_session();
-                ERROR_LOG.log(format!(
-                    "[diag] observe SnapshotUpdated after ensure: selected_target={:?}",
-                    self.selected_target
-                ));
             }
             LocalRuntimeEvent::Chrome(ChromeEvent::SidebarSelectionChanged { target }) => {
                 if self.sessions.is_empty() {
@@ -212,6 +189,14 @@ impl EventDrivenUiPaneState {
             }
             _ => {}
         }
+    }
+
+    fn selection_is_visible(&self) -> bool {
+        self.selected_target.as_ref().map(|target| {
+            self.sessions
+                .iter()
+                .any(|session| session.address.qualified_target() == *target)
+        }) == Some(true)
     }
 
     fn ensure_selected_session(&mut self) {
@@ -257,7 +242,6 @@ impl EventDrivenUiPaneState {
 
     fn step_selection(&self, delta: isize) -> Option<String> {
         if self.sessions.is_empty() {
-            ERROR_LOG.log("[diag] step_selection: sessions empty".to_string());
             return None;
         }
 
@@ -273,7 +257,6 @@ impl EventDrivenUiPaneState {
         let next_index =
             ((current_index as isize + delta).rem_euclid(self.sessions.len() as isize)) as usize;
         let result = self.sessions[next_index].address.qualified_target();
-        ERROR_LOG.log(format!("[diag] step_selection: delta={delta} sessions={} current={current_index} next={next_index} result={result}", self.sessions.len()));
         Some(result)
     }
 
@@ -284,18 +267,9 @@ impl EventDrivenUiPaneState {
 
     fn activation(&self) -> Option<EventDrivenSidebarActivation> {
         let selected_target = self.selected_target()?;
-        ERROR_LOG.log(format!(
-            "[diag] activation: selected_target={selected_target} active_target={:?}",
-            self.active_target
-        ));
         if self.active_target.as_deref() == Some(selected_target.as_str()) {
-            ERROR_LOG.log("[diag] activation: -> SelectMainPane".to_string());
             return Some(EventDrivenSidebarActivation::SelectMainPane);
         }
-
-        ERROR_LOG.log(format!(
-            "[diag] activation: -> ActivateTarget {selected_target}"
-        ));
         Some(EventDrivenSidebarActivation::ActivateTarget {
             target: selected_target,
         })

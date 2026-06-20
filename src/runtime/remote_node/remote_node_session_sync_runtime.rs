@@ -268,8 +268,14 @@ impl RemoteNodeSessionSyncRuntime<SocketScopedLocalSessionCatalog<EmbeddedTmuxBa
         socket_name: &str,
         network: &RemoteNetworkConfig,
     ) -> Result<(), LifecycleError> {
+        let t_owner = std::time::Instant::now();
         let socket_path = remote_session_sync_owner_socket_path(socket_name);
         if remote_session_sync_owner_available(&socket_path) {
+            ERROR_LOG.log(format!(
+                "[diag-newhost] ensure_session_sync_owner socket={} already_available elapsed={:?}",
+                socket_name,
+                t_owner.elapsed()
+            ));
             return Ok(());
         }
         if socket_path.exists() {
@@ -281,12 +287,28 @@ impl RemoteNodeSessionSyncRuntime<SocketScopedLocalSessionCatalog<EmbeddedTmuxBa
             remote_session_sync_owner_args(socket_name, network),
         )
         .map_err(remote_session_sync_error)?;
-        for _ in 0..REMOTE_SESSION_SYNC_OWNER_READY_RETRIES {
+        ERROR_LOG.log(format!(
+            "[diag-newhost] ensure_session_sync_owner socket={} sidecar_spawned elapsed={:?}",
+            socket_name,
+            t_owner.elapsed()
+        ));
+        for attempt in 0..REMOTE_SESSION_SYNC_OWNER_READY_RETRIES {
             if remote_session_sync_owner_available(&socket_path) {
+                ERROR_LOG.log(format!(
+                    "[diag-newhost] ensure_session_sync_owner socket={} ready attempt={} elapsed={:?}",
+                    socket_name,
+                    attempt,
+                    t_owner.elapsed()
+                ));
                 return Ok(());
             }
             thread::sleep(REMOTE_SESSION_SYNC_OWNER_READY_SLEEP);
         }
+        ERROR_LOG.log(format!(
+            "[diag-newhost] ensure_session_sync_owner socket={} timeout elapsed={:?}",
+            socket_name,
+            t_owner.elapsed()
+        ));
         Err(LifecycleError::Protocol(format!(
             "remote session sync owner for socket `{socket_name}` did not become ready"
         )))
@@ -457,7 +479,17 @@ impl SessionSyncAuthorityManager {
         payload: crate::infra::remote_protocol::CreateSessionRequestPayload,
         correlation_id: Option<&str>,
     ) -> Result<(), LifecycleError> {
+        let started = std::time::Instant::now();
+        ERROR_LOG.log(format!(
+            "[diag-create] sync owner received create-session request id={} authority={}",
+            payload.request_id, payload.authority_node_id
+        ));
         let result = self.create_local_target_for_create_session(session_handle, &payload);
+        ERROR_LOG.log(format!(
+            "[diag-create] sync owner create-session target result id={} elapsed={:?}",
+            payload.request_id,
+            started.elapsed()
+        ));
         match result {
             Ok(created) => session_handle
                 .send(crate::runtime::remote_node_session_runtime::map_outbound_grpc_envelope(
@@ -527,6 +559,7 @@ impl SessionSyncAuthorityManager {
                 "create-session requires a socket-scoped local session catalog".to_string(),
             )
         })?;
+        let target_started = std::time::Instant::now();
         let workspace = runtime
             .ensure_target_host(WorkspaceInstanceConfig::for_new_target_on_socket_with_size(
                 &cwd,
@@ -536,6 +569,12 @@ impl SessionSyncAuthorityManager {
             ))
             .map_err(remote_session_sync_error)?;
         let session_id = workspace.workspace_handle.session_name.as_str().to_string();
+        ERROR_LOG.log(format!(
+            "[diag-create] sync owner ensure_target_host id={} session={} elapsed={:?}",
+            payload.request_id,
+            session_id,
+            target_started.elapsed()
+        ));
         Ok(CreatedSyncSessionTarget {
             target_id: format!("remote-peer:{}:{session_id}", session_handle.node_id()),
             session_id,

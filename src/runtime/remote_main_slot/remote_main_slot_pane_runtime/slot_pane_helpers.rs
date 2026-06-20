@@ -557,22 +557,12 @@ pub(super) fn spawn_input_thread(tx: mpsc::Sender<RemotePaneEvent>, raw_input: R
                         .route
                         .send(&raw_input.registry, bytes.clone())
                     {
-                        Ok(forwarded) => {
+                        Ok(forwarded) => forwarded,
+                        Err(error) => {
                             ERROR_LOG.log(format!(
-                                "[diag-timing] input thread: read {} bytes, forwarded={}, bytes={:?}",
-                                read, forwarded, bytes
+                                "[diag-timing] input thread: raw route send failed, falling back to event loop: {error}"
                             ));
-                            forwarded
-                        }
-                        Err(_) => {
-                            ERROR_LOG.log(
-                                    "[diag-timing] input thread: route.send failed, sending Disconnected"
-                                        .to_string(),
-                                );
-                            let _ = tx.send(RemotePaneEvent::AuthorityTransport(
-                                AuthorityTransportEvent::Disconnected,
-                            ));
-                            true
+                            false
                         }
                     };
                     if tx

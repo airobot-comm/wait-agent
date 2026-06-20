@@ -1,8 +1,9 @@
 mod tests {
     use super::super::{
-        discover_authority_socket_paths, extract_target_component,
-        has_active_ingress_session_for_node, route_transport_envelope, ActiveAuthoritySocketBridge,
-        ActiveNodeIngressSession, InternalEvent, RemoteNodeIngressServerRuntime,
+        discover_authority_socket_paths, enqueue_ingress_event, extract_target_component,
+        has_active_ingress_session_for_node, next_ingress_event, route_transport_envelope,
+        ActiveAuthoritySocketBridge, ActiveNodeIngressSession, IngressServerEvent, InternalEvent,
+        RemoteNodeIngressServerRuntime,
     };
     use crate::cli::RemoteNetworkConfig;
     use crate::infra::remote_grpc_proto::v1::node_session_envelope::Body;
@@ -15,12 +16,135 @@ mod tests {
         authority_transport_socket_path, RemoteAuthorityTransportRuntime,
     };
     use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
+    use std::collections::VecDeque;
     use std::fs;
     use std::net::Shutdown;
     use std::path::PathBuf;
     use std::process;
+    use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn local_create_session_event_is_prioritized_over_periodic_publication() {
+        let (_reply_tx, reply_rx) = mpsc::channel();
+        let mut high = VecDeque::new();
+        let mut low = VecDeque::new();
+
+        enqueue_ingress_event(
+            &mut high,
+            &mut low,
+            IngressServerEvent::Transport(
+                crate::infra::remote_grpc_transport::RemoteNodeTransportEvent::EnvelopeReceived {
+                    node_id: "peer-a".to_string(),
+                    session_instance_id: "session-1".to_string(),
+                    envelope: target_published_envelope_for("shell-a"),
+                },
+            ),
+        );
+        enqueue_ingress_event(
+            &mut high,
+            &mut low,
+            IngressServerEvent::Internal(InternalEvent::LocalCreateSession {
+                envelope: create_session_request_envelope("request-1"),
+                reply_tx: _reply_tx,
+            }),
+        );
+
+        let first = next_ingress_event(&mut high, &mut low).expect("first event should exist");
+        match first {
+            IngressServerEvent::Internal(InternalEvent::LocalCreateSession {
+                envelope, ..
+            }) => {
+                assert_eq!(
+                    grpc_create_request_id(&envelope).as_deref(),
+                    Some("request-1")
+                );
+            }
+            _ => panic!("local create-session should be handled before publication sync"),
+        }
+        drop(reply_rx);
+    }
+
+    #[test]
+    fn socket_discovery_event_is_prioritized_over_periodic_publication() {
+        let mut high = VecDeque::new();
+        let mut low = VecDeque::new();
+
+        enqueue_ingress_event(
+            &mut high,
+            &mut low,
+            IngressServerEvent::Transport(
+                crate::infra::remote_grpc_transport::RemoteNodeTransportEvent::EnvelopeReceived {
+                    node_id: "peer-a".to_string(),
+                    session_instance_id: "session-1".to_string(),
+                    envelope: target_published_envelope_for("shell-a"),
+                },
+            ),
+        );
+        enqueue_ingress_event(
+            &mut high,
+            &mut low,
+            IngressServerEvent::Internal(InternalEvent::SocketDirChanged),
+        );
+
+        let first = next_ingress_event(&mut high, &mut low).expect("first event should exist");
+        assert!(matches!(
+            first,
+            IngressServerEvent::Internal(InternalEvent::SocketDirChanged)
+        ));
+    }
+
+    #[test]
+    fn authority_socket_ready_reply_reports_registration_state() {
+        use super::super::{
+            authority_socket_ready_reply, AuthoritySocketReadyStatus, BridgeRefreshOutcome,
+        };
+        let path = PathBuf::from("/tmp/waitagent-authority.sock");
+
+        assert_eq!(
+            authority_socket_ready_reply(
+                "peer-a",
+                &path,
+                BridgeRefreshOutcome {
+                    connected: 1,
+                    pending: 0,
+                    already_registered: 0,
+                    invalid: 0,
+                },
+            )
+            .status,
+            AuthoritySocketReadyStatus::Registered
+        );
+        assert_eq!(
+            authority_socket_ready_reply(
+                "peer-a",
+                &path,
+                BridgeRefreshOutcome {
+                    connected: 0,
+                    pending: 1,
+                    already_registered: 0,
+                    invalid: 0,
+                },
+            )
+            .status,
+            AuthoritySocketReadyStatus::Pending
+        );
+        assert_eq!(
+            authority_socket_ready_reply(
+                "peer-a",
+                &path,
+                BridgeRefreshOutcome {
+                    connected: 0,
+                    pending: 0,
+                    already_registered: 0,
+                    invalid: 1,
+                },
+            )
+            .status,
+            AuthoritySocketReadyStatus::Error
+        );
+    }
 
     #[test]
     fn extracts_target_component_for_authority_socket_file() {
@@ -131,6 +255,7 @@ mod tests {
                     transport: transport.clone(),
                 },
             )]),
+            published_fingerprints: std::collections::HashMap::new(),
         };
         let publication_runtime = RemoteTargetPublicationRuntime::from_build_env()
             .expect("publication runtime should build");
@@ -258,6 +383,7 @@ mod tests {
                     },
                 ),
             ]),
+            published_fingerprints: std::collections::HashMap::new(),
         };
         let publication_runtime = RemoteTargetPublicationRuntime::from_build_env()
             .expect("publication runtime should build");
@@ -443,6 +569,7 @@ mod tests {
                 ActiveNodeIngressSession {
                     session: same_node_session,
                     bridges: std::collections::HashMap::new(),
+                    published_fingerprints: std::collections::HashMap::new(),
                 },
             ),
             (
@@ -450,6 +577,7 @@ mod tests {
                 ActiveNodeIngressSession {
                     session: other_node_session,
                     bridges: std::collections::HashMap::new(),
+                    published_fingerprints: std::collections::HashMap::new(),
                 },
             ),
         ]);
@@ -465,6 +593,7 @@ mod tests {
             ActiveNodeIngressSession {
                 session: RemoteNodeSessionHandle::new_for_tests(other_node_id, "session-other-2").0,
                 bridges: std::collections::HashMap::new(),
+                published_fingerprints: std::collections::HashMap::new(),
             },
         )]);
         assert!(!has_active_ingress_session_for_node(&sessions, node_id));
@@ -533,6 +662,73 @@ mod tests {
         >,
     > {
         read_envelope_from_any(streams)
+    }
+
+    fn grpc_create_request_id(envelope: &NodeSessionEnvelope) -> Option<String> {
+        match envelope.body.as_ref() {
+            Some(Body::CreateSessionRequest(payload)) => Some(payload.request_id.clone()),
+            _ => None,
+        }
+    }
+
+    fn create_session_request_envelope(request_id: &str) -> NodeSessionEnvelope {
+        NodeSessionEnvelope {
+            message_id: format!("create-session-{request_id}"),
+            sent_at: None,
+            session_instance_id: String::new(),
+            correlation_id: Some(request_id.to_string()),
+            route: Some(RouteContext {
+                authority_node_id: Some("peer-a".to_string()),
+                target_id: None,
+                attachment_id: None,
+                console_id: None,
+                console_host_id: None,
+                session_id: None,
+            }),
+            body: Some(Body::CreateSessionRequest(
+                crate::infra::remote_grpc_proto::v1::CreateSessionRequest {
+                    request_id: request_id.to_string(),
+                    authority_node_id: "peer-a".to_string(),
+                    cwd_hint: None,
+                    cols: 80,
+                    rows: 24,
+                },
+            )),
+        }
+    }
+
+    fn target_published_envelope_for(session_id: &str) -> NodeSessionEnvelope {
+        NodeSessionEnvelope {
+            message_id: format!("target-published-{session_id}"),
+            sent_at: None,
+            session_instance_id: "client-session-1".to_string(),
+            correlation_id: None,
+            route: Some(RouteContext {
+                authority_node_id: Some("peer-a".to_string()),
+                target_id: Some(format!("remote-peer:peer-a:{session_id}")),
+                attachment_id: None,
+                console_id: None,
+                console_host_id: None,
+                session_id: Some(session_id.to_string()),
+            }),
+            body: Some(Body::TargetPublished(
+                crate::infra::remote_grpc_proto::v1::TargetPublished {
+                    target_id: format!("remote-peer:peer-a:{session_id}"),
+                    transport_session_id: session_id.to_string(),
+                    authority_node_id: "peer-a".to_string(),
+                    transport: "tmux".to_string(),
+                    selector: Some("shell-a".to_string()),
+                    availability: "online".to_string(),
+                    command_name: Some("bash".to_string()),
+                    current_path: Some("/tmp".to_string()),
+                    attached_count: Some(0),
+                    session_role: None,
+                    workspace_key: None,
+                    window_count: Some(1),
+                    task_state: Some("running".to_string()),
+                },
+            )),
+        }
     }
 
     fn temp_dir_path(file_name: &str) -> PathBuf {

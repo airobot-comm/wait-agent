@@ -258,19 +258,52 @@ impl WorkspaceLayoutRuntime {
     }
 
     pub fn run_chrome_refresh_on_socket(&self, socket_name: &str) -> Result<(), LifecycleError> {
-        let sessions = self
-            .target_registry
-            .list_workspace_chrome_targets_on_authority(socket_name)
+        let t_refresh_socket = Instant::now();
+        ERROR_LOG.log(format!(
+            "[diag-newhost] chrome_refresh_socket start socket={}",
+            socket_name
+        ));
+        let target_registry = TargetRegistryService::new(
+            DefaultTargetCatalogGateway::from_build_env_with_socket_name(socket_name.to_string())
+                .map_err(tmux_layout_error)?,
+        );
+        ERROR_LOG.log(format!(
+            "[diag-newhost] chrome_refresh_socket registry_ready socket={} elapsed={:?}",
+            socket_name,
+            t_refresh_socket.elapsed()
+        ));
+        let sessions = target_registry
+            .list_local_workspace_chrome_targets_on_authority(socket_name)
             .map_err(tmux_layout_error)?;
-        self.refresh_workspace_chrome_targets(&sessions)
+        ERROR_LOG.log(format!(
+            "[diag-newhost] chrome_refresh_socket chrome_targets socket={} count={} elapsed={:?}",
+            socket_name,
+            sessions.len(),
+            t_refresh_socket.elapsed()
+        ));
+        let result = self.refresh_workspace_chrome_targets(&sessions);
+        ERROR_LOG.log(format!(
+            "[diag-newhost] chrome_refresh_socket done socket={} ok={} elapsed={:?}",
+            socket_name,
+            result.is_ok(),
+            t_refresh_socket.elapsed()
+        ));
+        result
     }
 
     fn refresh_workspace_chrome_targets(
         &self,
         sessions: &[crate::domain::session_catalog::ManagedSessionRecord],
     ) -> Result<(), LifecycleError> {
+        let t_targets = Instant::now();
         for session in sessions {
+            let t_one = Instant::now();
             let Some(workspace_dir) = session.workspace_dir.as_ref() else {
+                ERROR_LOG.log(format!(
+                    "[diag-newhost] chrome_refresh_target skip_no_workspace_dir target={} total={:?}",
+                    session.address.qualified_target(),
+                    t_targets.elapsed()
+                ));
                 continue;
             };
             let workspace = TmuxWorkspaceHandle {
@@ -279,6 +312,12 @@ impl WorkspaceLayoutRuntime {
                 session_name: TmuxSessionName::new(session.address.session_id()),
             };
             self.refresh_chrome(&workspace, workspace_dir)?;
+            ERROR_LOG.log(format!(
+                "[diag-newhost] chrome_refresh_target done target={} elapsed={:?} total={:?}",
+                session.address.qualified_target(),
+                t_one.elapsed(),
+                t_targets.elapsed()
+            ));
         }
 
         Ok(())
@@ -322,17 +361,35 @@ impl WorkspaceLayoutRuntime {
         workspace: &TmuxWorkspaceHandle,
         workspace_dir: &Path,
     ) -> Result<(), LifecycleError> {
+        let t_total = Instant::now();
         self.ensure_layout_topology(
             workspace,
             workspace_dir,
             LayoutFocusBehavior::PreserveCurrent,
         )?;
-        self.backend
+        ERROR_LOG.log(format!(
+            "[diag-newhost] refresh_chrome ensure_layout_topology socket={} session={} elapsed={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            t_total.elapsed()
+        ));
+        let t_signal = Instant::now();
+        let result = self
+            .backend
             .signal_chrome_refresh_on_socket(
                 workspace.socket_name.as_str(),
                 workspace.session_name.as_str(),
             )
-            .map_err(tmux_layout_error)
+            .map_err(tmux_layout_error);
+        ERROR_LOG.log(format!(
+            "[diag-newhost] refresh_chrome signal socket={} session={} ok={} elapsed={:?} total={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            result.is_ok(),
+            t_signal.elapsed(),
+            t_total.elapsed()
+        ));
+        result
     }
 
     fn notify_existing_chrome_panes(
@@ -377,18 +434,29 @@ impl WorkspaceLayoutRuntime {
         workspace_dir: &Path,
         focus_behavior: LayoutFocusBehavior,
     ) -> Result<crate::domain::workspace_layout::WorkspaceChromeLayout, LifecycleError> {
+        let t_total = Instant::now();
         let sidebar_program = self.sidebar_program(workspace, workspace_dir);
         let footer_program = self.footer_program(workspace, workspace_dir);
         let reconcile_command = self.layout_reconcile_hook_command(workspace, workspace_dir);
         let main_pane_pipe_command =
             self.main_pane_output_bridge_shell_command(workspace, workspace_dir);
+        let t_generation = Instant::now();
         let pane_generation = self
             .backend
             .show_session_option(workspace, WAITAGENT_MAIN_PANE_GENERATION_OPTION)
             .map_err(tmux_layout_error)?
             .filter(|generation| !generation.is_empty())
             .unwrap_or_else(|| "0".to_string());
+        ERROR_LOG.log(format!(
+            "[diag-newhost] layout_topology pane_generation socket={} session={} generation={} elapsed={:?} total={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            pane_generation,
+            t_generation.elapsed(),
+            t_total.elapsed()
+        ));
         let pane_died_command = self.main_pane_died_hook_command(workspace, &pane_generation);
+        let t_options = Instant::now();
         let transition_active = self
             .backend
             .show_session_option(workspace, WAITAGENT_MAIN_PANE_TRANSITION_OPTION)
@@ -401,12 +469,33 @@ impl WorkspaceLayoutRuntime {
             .map_err(tmux_layout_error)?
             .filter(|pane| !pane.is_empty())
             .map(TmuxPaneId::new);
+        ERROR_LOG.log(format!(
+            "[diag-newhost] layout_topology options socket={} session={} transition_active={} previous_main={:?} elapsed={:?} total={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            transition_active,
+            previous_main_pane,
+            t_options.elapsed(),
+            t_total.elapsed()
+        ));
+        let t_layout = Instant::now();
         let layout = self
             .layout_service
             .ensure_workspace_layout(workspace, &sidebar_program, &footer_program, focus_behavior)
             .map_err(tmux_layout_error)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] layout_topology ensure_workspace_layout socket={} session={} main={} sidebar={} footer={} elapsed={:?} total={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            layout.main_pane.as_str(),
+            layout.sidebar_pane.as_str(),
+            layout.footer_pane.as_str(),
+            t_layout.elapsed(),
+            t_total.elapsed()
+        ));
         let footer_bindings = self.footer_menu_bindings(workspace);
         let fullscreen_toggle_command = self.fullscreen_toggle_command(workspace);
+        let t_controls = Instant::now();
         self.control_service
             .ensure_native_controls(
                 workspace,
@@ -415,6 +504,13 @@ impl WorkspaceLayoutRuntime {
                 Some(&footer_bindings),
             )
             .map_err(tmux_layout_error)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] layout_topology ensure_native_controls socket={} session={} elapsed={:?} total={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            t_controls.elapsed(),
+            t_total.elapsed()
+        ));
         if transition_active && previous_main_pane.is_none() {
             ERROR_LOG.log(format!(
                 "[diag] ensure_layout_topology: skipped main pane metadata while transition is active for session={:?}",
@@ -436,14 +532,32 @@ impl WorkspaceLayoutRuntime {
             previous_main_pane.as_ref(),
             &layout.main_pane,
         );
+        let t_set_main = Instant::now();
         self.backend
             .set_session_option(workspace, WAITAGENT_MAIN_PANE_OPTION, main_pane.as_str())
             .map_err(tmux_layout_error)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] layout_topology set_main_option socket={} session={} pane={} elapsed={:?} total={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            main_pane.as_str(),
+            t_set_main.elapsed(),
+            t_total.elapsed()
+        ));
+        let t_bridge = Instant::now();
         if self.main_pane_output_bridge_enabled(workspace)? {
             self.ensure_main_pane_output_bridge(workspace, &main_pane, &main_pane_pipe_command)?;
         } else {
             self.suspend_main_pane_output_bridge(workspace)?;
         }
+        ERROR_LOG.log(format!(
+            "[diag-newhost] layout_topology main_bridge socket={} session={} elapsed={:?} total={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            t_bridge.elapsed(),
+            t_total.elapsed()
+        ));
+        let t_hooks = Instant::now();
         self.layout_service
             .ensure_layout_hooks(
                 workspace,
@@ -453,6 +567,13 @@ impl WorkspaceLayoutRuntime {
                 &pane_died_command,
             )
             .map_err(tmux_layout_error)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] layout_topology hooks socket={} session={} elapsed={:?} total={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            t_hooks.elapsed(),
+            t_total.elapsed()
+        ));
         Ok(layout)
     }
 
@@ -524,6 +645,7 @@ impl WorkspaceLayoutRuntime {
         workspace: &TmuxWorkspaceHandle,
         layout: &crate::domain::workspace_layout::WorkspaceChromeLayout,
     ) {
+        let t_total = Instant::now();
         let mut sidebar_ready = self
             .backend
             .sidebar_ready_matches(workspace, layout.sidebar_pane.as_str())
@@ -532,6 +654,14 @@ impl WorkspaceLayoutRuntime {
             .backend
             .footer_ready_matches(workspace, layout.footer_pane.as_str())
             .unwrap_or(false);
+        ERROR_LOG.log(format!(
+            "[diag-newhost] wait_initial_chrome initial socket={} session={} sidebar_ready={} footer_ready={} elapsed={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            sidebar_ready,
+            footer_ready,
+            t_total.elapsed()
+        ));
         if sidebar_ready && footer_ready {
             return;
         }
@@ -589,6 +719,14 @@ impl WorkspaceLayoutRuntime {
             }
         }
 
+        ERROR_LOG.log(format!(
+            "[diag-newhost] wait_initial_chrome done socket={} session={} sidebar_ready={} footer_ready={} elapsed={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            sidebar_ready,
+            footer_ready,
+            t_total.elapsed()
+        ));
         if !(sidebar_ready && footer_ready) {
             let _ = self.backend.signal_sidebar_ready_on_socket(
                 workspace.socket_name.as_str(),

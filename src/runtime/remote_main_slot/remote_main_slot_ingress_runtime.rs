@@ -10,6 +10,7 @@ use crate::runtime::remote_authority_transport_runtime::{
     AuthorityTransportListenerGuard,
 };
 use crate::runtime::remote_main_slot_pane_runtime::RemoteMainSlotPaneRuntime;
+use crate::runtime::remote_node::remote_node_ingress_server_runtime::notify_authority_socket_ready;
 use crate::runtime::remote_node_ingress_runtime::run_grpc_node_ingress_worker;
 use crate::runtime::remote_node_session_runtime::{
     RemoteNodePublicationSink, RemoteNodeSessionError,
@@ -118,12 +119,23 @@ impl RemoteMainSlotIngressRuntime {
             &command.session_name,
             &command.target,
         );
-        spawn_authority_transport_listener(socket_path, authority_sink).map_err(|error| {
-            LifecycleError::Io(
-                "failed to start remote main-slot authority transport listener".to_string(),
-                error,
-            )
-        })
+        let guard = spawn_authority_transport_listener(socket_path.clone(), authority_sink)
+            .map_err(|error| {
+                LifecycleError::Io(
+                    "failed to start remote main-slot authority transport listener".to_string(),
+                    error,
+                )
+            })?;
+        let authority_id = extract_authority_id_from_target(&command.target);
+        notify_authority_socket_ready(&self.network, &authority_id, &socket_path).map_err(
+            |error| {
+                LifecycleError::Io(
+                    "failed to register remote main-slot authority socket".to_string(),
+                    error,
+                )
+            },
+        )?;
+        Ok(guard)
     }
 
     fn spawn_background_grpc_bridge(
@@ -276,9 +288,7 @@ mod tests {
     use crate::runtime::remote_authority_connection_runtime::{
         AuthorityConnectionRequest, AuthorityTransportEvent,
     };
-    use crate::runtime::remote_authority_transport_runtime::{
-        authority_transport_socket_path, RemoteAuthorityTransportRuntime,
-    };
+    use crate::runtime::remote_authority_transport_runtime::authority_transport_socket_path;
     use crate::runtime::remote_main_slot_pane_runtime::apply_authority_envelope;
     use crate::runtime::remote_main_slot_pane_runtime::RemoteMainSlotPaneRuntime;
     use crate::runtime::remote_main_slot_runtime::RemoteMainSlotRuntime;
@@ -351,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn server_listener_authority_transport_listener_registers_with_pane_queue() {
+    fn server_listener_authority_transport_listener_requires_owner_registration() {
         let target_registry = TargetRegistryService::new(
             DefaultTargetCatalogGateway::from_build_env()
                 .expect("build env target catalog should exist"),
@@ -387,23 +397,15 @@ mod tests {
                 tx,
             )
             .expect("pane runtime should start queued authority connection");
-        let _listener = runtime
-            .start_local_authority_transport_listener(&command, sink)
-            .expect("server main-slot listener should bind");
+        let error = match runtime.start_local_authority_transport_listener(&command, sink) {
+            Ok(_) => panic!("server listener should fail without owner registration ACK"),
+            Err(error) => error,
+        };
 
-        let socket_path = authority_transport_socket_path(
-            &command.socket_name,
-            &command.session_name,
-            &command.target,
-        );
-        let _transport = RemoteAuthorityTransportRuntime::connect(socket_path, "peer-a")
-            .expect("ingress bridge should connect with authority transport protocol");
-
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .expect("connected event should arrive"),
-            AuthorityTransportEvent::Connected
-        );
+        assert!(error
+            .to_string()
+            .contains("failed to register remote main-slot authority socket"));
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
     #[test]

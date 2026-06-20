@@ -29,9 +29,9 @@ use crate::runtime::remote_node_session_runtime::{
 use crate::runtime::remote_node_session_sync_runtime::SessionSyncAuthorityManager;
 use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
 use crate::runtime::sidecar_process_runtime::spawn_waitagent_sidecar;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io;
+use std::io::{self, Cursor, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,8 +41,27 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BRIDGE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const BRIDGE_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(25);
+const BRIDGE_DISCOVERY_RETRY_ATTEMPTS: u8 = 20;
 const REMOTE_NODE_INGRESS_OWNER_READY_RETRIES: usize = 20;
 const REMOTE_NODE_INGRESS_OWNER_READY_SLEEP: Duration = Duration::from_millis(25);
+const OWNER_CONTROL_MAGIC: &[u8; 4] = b"waOC";
+const OWNER_CONTROL_REPLY_OK: u8 = 0;
+const OWNER_CONTROL_REPLY_PENDING: u8 = 1;
+const OWNER_CONTROL_REPLY_ERROR: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthoritySocketReadyReply {
+    status: AuthoritySocketReadyStatus,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthoritySocketReadyStatus {
+    Registered,
+    Pending,
+    Error,
+}
 
 pub struct RemoteNodeIngressServerRuntime {
     publication_runtime: RemoteTargetPublicationRuntime,
@@ -63,6 +82,7 @@ struct ActiveAuthoritySocketBridge {
 struct ActiveNodeIngressSession {
     session: RemoteNodeSessionHandle,
     bridges: HashMap<PathBuf, ActiveAuthoritySocketBridge>,
+    published_fingerprints: HashMap<String, String>,
 }
 
 enum InternalEvent {
@@ -74,7 +94,18 @@ enum InternalEvent {
         envelope: GrpcNodeSessionEnvelope,
         reply_tx: mpsc::Sender<GrpcNodeSessionEnvelope>,
     },
+    LocalCreateSessionTimedOut {
+        request_id: String,
+    },
     SocketDirChanged,
+    AuthoritySocketReady {
+        node_id: String,
+        socket_path: PathBuf,
+        reply_tx: mpsc::Sender<AuthoritySocketReadyReply>,
+    },
+    RetrySocketDiscovery {
+        attempts_remaining: u8,
+    },
     Shutdown,
 }
 
@@ -166,6 +197,32 @@ impl RemoteNodeIngressServerRuntime {
     }
 }
 
+pub(crate) fn notify_authority_socket_ready(
+    network: &RemoteNetworkConfig,
+    node_id: &str,
+    socket_path: &std::path::Path,
+) -> io::Result<()> {
+    RemoteNodeIngressServerRuntime::ensure_owner_running("__shared__", network)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+    let mut stream = UnixStream::connect(remote_node_ingress_owner_socket_path(network))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    write_owner_control_authority_socket_ready(&mut stream, node_id, socket_path)?;
+    match read_owner_control_reply(&mut stream)? {
+        AuthoritySocketReadyReply {
+            status: AuthoritySocketReadyStatus::Registered,
+            ..
+        } => Ok(()),
+        AuthoritySocketReadyReply {
+            status: AuthoritySocketReadyStatus::Pending,
+            message,
+        } => Err(io::Error::new(io::ErrorKind::WouldBlock, message)),
+        AuthoritySocketReadyReply {
+            status: AuthoritySocketReadyStatus::Error,
+            message,
+        } => Err(io::Error::new(io::ErrorKind::Other, message)),
+    }
+}
+
 pub(crate) fn remote_node_ingress_owner_socket_path(network: &RemoteNetworkConfig) -> PathBuf {
     std::env::temp_dir().join(format!(
         "waitagent-remote-node-ingress-{}.sock",
@@ -206,8 +263,51 @@ fn drain_owner_requests(
 
 fn handle_owner_stream(mut stream: UnixStream, owner_tx: mpsc::Sender<InternalEvent>) {
     thread::spawn(move || {
-        let Ok(request) = read_node_session_envelope(&mut stream) else {
+        let mut prefix = [0_u8; 4];
+        if stream.read_exact(&mut prefix).is_err() {
             return;
+        }
+        let request = if &prefix == OWNER_CONTROL_MAGIC {
+            match read_owner_control_message(&mut stream) {
+                Ok(OwnerControlMessage::AuthoritySocketReady {
+                    node_id,
+                    socket_path,
+                }) => {
+                    let (reply_tx, reply_rx) = mpsc::channel();
+                    if owner_tx
+                        .send(InternalEvent::AuthoritySocketReady {
+                            node_id,
+                            socket_path,
+                            reply_tx,
+                        })
+                        .is_err()
+                    {
+                        let _ = write_owner_control_reply(
+                            &mut stream,
+                            &AuthoritySocketReadyReply {
+                                status: AuthoritySocketReadyStatus::Error,
+                                message: "remote-node-ingress owner loop is closed".to_string(),
+                            },
+                        );
+                        return;
+                    }
+                    let reply = reply_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap_or_else(|_| AuthoritySocketReadyReply {
+                            status: AuthoritySocketReadyStatus::Pending,
+                            message: "authority socket registration is pending".to_string(),
+                        });
+                    let _ = write_owner_control_reply(&mut stream, &reply);
+                }
+                Err(_) => {}
+            }
+            return;
+        } else {
+            let mut request_reader = Cursor::new(prefix).chain(&mut stream);
+            let Ok(request) = read_node_session_envelope(&mut request_reader) else {
+                return;
+            };
+            request
         };
         let Some(Body::CreateSessionRequest(payload)) =
             map_outbound_grpc_envelope_for_local_request(request).body
@@ -216,6 +316,7 @@ fn handle_owner_stream(mut stream: UnixStream, owner_tx: mpsc::Sender<InternalEv
         };
         let authority_node_id = payload.authority_node_id.clone();
         let request_id = payload.request_id.clone();
+        ERROR_LOG.log(format!("[diag-create] owner received local create-session request id={request_id} authority={authority_node_id}"));
         let grpc = local_create_session_request_grpc_envelope(authority_node_id, payload);
         let (reply_tx, reply_rx) = mpsc::channel();
         if owner_tx
@@ -232,13 +333,22 @@ fn handle_owner_stream(mut stream: UnixStream, owner_tx: mpsc::Sender<InternalEv
             );
             return;
         }
+        let wait_started = std::time::Instant::now();
         match reply_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(reply) => {
+                ERROR_LOG.log(format!(
+                    "[diag-create] owner got create-session reply after {:?}",
+                    wait_started.elapsed()
+                ));
                 if let Some(envelope) = map_local_reply_from_grpc(reply) {
                     let _ = write_node_session_envelope(&mut stream, &envelope);
                 }
             }
             Err(_) => {
+                ERROR_LOG.log(format!("[diag-create] owner timed out waiting create-session reply id={request_id} after {:?}", wait_started.elapsed()));
+                let _ = owner_tx.send(InternalEvent::LocalCreateSessionTimedOut {
+                    request_id: request_id.clone(),
+                });
                 let _ = write_create_session_rejected_to_stream(
                     &mut stream,
                     request_id,
@@ -247,6 +357,98 @@ fn handle_owner_stream(mut stream: UnixStream, owner_tx: mpsc::Sender<InternalEv
             }
         }
     });
+}
+
+enum OwnerControlMessage {
+    AuthoritySocketReady {
+        node_id: String,
+        socket_path: PathBuf,
+    },
+}
+fn write_owner_control_authority_socket_ready(
+    writer: &mut impl Write,
+    node_id: &str,
+    socket_path: &std::path::Path,
+) -> io::Result<()> {
+    writer.write_all(OWNER_CONTROL_MAGIC)?;
+    writer.write_all(&[1])?;
+    write_owner_control_string(writer, node_id)?;
+    write_owner_control_string(writer, &socket_path.to_string_lossy())?;
+    writer.flush()
+}
+
+fn write_owner_control_reply(
+    writer: &mut impl Write,
+    reply: &AuthoritySocketReadyReply,
+) -> io::Result<()> {
+    let status = match reply.status {
+        AuthoritySocketReadyStatus::Registered => OWNER_CONTROL_REPLY_OK,
+        AuthoritySocketReadyStatus::Pending => OWNER_CONTROL_REPLY_PENDING,
+        AuthoritySocketReadyStatus::Error => OWNER_CONTROL_REPLY_ERROR,
+    };
+    writer.write_all(&[status])?;
+    write_owner_control_string(writer, &reply.message)?;
+    writer.flush()
+}
+
+fn read_owner_control_reply(reader: &mut impl Read) -> io::Result<AuthoritySocketReadyReply> {
+    let mut status = [0_u8; 1];
+    reader.read_exact(&mut status)?;
+    let message = read_owner_control_string(reader)?;
+    let status = match status[0] {
+        OWNER_CONTROL_REPLY_OK => AuthoritySocketReadyStatus::Registered,
+        OWNER_CONTROL_REPLY_PENDING => AuthoritySocketReadyStatus::Pending,
+        OWNER_CONTROL_REPLY_ERROR => AuthoritySocketReadyStatus::Error,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown authority socket ready reply status",
+            ))
+        }
+    };
+    Ok(AuthoritySocketReadyReply { status, message })
+}
+
+fn read_owner_control_message(reader: &mut impl Read) -> io::Result<OwnerControlMessage> {
+    let mut tag = [0_u8; 1];
+    reader.read_exact(&mut tag)?;
+    match tag[0] {
+        1 => {
+            let node_id = read_owner_control_string(reader)?;
+            let socket_path = PathBuf::from(read_owner_control_string(reader)?);
+            Ok(OwnerControlMessage::AuthoritySocketReady {
+                node_id,
+                socket_path,
+            })
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown remote-node-ingress owner control message",
+        )),
+    }
+}
+
+fn write_owner_control_string(writer: &mut impl Write, value: &str) -> io::Result<()> {
+    let bytes = value.as_bytes();
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "owner control string too long")
+    })?;
+    writer.write_all(&len.to_be_bytes())?;
+    writer.write_all(bytes)
+}
+
+fn read_owner_control_string(reader: &mut impl Read) -> io::Result<String> {
+    let mut len_bytes = [0_u8; 4];
+    reader.read_exact(&mut len_bytes)?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    let mut bytes = vec![0_u8; len];
+    reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "owner control string is not valid UTF-8",
+        )
+    })
 }
 
 fn any_live_workspace_exists() -> Result<bool, LifecycleError> {
@@ -371,6 +573,12 @@ enum IngressServerEvent {
     Internal(InternalEvent),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngressEventPriority {
+    High,
+    Low,
+}
+
 fn run_node_ingress_server_loop(
     publication_runtime: RemoteTargetPublicationRuntime,
     transport_rx: mpsc::Receiver<RemoteNodeTransportEvent>,
@@ -421,7 +629,38 @@ fn run_node_ingress_server_loop(
         None
     };
 
-    while let Ok(event) = event_rx.recv() {
+    let mut high_priority_events = VecDeque::<IngressServerEvent>::new();
+    let mut low_priority_events = VecDeque::<IngressServerEvent>::new();
+
+    loop {
+        drain_ingress_events(
+            &event_rx,
+            &mut high_priority_events,
+            &mut low_priority_events,
+        );
+        let event = match next_ingress_event(&mut high_priority_events, &mut low_priority_events) {
+            Some(event) => event,
+            None => match event_rx.recv() {
+                Ok(event) => {
+                    enqueue_ingress_event(
+                        &mut high_priority_events,
+                        &mut low_priority_events,
+                        event,
+                    );
+                    drain_ingress_events(
+                        &event_rx,
+                        &mut high_priority_events,
+                        &mut low_priority_events,
+                    );
+                    match next_ingress_event(&mut high_priority_events, &mut low_priority_events) {
+                        Some(event) => event,
+                        None => continue,
+                    }
+                }
+                Err(_) => break,
+            },
+        };
+
         match event {
             IngressServerEvent::Transport(event) => handle_transport_event(
                 &publication_runtime,
@@ -443,6 +682,11 @@ fn run_node_ingress_server_loop(
                     reply_tx,
                 );
             }
+            IngressServerEvent::Internal(InternalEvent::LocalCreateSessionTimedOut {
+                request_id,
+            }) => {
+                pending_create_sessions.remove(&request_id);
+            }
             IngressServerEvent::Internal(event) => {
                 handle_internal_event(&mut sessions, internal_tx.clone(), event);
             }
@@ -451,6 +695,50 @@ fn run_node_ingress_server_loop(
     watcher_shutdown.store(true, Ordering::Relaxed);
     if let Some(watcher) = watcher {
         let _ = watcher.join();
+    }
+}
+
+fn drain_ingress_events(
+    event_rx: &mpsc::Receiver<IngressServerEvent>,
+    high_priority_events: &mut VecDeque<IngressServerEvent>,
+    low_priority_events: &mut VecDeque<IngressServerEvent>,
+) {
+    while let Ok(event) = event_rx.try_recv() {
+        enqueue_ingress_event(high_priority_events, low_priority_events, event);
+    }
+}
+
+fn next_ingress_event(
+    high_priority_events: &mut VecDeque<IngressServerEvent>,
+    low_priority_events: &mut VecDeque<IngressServerEvent>,
+) -> Option<IngressServerEvent> {
+    high_priority_events
+        .pop_front()
+        .or_else(|| low_priority_events.pop_front())
+}
+
+fn enqueue_ingress_event(
+    high_priority_events: &mut VecDeque<IngressServerEvent>,
+    low_priority_events: &mut VecDeque<IngressServerEvent>,
+    event: IngressServerEvent,
+) {
+    match ingress_event_priority(&event) {
+        IngressEventPriority::High => high_priority_events.push_back(event),
+        IngressEventPriority::Low => low_priority_events.push_back(event),
+    }
+}
+
+fn ingress_event_priority(event: &IngressServerEvent) -> IngressEventPriority {
+    match event {
+        IngressServerEvent::Internal(_) => IngressEventPriority::High,
+        IngressServerEvent::Transport(RemoteNodeTransportEvent::EnvelopeReceived {
+            envelope,
+            ..
+        }) => match envelope.body.as_ref() {
+            Some(Body::TargetPublished(_)) | Some(Body::Heartbeat(_)) => IngressEventPriority::Low,
+            _ => IngressEventPriority::High,
+        },
+        IngressServerEvent::Transport(_) => IngressEventPriority::High,
     }
 }
 
@@ -469,8 +757,12 @@ fn handle_transport_event(
             let mut active = ActiveNodeIngressSession {
                 session,
                 bridges: HashMap::new(),
+                published_fingerprints: HashMap::new(),
             };
-            refresh_authority_bridges(&node_id, &mut active, internal_tx);
+            let outcome = refresh_authority_bridges(&node_id, &mut active, internal_tx.clone());
+            if outcome.pending > 0 {
+                schedule_socket_discovery_retry(internal_tx, BRIDGE_DISCOVERY_RETRY_ATTEMPTS);
+            }
             sessions.insert(session_instance_id, active);
         }
         RemoteNodeTransportEvent::EnvelopeReceived {
@@ -597,8 +889,14 @@ fn handle_local_create_session_request(
         return;
     };
     let request_id = grpc_create_session_request_id(&envelope).unwrap_or_default();
+    ERROR_LOG.log(format!("[diag-create] routing create-session request id={request_id} authority={authority_node_id}"));
     pending_create_sessions.insert(request_id.clone(), reply_tx);
+    let send_started = std::time::Instant::now();
     if active.session.send(envelope).is_err() {
+        ERROR_LOG.log(format!(
+            "[diag-create] failed sending create-session request id={request_id} after {:?}",
+            send_started.elapsed()
+        ));
         if let Some(reply_tx) = pending_create_sessions.remove(&request_id) {
             let _ = reply_tx.send(local_create_session_rejected_grpc_envelope(
                 request_id,
@@ -762,14 +1060,51 @@ fn handle_internal_event(
                 }
             }
         }
-        InternalEvent::SocketDirChanged => {
-            for active in sessions.values_mut() {
-                let node_id = active.session.node_id().to_string();
-                refresh_authority_bridges(&node_id, active, internal_tx.clone());
-            }
+        InternalEvent::AuthoritySocketReady {
+            node_id,
+            socket_path,
+            reply_tx,
+        } => {
+            let outcome = refresh_authority_bridge_for_socket(
+                sessions,
+                internal_tx,
+                &node_id,
+                socket_path.clone(),
+            );
+            let reply = authority_socket_ready_reply(&node_id, &socket_path, outcome);
+            let _ = reply_tx.send(reply);
         }
-        InternalEvent::Shutdown | InternalEvent::LocalCreateSession { .. } => {}
+        InternalEvent::SocketDirChanged => {
+            refresh_authority_bridges_for_sessions(
+                sessions,
+                internal_tx,
+                BRIDGE_DISCOVERY_RETRY_ATTEMPTS,
+            );
+        }
+        InternalEvent::RetrySocketDiscovery { attempts_remaining } => {
+            refresh_authority_bridges_for_sessions(sessions, internal_tx, attempts_remaining);
+        }
+        InternalEvent::Shutdown
+        | InternalEvent::LocalCreateSession { .. }
+        | InternalEvent::LocalCreateSessionTimedOut { .. } => {}
     }
+}
+
+fn target_published_fingerprint(payload: &GrpcTargetPublished) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}",
+        payload.target_id,
+        payload.transport_session_id,
+        payload.availability,
+        payload.selector,
+        payload.transport,
+        payload.command_name,
+        payload.current_path,
+        payload.attached_count,
+        payload.session_role,
+        payload.window_count,
+        payload.task_state
+    )
 }
 
 fn route_transport_envelope(
@@ -780,6 +1115,19 @@ fn route_transport_envelope(
 ) -> Result<(), LifecycleError> {
     match envelope.body.as_ref() {
         Some(Body::TargetPublished(payload)) => {
+            if let Some(session) = session {
+                let fingerprint = target_published_fingerprint(payload);
+                if session
+                    .published_fingerprints
+                    .get(&payload.transport_session_id)
+                    == Some(&fingerprint)
+                {
+                    return Ok(());
+                }
+                session
+                    .published_fingerprints
+                    .insert(payload.transport_session_id.clone(), fingerprint);
+            }
             let mapped = map_target_published_envelope(node_id, &envelope, payload)
                 .map_err(remote_node_ingress_error)?;
             publication_runtime.apply_discovered_remote_session_envelope(node_id, mapped)
@@ -1041,13 +1389,167 @@ where
     Ok(())
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BridgeRefreshOutcome {
+    connected: usize,
+    pending: usize,
+    already_registered: usize,
+    invalid: usize,
+}
+
+fn refresh_authority_bridge_for_socket(
+    sessions: &mut HashMap<String, ActiveNodeIngressSession>,
+    internal_tx: mpsc::Sender<InternalEvent>,
+    node_id: &str,
+    socket_path: PathBuf,
+) -> BridgeRefreshOutcome {
+    let mut total = BridgeRefreshOutcome::default();
+    for active in sessions.values_mut() {
+        if active.session.node_id() != node_id {
+            continue;
+        }
+        let outcome =
+            refresh_authority_bridge_path(node_id, active, &socket_path, internal_tx.clone());
+        total.connected += outcome.connected;
+        total.pending += outcome.pending;
+        total.already_registered += outcome.already_registered;
+        total.invalid += outcome.invalid;
+    }
+    if total.pending > 0 {
+        schedule_socket_discovery_retry(internal_tx, BRIDGE_DISCOVERY_RETRY_ATTEMPTS);
+    }
+    total
+}
+
+fn authority_socket_ready_reply(
+    node_id: &str,
+    socket_path: &PathBuf,
+    outcome: BridgeRefreshOutcome,
+) -> AuthoritySocketReadyReply {
+    if outcome.connected > 0 || outcome.already_registered > 0 {
+        return AuthoritySocketReadyReply {
+            status: AuthoritySocketReadyStatus::Registered,
+            message: "registered".to_string(),
+        };
+    }
+    if outcome.pending > 0 {
+        return AuthoritySocketReadyReply {
+            status: AuthoritySocketReadyStatus::Pending,
+            message: format!(
+                "authority socket bridge for node {node_id} is pending: {}",
+                socket_path.display()
+            ),
+        };
+    }
+    AuthoritySocketReadyReply {
+        status: AuthoritySocketReadyStatus::Error,
+        message: format!(
+            "authority socket bridge for node {node_id} was not registered: {}",
+            socket_path.display()
+        ),
+    }
+}
+
+fn refresh_authority_bridges_for_sessions(
+    sessions: &mut HashMap<String, ActiveNodeIngressSession>,
+    internal_tx: mpsc::Sender<InternalEvent>,
+    retry_budget: u8,
+) {
+    let mut pending = 0usize;
+    for active in sessions.values_mut() {
+        let node_id = active.session.node_id().to_string();
+        let outcome = refresh_authority_bridges(&node_id, active, internal_tx.clone());
+        pending += outcome.pending;
+    }
+    if pending > 0 {
+        schedule_socket_discovery_retry(internal_tx, retry_budget);
+    }
+}
+
+fn schedule_socket_discovery_retry(internal_tx: mpsc::Sender<InternalEvent>, retry_budget: u8) {
+    if retry_budget == 0 {
+        return;
+    }
+    thread::spawn(move || {
+        thread::sleep(BRIDGE_DISCOVERY_RETRY_DELAY);
+        let _ = internal_tx.send(InternalEvent::RetrySocketDiscovery {
+            attempts_remaining: retry_budget.saturating_sub(1),
+        });
+    });
+}
+
+fn refresh_authority_bridge_path(
+    node_id: &str,
+    session: &mut ActiveNodeIngressSession,
+    socket_path: &PathBuf,
+    internal_tx: mpsc::Sender<InternalEvent>,
+) -> BridgeRefreshOutcome {
+    let mut outcome = BridgeRefreshOutcome::default();
+    if session.bridges.contains_key(socket_path) {
+        outcome.already_registered += 1;
+        return outcome;
+    }
+    let Some(target_component) = socket_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .and_then(|name| extract_target_component(&name, node_id))
+    else {
+        outcome.invalid += 1;
+        return outcome;
+    };
+    let transport = match RemoteAuthorityTransportRuntime::connect(socket_path, node_id) {
+        Ok(transport) => transport,
+        Err(_) => {
+            outcome.pending += 1;
+            return outcome;
+        }
+    };
+    let transport = Arc::new(transport);
+    let reader = transport.clone();
+    let transport_session = session.session.clone();
+    let node_id_owned = node_id.to_string();
+    let socket_path_owned = socket_path.clone();
+    let internal_tx_owned = internal_tx.clone();
+    thread::spawn(move || {
+        loop {
+            let command = match reader.recv_command() {
+                Ok(command) => command,
+                Err(_) => break,
+            };
+            let Ok(envelope) = map_authority_command_to_grpc(&transport_session, command) else {
+                break;
+            };
+            if transport_session.send(envelope).is_err() {
+                break;
+            }
+        }
+        let _ = internal_tx_owned.send(InternalEvent::BridgeClosed {
+            node_id: node_id_owned,
+            socket_path: socket_path_owned,
+        });
+    });
+    session.bridges.insert(
+        socket_path.clone(),
+        ActiveAuthoritySocketBridge {
+            target_component,
+            transport,
+        },
+    );
+    outcome.connected += 1;
+    ERROR_LOG.log(format!(
+        "[remote-node-ingress] registered authority bridge for node={node_id}"
+    ));
+    outcome
+}
+
 fn refresh_authority_bridges(
     node_id: &str,
     session: &mut ActiveNodeIngressSession,
     internal_tx: mpsc::Sender<InternalEvent>,
-) {
+) -> BridgeRefreshOutcome {
+    let mut outcome = BridgeRefreshOutcome::default();
     let Ok(socket_paths) = discover_authority_socket_paths(node_id) else {
-        return;
+        return outcome;
     };
     for socket_path in socket_paths {
         if session.bridges.contains_key(&socket_path) {
@@ -1062,7 +1564,10 @@ fn refresh_authority_bridges(
         };
         let transport = match RemoteAuthorityTransportRuntime::connect(&socket_path, node_id) {
             Ok(transport) => transport,
-            Err(_) => continue,
+            Err(_) => {
+                outcome.pending += 1;
+                continue;
+            }
         };
         let transport = Arc::new(transport);
         let reader = transport.clone();
@@ -1096,7 +1601,15 @@ fn refresh_authority_bridges(
                 transport,
             },
         );
+        outcome.connected += 1;
     }
+    if outcome.connected > 0 {
+        ERROR_LOG.log(format!(
+            "[remote-node-ingress] registered {} authority bridge(s) for node={node_id}",
+            outcome.connected
+        ));
+    }
+    outcome
 }
 
 fn discover_authority_socket_paths(authority_id: &str) -> io::Result<Vec<PathBuf>> {

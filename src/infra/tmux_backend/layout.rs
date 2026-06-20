@@ -78,6 +78,28 @@ impl EmbeddedTmuxBackend {
         Ok(output.stdout.trim() == "0")
     }
 
+    pub(crate) fn pane_liveness_on_socket(
+        &self,
+        socket_name: &crate::infra::tmux::TmuxSocketName,
+        pane_id: &str,
+    ) -> Result<Option<bool>, TmuxError> {
+        let output = match self.run_on_socket(
+            socket_name,
+            &[
+                "display-message".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                pane_id.to_string(),
+                "#{pane_dead}".to_string(),
+            ],
+        ) {
+            Ok(output) => output,
+            Err(error) if error.is_command_failure() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(output.stdout.trim() == "0"))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn kill_pane(
         &self,

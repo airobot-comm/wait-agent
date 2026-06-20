@@ -16,6 +16,8 @@ use crate::cli::{
 };
 use crate::domain::session_catalog::{ManagedSessionRecord, SessionAvailability, SessionTransport};
 use crate::domain::workspace::WorkspaceInstanceId;
+use crate::infra::error_log::ERROR_LOG;
+use crate::infra::tmux::TmuxLayoutGateway;
 use crate::infra::tmux::{
     EmbeddedTmuxBackend, TmuxError, TmuxSessionName, TmuxSocketName, TmuxWorkspaceHandle,
 };
@@ -38,8 +40,10 @@ use crate::runtime::workspace_entry_runtime::WorkspaceEntryRuntime;
 use crate::runtime::workspace_layout_runtime::WorkspaceLayoutRuntime;
 use crate::runtime::workspace_runtime::WorkspaceRuntime;
 use std::io;
+use std::time::Instant;
 
 const WAITAGENT_SIDEBAR_SELECTED_TARGET_OPTION: &str = "@waitagent_sidebar_selected_target";
+const WAITAGENT_REMOTE_SESSION_CREATE_LOCK_PREFIX: &str = "waitagent-remote-session-create-";
 
 // This runtime owns the accepted default local command path for workspace
 // bootstrap, attach, target activation, fullscreen, and detach semantics.
@@ -57,6 +61,25 @@ pub struct WorkspaceCommandRuntime {
     target_registry: TargetRegistryService<DefaultTargetCatalogGateway>,
     backend: EmbeddedTmuxBackend,
     network: RemoteNetworkConfig,
+}
+
+struct RemoteSessionCreateGuard<'a> {
+    backend: &'a EmbeddedTmuxBackend,
+    socket_name: TmuxSocketName,
+    lock_name: String,
+}
+
+impl Drop for RemoteSessionCreateGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.backend.run_on_socket(
+            &self.socket_name,
+            &[
+                "wait-for".to_string(),
+                "-U".to_string(),
+                self.lock_name.clone(),
+            ],
+        );
+    }
 }
 
 impl WorkspaceCommandRuntime {
@@ -155,19 +178,54 @@ impl WorkspaceCommandRuntime {
     }
 
     pub fn run_workspace_entry(&self) -> Result<(), LifecycleError> {
+        let t_entry = Instant::now();
+        ERROR_LOG.log(format!(
+            "[diag-newhost] workspace_entry start connect={:?}",
+            self.network.connect
+        ));
         let workspace_dir = self.resolve_workspace_dir(None)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] workspace_entry resolve_workspace_dir done elapsed={:?}",
+            t_entry.elapsed()
+        ));
         let workspace = self.entry_runtime.bootstrap_workspace(&workspace_dir)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] workspace_entry bootstrap_workspace socket={} session={} elapsed={:?}",
+            workspace.workspace_handle.socket_name.as_str(),
+            workspace.workspace_handle.session_name.as_str(),
+            t_entry.elapsed()
+        ));
         self.remote_runtime_owner_runtime.ensure_owner_running()?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] workspace_entry remote_runtime_owner ready elapsed={:?}",
+            t_entry.elapsed()
+        ));
         self.main_slot_runtime.ensure_initial_target_materialized(
             &workspace.workspace_handle,
             &workspace.workspace_dir,
         )?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] workspace_entry initial_target_materialized elapsed={:?}",
+            t_entry.elapsed()
+        ));
         self.remote_target_publication_runtime
             .ensure_configured_publications_on_socket(
                 workspace.workspace_handle.socket_name.as_str(),
             )?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] workspace_entry publications configured elapsed={:?}",
+            t_entry.elapsed()
+        ));
         self.start_remote_node_ingress(workspace.workspace_handle.socket_name.as_str())?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] workspace_entry remote_node_ingress ready elapsed={:?}",
+            t_entry.elapsed()
+        ));
         self.start_remote_session_sync(workspace.workspace_handle.socket_name.as_str())?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] workspace_entry remote_session_sync ready elapsed={:?}",
+            t_entry.elapsed()
+        ));
         match self
             .session_service
             .attach_workspace(&workspace.workspace_handle)
@@ -236,6 +294,9 @@ impl WorkspaceCommandRuntime {
         &self,
         command: NewSelectedRemoteSessionCommand,
     ) -> Result<(), LifecycleError> {
+        let workspace =
+            workspace_handle(&command.current_socket_name, &command.current_session_name);
+        let _create_guard = self.claim_remote_session_create(&workspace)?;
         let selected_target = self.selected_sidebar_target(&command)?;
         let selected_session = self
             .target_registry
@@ -274,13 +335,50 @@ impl WorkspaceCommandRuntime {
                 rows: 0,
             })
             .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+        self.remote_runtime_owner_runtime
+            .upsert_session(created.address.authority_id(), &created)?;
+        let qualified_target = created.address.qualified_target();
+        self.backend
+            .set_session_option(
+                &workspace,
+                WAITAGENT_SIDEBAR_SELECTED_TARGET_OPTION,
+                &qualified_target,
+            )
+            .map_err(tmux_runtime_error)?;
+        self.refresh_registered_remote_session(&command.current_socket_name)?;
+        self.main_slot_runtime.run_activate_session_record(
+            &command.current_socket_name,
+            &command.current_session_name,
+            &created,
+        )
+    }
 
-        self.main_slot_runtime
-            .run_activate_target(ActivateTargetCommand {
-                current_socket_name: command.current_socket_name,
-                current_session_name: command.current_session_name,
-                target: created.address.qualified_target(),
-            })
+    fn refresh_registered_remote_session(&self, socket_name: &str) -> Result<(), LifecycleError> {
+        self.remote_target_publication_runtime
+            .ensure_configured_publications_on_socket(socket_name)?;
+        WorkspaceLayoutRuntime::from_build_env_with_network(self.network.clone())?
+            .run_chrome_refresh_on_socket(socket_name)
+    }
+
+    fn claim_remote_session_create<'a>(
+        &'a self,
+        workspace: &TmuxWorkspaceHandle,
+    ) -> Result<RemoteSessionCreateGuard<'a>, LifecycleError> {
+        let lock_name = format!(
+            "{WAITAGENT_REMOTE_SESSION_CREATE_LOCK_PREFIX}{}",
+            workspace.session_name.as_str()
+        );
+        self.backend
+            .run_on_socket(
+                &workspace.socket_name,
+                &["wait-for".to_string(), "-L".to_string(), lock_name.clone()],
+            )
+            .map_err(tmux_runtime_error)?;
+        Ok(RemoteSessionCreateGuard {
+            backend: &self.backend,
+            socket_name: TmuxSocketName::new(workspace.socket_name.as_str()),
+            lock_name,
+        })
     }
 
     fn display_remote_session_creation_error(
@@ -345,12 +443,25 @@ impl WorkspaceCommandRuntime {
             ),
         );
         let outcome = runtime.connect(request)?;
-        self.main_slot_runtime
-            .run_activate_target(ActivateTargetCommand {
-                current_socket_name: command.current_socket_name,
-                current_session_name: command.current_session_name,
-                target: outcome.created_target.address.qualified_target(),
-            })
+        self.remote_runtime_owner_runtime.upsert_session(
+            outcome.created_target.address.authority_id(),
+            &outcome.created_target,
+        )?;
+        let workspace =
+            workspace_handle(&command.current_socket_name, &command.current_session_name);
+        self.backend
+            .set_session_option(
+                &workspace,
+                WAITAGENT_SIDEBAR_SELECTED_TARGET_OPTION,
+                &outcome.created_target.address.qualified_target(),
+            )
+            .map_err(tmux_runtime_error)?;
+        self.refresh_registered_remote_session(&command.current_socket_name)?;
+        self.main_slot_runtime.run_activate_session_record(
+            &command.current_socket_name,
+            &command.current_session_name,
+            &outcome.created_target,
+        )
     }
 
     pub fn run_local_target_host(

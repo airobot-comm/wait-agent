@@ -3,10 +3,10 @@ mod tests {
         activate_surface_target, activate_surface_target_with_mode, apply_authority_envelope,
         authority_status_from_runtime, authority_transport_event_sender,
         collect_direct_raw_pty_output_envelope, collect_direct_raw_pty_output_payload,
-        main_slot_console_id, main_slot_surface_spec, placeholder_lines,
-        should_draw_remote_snapshot, should_exit_surface_for_target_presence,
+        flush_paused_input, flush_pending_pty_size, main_slot_console_id, main_slot_surface_spec,
+        placeholder_lines, should_draw_remote_snapshot, should_exit_surface_for_target_presence,
         should_exit_surface_for_target_presence_loss, should_exit_surface_locally,
-        spawn_mailbox_watcher, target_exists_in_catalog,
+        spawn_mailbox_watcher, sync_or_defer_remote_pty_size, target_exists_in_catalog,
         write_remote_raw_output_with_initial_clear, AuthorityTransportStatus, RawPtyInputRoute,
         RemoteInteractInputSignalDecoder, RemoteInteractSignal, RemoteInteractSurfaceSpec,
         RemoteMainSlotPaneRuntime, RemotePaneEvent, RemoteRawPtyMailboxReader,
@@ -1347,6 +1347,105 @@ mod tests {
             .expect("raw mailbox reader should collect bootstrap and raw output");
 
         assert_eq!(raw, b"prompt$ \x1b[?25hecho\r\n");
+    }
+
+    #[test]
+    fn resize_waits_for_authority_registration_then_flushes_latest_size() {
+        let registry = RemoteConnectionRegistry::new();
+        let runtime = RemoteMainSlotRuntime::with_registry(registry);
+        runtime.ensure_local_connection("observer-a");
+        let target = remote_target();
+        let binding = runtime
+            .activate_target_with_raw_pty_mode(
+                &target,
+                RemoteConsoleDescriptor {
+                    console_id: "console-a".to_string(),
+                    console_host_id: "observer-a".to_string(),
+                    location: ConsoleLocation::LocalWorkspace,
+                },
+                80,
+                24,
+                true,
+            )
+            .expect("activation should not require authority registration");
+        let mut pending = None;
+
+        sync_or_defer_remote_pty_size(
+            &runtime,
+            &target,
+            &binding,
+            &TerminalSize {
+                cols: 132,
+                rows: 43,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            &mut pending,
+        )
+        .expect("resize should defer while authority is unregistered");
+
+        assert_eq!(
+            pending.as_ref().map(|size| (size.cols, size.rows)),
+            Some((132, 43))
+        );
+        let authority_mailbox = runtime
+            .ensure_local_connection("peer-a")
+            .expect("authority registration should expose mailbox");
+        flush_pending_pty_size(&runtime, &target, &binding, &mut pending)
+            .expect("pending resize should flush after authority registration");
+
+        assert!(pending.is_none());
+        let envelopes = authority_mailbox.snapshot();
+        assert_eq!(envelopes.len(), 1);
+        match &envelopes[0].payload {
+            ControlPlanePayload::ApplyResize(payload) => {
+                assert_eq!(payload.cols, 132);
+                assert_eq!(payload.rows, 43);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paused_input_flushes_after_authority_registration() {
+        let runtime = RemoteMainSlotRuntime::with_registry(RemoteConnectionRegistry::new());
+        runtime.ensure_local_connection("observer-a");
+        let target = remote_target();
+        let binding = runtime
+            .activate_target_with_raw_pty_mode(
+                &target,
+                RemoteConsoleDescriptor {
+                    console_id: "console-a".to_string(),
+                    console_host_id: "observer-a".to_string(),
+                    location: ConsoleLocation::LocalWorkspace,
+                },
+                80,
+                24,
+                true,
+            )
+            .expect("activation should not require authority registration");
+        let paused = vec![b"ab".to_vec(), b"c".to_vec()];
+        let mut console_seq = 7;
+
+        let authority_mailbox = runtime
+            .ensure_local_connection("peer-a")
+            .expect("authority registration should expose mailbox");
+        flush_paused_input(&runtime, &target, &binding, &paused, &mut console_seq)
+            .expect("paused input should flush after authority registration");
+
+        assert_eq!(console_seq, 9);
+        let envelopes = authority_mailbox.snapshot();
+        assert_eq!(envelopes.len(), 2);
+        let inputs: Vec<_> = envelopes
+            .iter()
+            .map(|envelope| match &envelope.payload {
+                ControlPlanePayload::RawPtyInput(payload) => {
+                    (payload.input_seq, payload.input_bytes.clone())
+                }
+                other => panic!("unexpected payload: {other:?}"),
+            })
+            .collect();
+        assert_eq!(inputs, vec![(1, b"ab".to_vec()), (2, b"c".to_vec())]);
     }
 
     #[test]

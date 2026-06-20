@@ -89,14 +89,11 @@ impl EventDrivenPaneRuntime {
             };
             match event {
                 PaneEvent::Input(bytes) => {
-                    ERROR_LOG.log(format!("[diag] run_sidebar Input: bytes={bytes:?}"));
                     let outcome = chrome.apply_sidebar_input(&command, &bytes)?;
-                    ERROR_LOG.log(format!("[diag] run_sidebar Input: outcome.render.invalidate_sidebar={} outcome.activation={:?}", outcome.render.invalidate_sidebar, outcome.activation));
                     if let Err(error) = redraw_sidebar(outcome.render, &mut last_buffer) {
                         ERROR_LOG.log(format!("[diag] sidebar redraw error on input: {error}"));
                     }
                     if let Some(activation) = outcome.activation {
-                        ERROR_LOG.log(format!("[diag] sidebar input: activation={:?}", activation));
                         match self.apply_sidebar_activation(&command, activation) {
                             Ok(true) => {
                                 match chrome.refresh_sidebar_for_pane(
@@ -222,10 +219,6 @@ impl EventDrivenPaneRuntime {
     ) -> Result<bool, LifecycleError> {
         match activation {
             EventDrivenSidebarActivation::SelectMainPane => {
-                ERROR_LOG.log(format!(
-                    "[diag] apply_sidebar_activation: SelectMainPane socket={}",
-                    command.socket_name
-                ));
                 self.backend
                     .run_socket_command(
                         &TmuxSocketName::new(&command.socket_name),
@@ -235,12 +228,7 @@ impl EventDrivenPaneRuntime {
                 Ok(false)
             }
             EventDrivenSidebarActivation::ActivateTarget { target } => {
-                ERROR_LOG.log(format!(
-                    "[diag] apply_sidebar_activation: ActivateTarget target={} socket={}",
-                    target, command.socket_name
-                ));
                 self.dispatch_activate_target_action(command, &target)?;
-                ERROR_LOG.log("[diag] apply_sidebar_activation: dispatched".to_string());
                 Ok(false)
             }
         }
@@ -284,9 +272,6 @@ impl EventDrivenPaneRuntime {
             &command.session_name,
             target,
         );
-        ERROR_LOG.log(format!(
-            "[diag] dispatch_activate_target_action: executable={executable:?} args={args:?}"
-        ));
         let mut shell_parts = vec![shell_escape(&executable.display().to_string())];
         shell_parts.extend(args.iter().map(|arg| shell_escape(arg)));
         let shell_command = shell_parts.join(" ");
@@ -457,9 +442,6 @@ fn spawn_input_thread(tx: mpsc::Sender<PaneEvent>) {
                 Ok(0) => break,
                 Ok(read) => {
                     let bytes = buffer[..read].to_vec();
-                    ERROR_LOG.log(format!(
-                        "[diag] spawn_input_thread: read={read} bytes={bytes:?}"
-                    ));
                     if tx.send(PaneEvent::Input(bytes)).is_err() {
                         break;
                     }

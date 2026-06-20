@@ -5,9 +5,8 @@ use crate::infra::remote_protocol::{
     RawPtyOutputPayload, TargetExitedPayload, TargetOutputPayload, REMOTE_PROTOCOL_VERSION,
 };
 use crate::infra::remote_transport_codec::{
-    read_authority_transport_frame, read_control_plane_envelope, write_authority_transport_frame,
-    write_control_plane_envelope, write_registration_frame, AuthorityTransportFrame,
-    RemoteTransportCodecError,
+    read_authority_transport_frame, write_authority_transport_frame, write_control_plane_envelope,
+    write_registration_frame, AuthorityTransportFrame, RemoteTransportCodecError,
 };
 use crate::runtime::remote_authority_connection_runtime::QueuedAuthorityStreamSink;
 use crate::runtime::remote_node_transport_runtime::{
@@ -80,29 +79,24 @@ impl RemoteAuthorityTransportRuntime {
             .lock()
             .expect("authority transport reader mutex should not be poisoned");
         loop {
-            match read_control_plane_envelope(&mut *reader) {
-                Ok(envelope) => {
-                    return match envelope.payload {
-                        ControlPlanePayload::OpenMirrorRequest(payload) => {
-                            Ok(RemoteAuthorityCommand::OpenMirror(payload))
-                        }
-                        ControlPlanePayload::CloseMirrorRequest(payload) => {
-                            Ok(RemoteAuthorityCommand::CloseMirror(payload))
-                        }
-                        ControlPlanePayload::RawPtyInput(payload) => {
-                            Ok(RemoteAuthorityCommand::RawPtyInput(payload))
-                        }
-                        ControlPlanePayload::ApplyResize(payload) => {
-                            Ok(RemoteAuthorityCommand::ApplyResize(payload))
-                        }
-                        other => Err(RemoteAuthorityTransportError::new(format!(
-                            "unexpected authority command `{}`",
-                            other.message_type()
-                        ))),
-                    };
+            match read_authority_transport_frame(&mut *reader) {
+                Ok(AuthorityTransportFrame::ControlPlane(envelope)) => {
+                    return command_from_control_plane_payload(envelope.payload);
+                }
+                Ok(AuthorityTransportFrame::RawPtyInput(payload)) => {
+                    return Ok(RemoteAuthorityCommand::RawPtyInput(payload));
+                }
+                Ok(AuthorityTransportFrame::Ping) => {
+                    self.send_transport_frame(AuthorityTransportFrame::Pong)?;
+                }
+                Ok(AuthorityTransportFrame::Pong) => {}
+                Ok(other) => {
+                    return Err(RemoteAuthorityTransportError::new(format!(
+                        "unexpected authority command frame `{other:?}`"
+                    )));
                 }
                 Err(ref e) if e.is_read_timeout() => {
-                    // SO_RCVTIMEO triggered — no command available yet, keep waiting.
+                    // SO_RCVTIMEO triggered - no command available yet, keep waiting.
                     continue;
                 }
                 Err(e) => {
@@ -110,6 +104,18 @@ impl RemoteAuthorityTransportRuntime {
                 }
             }
         }
+    }
+
+    fn send_transport_frame(
+        &self,
+        frame: AuthorityTransportFrame,
+    ) -> Result<(), RemoteAuthorityTransportError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .expect("authority transport writer mutex should not be poisoned");
+        write_authority_transport_frame(&mut *writer, &frame)?;
+        Ok(())
     }
 
     pub fn send_target_output(
@@ -405,6 +411,29 @@ impl RemoteAuthorityTransportRuntime {
     }
 }
 
+fn command_from_control_plane_payload(
+    payload: ControlPlanePayload,
+) -> Result<RemoteAuthorityCommand, RemoteAuthorityTransportError> {
+    match payload {
+        ControlPlanePayload::OpenMirrorRequest(payload) => {
+            Ok(RemoteAuthorityCommand::OpenMirror(payload))
+        }
+        ControlPlanePayload::CloseMirrorRequest(payload) => {
+            Ok(RemoteAuthorityCommand::CloseMirror(payload))
+        }
+        ControlPlanePayload::RawPtyInput(payload) => {
+            Ok(RemoteAuthorityCommand::RawPtyInput(payload))
+        }
+        ControlPlanePayload::ApplyResize(payload) => {
+            Ok(RemoteAuthorityCommand::ApplyResize(payload))
+        }
+        other => Err(RemoteAuthorityTransportError::new(format!(
+            "unexpected authority command `{}`",
+            other.message_type()
+        ))),
+    }
+}
+
 pub fn spawn_authority_transport_listener(
     socket_path: PathBuf,
     sink: QueuedAuthorityStreamSink,
@@ -557,29 +586,43 @@ fn bridge_authority_transport(
 }
 
 fn forward_authority_frames_to_control_plane(
+    reader: UnixStream,
+    writer: UnixStream,
+) -> Result<(), RemoteAuthorityTransportError> {
+    forward_authority_frames_to_control_plane_with_timeouts(
+        reader,
+        writer,
+        AUTHORITY_TRANSPORT_SOCKET_TIMEOUT,
+        AUTHORITY_TRANSPORT_READ_TIMEOUT,
+    )
+}
+
+fn forward_authority_frames_to_control_plane_with_timeouts(
     mut reader: UnixStream,
     mut writer: UnixStream,
+    socket_timeout: Duration,
+    read_timeout: Duration,
 ) -> Result<(), RemoteAuthorityTransportError> {
-    // Set a short read timeout so we can handle Ping/Pong and detect
-    // peer death within AUTHORITY_TRANSPORT_READ_TIMEOUT seconds.
-    reader
-        .set_read_timeout(Some(AUTHORITY_TRANSPORT_SOCKET_TIMEOUT))
-        .ok();
+    reader.set_read_timeout(Some(socket_timeout)).ok();
     let mut last_received = Instant::now();
+    let mut keepalive_sent_at: Option<Instant> = None;
 
     loop {
         match read_authority_transport_frame(&mut reader) {
             Ok(AuthorityTransportFrame::Ping) => {
                 last_received = Instant::now();
+                keepalive_sent_at = None;
                 let mut buf = Vec::new();
-                let _ = write_authority_transport_frame(&mut buf, &AuthorityTransportFrame::Pong);
-                let _ = reader.write_all(&buf);
+                write_authority_transport_frame(&mut buf, &AuthorityTransportFrame::Pong)?;
+                reader.write_all(&buf)?;
             }
             Ok(AuthorityTransportFrame::Pong) => {
                 last_received = Instant::now();
+                keepalive_sent_at = None;
             }
             Ok(frame) => {
                 last_received = Instant::now();
+                keepalive_sent_at = None;
                 let frame = match frame {
                     AuthorityTransportFrame::ControlPlane(envelope) => match envelope.payload {
                         ControlPlanePayload::RawPtyOutput(payload) => {
@@ -594,16 +637,23 @@ fn forward_authority_frames_to_control_plane(
                 };
                 write_authority_transport_frame(&mut writer, &frame)?;
             }
-            Err(ref e) if e.is_timed_out() => {
-                if last_received.elapsed() > AUTHORITY_TRANSPORT_READ_TIMEOUT {
-                    return Ok(());
+            Err(ref e) if e.is_read_timeout() => {
+                if let Some(sent_at) = keepalive_sent_at {
+                    if sent_at.elapsed() >= read_timeout {
+                        return Err(RemoteAuthorityTransportError::new(
+                            "authority transport keepalive timed out",
+                        ));
+                    }
+                    continue;
                 }
-                // Probe liveness while the remote is idle.
-                let mut buf = Vec::new();
-                let _ = write_authority_transport_frame(&mut buf, &AuthorityTransportFrame::Ping);
-                let _ = reader.write_all(&buf);
+                if last_received.elapsed() >= read_timeout {
+                    let mut buf = Vec::new();
+                    write_authority_transport_frame(&mut buf, &AuthorityTransportFrame::Ping)?;
+                    reader.write_all(&buf)?;
+                    keepalive_sent_at = Some(Instant::now());
+                }
             }
-            Err(_) => return Ok(()),
+            Err(error) => return Err(RemoteAuthorityTransportError::from(error)),
         }
     }
 }
@@ -640,11 +690,8 @@ fn forward_control_plane_to_authority_frames(
                 }
                 _ => {}
             },
-            Err(_) => {
-                if !running.load(Ordering::Relaxed) {
-                    break;
-                }
-            }
+            Err(ref error) if error.is_read_timeout() => continue,
+            Err(error) => return Err(RemoteAuthorityTransportError::from(error)),
         }
     }
     Ok(())
@@ -685,13 +732,18 @@ fn raw_pty_output_envelope(payload: RawPtyOutputPayload) -> ProtocolEnvelope<Con
 #[cfg(test)]
 mod tests {
     use super::{
-        authority_transport_socket_path, spawn_authority_transport_listener,
-        RemoteAuthorityCommand, RemoteAuthorityTransportRuntime,
+        authority_transport_socket_path, forward_authority_frames_to_control_plane_with_timeouts,
+        spawn_authority_transport_listener, RemoteAuthorityCommand,
+        RemoteAuthorityTransportRuntime,
     };
     use crate::infra::remote_protocol::{
         ClientHelloPayload, ControlPlanePayload, ProtocolEnvelope, RawPtyInputPayload,
+        RawPtyOutputPayload,
     };
-    use crate::infra::remote_transport_codec::read_control_plane_envelope;
+    use crate::infra::remote_transport_codec::{
+        read_authority_transport_frame, read_control_plane_envelope,
+        write_authority_transport_frame, AuthorityTransportFrame,
+    };
     use crate::runtime::remote_authority_connection_runtime::{
         AuthorityConnectionRequest, AuthorityTransportEvent, QueuedAuthorityStreamSource,
         RemoteAuthorityConnectionRuntime,
@@ -704,7 +756,7 @@ mod tests {
         RegistryRemoteControlPlaneSink, RemoteConnectionRegistry,
     };
     use std::fs;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::process;
     use std::sync::mpsc;
     use std::thread;
@@ -871,6 +923,90 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn authority_bridge_keeps_forwarding_after_socket_idle_timeout() {
+        let (mut transport_writer, transport_reader) =
+            UnixStream::pair().expect("transport socket pair should open");
+        let (mut control_plane_reader, control_plane_writer) =
+            UnixStream::pair().expect("control-plane socket pair should open");
+        let worker = thread::spawn(move || {
+            forward_authority_frames_to_control_plane_with_timeouts(
+                transport_reader,
+                control_plane_writer,
+                Duration::from_millis(20),
+                Duration::from_millis(60),
+            )
+        });
+
+        thread::sleep(Duration::from_millis(90));
+        let ping = read_authority_transport_frame(&mut transport_writer)
+            .expect("bridge should send keepalive ping after idle");
+        assert_eq!(ping, AuthorityTransportFrame::Ping);
+        write_authority_transport_frame(&mut transport_writer, &AuthorityTransportFrame::Pong)
+            .expect("pong should write");
+        let frame = AuthorityTransportFrame::RawPtyOutput(RawPtyOutputPayload {
+            session_id: "shell-1".to_string(),
+            target_id: "remote-peer:peer-a:shell-1".to_string(),
+            output_seq: 42,
+            output_bytes: b"after-idle".to_vec(),
+        });
+        write_authority_transport_frame(&mut transport_writer, &frame)
+            .expect("frame should write after idle timeout");
+
+        let decoded = read_authority_transport_frame(&mut control_plane_reader)
+            .expect("bridge should still forward after socket idle timeout");
+        assert_eq!(decoded, frame);
+        drop(transport_writer);
+        let _ = worker.join().expect("bridge worker should join");
+    }
+
+    #[test]
+    fn recv_command_consumes_keepalive_frames_before_command() {
+        let socket_path = test_socket_path("keepalive-command");
+        let listener = UnixListener::bind(&socket_path).expect("listener should bind");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("listener should accept");
+            let _hello =
+                read_control_plane_envelope(&mut stream).expect("client hello should decode");
+            write_server_hello(&mut stream, "waitagent-main-slot")
+                .expect("server hello should encode");
+            write_authority_transport_frame(&mut stream, &AuthorityTransportFrame::Ping)
+                .expect("ping should encode");
+            let pong = read_authority_transport_frame(&mut stream).expect("pong should decode");
+            assert_eq!(pong, AuthorityTransportFrame::Pong);
+            write_authority_transport_frame(
+                &mut stream,
+                &AuthorityTransportFrame::RawPtyInput(RawPtyInputPayload {
+                    attachment_id: "attach-1".to_string(),
+                    session_id: "shell-1".to_string(),
+                    target_id: "remote-peer:peer-a:shell-1".to_string(),
+                    console_id: "console-a".to_string(),
+                    console_host_id: "observer-a".to_string(),
+                    input_seq: 10,
+                    input_bytes: b"after-ping".to_vec(),
+                }),
+            )
+            .expect("raw input should encode");
+        });
+
+        let transport = RemoteAuthorityTransportRuntime::connect(&socket_path, "peer-a")
+            .expect("authority runtime should connect");
+        assert_eq!(
+            transport.recv_command().expect("command should decode"),
+            RemoteAuthorityCommand::RawPtyInput(RawPtyInputPayload {
+                attachment_id: "attach-1".to_string(),
+                session_id: "shell-1".to_string(),
+                target_id: "remote-peer:peer-a:shell-1".to_string(),
+                console_id: "console-a".to_string(),
+                console_host_id: "observer-a".to_string(),
+                input_seq: 10,
+                input_bytes: b"after-ping".to_vec(),
+            })
+        );
+        server.join().expect("server should join cleanly");
         let _ = fs::remove_file(&socket_path);
     }
 

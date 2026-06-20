@@ -1,17 +1,18 @@
 mod tests {
     use super::super::{
-        register_authority_stream, spawn_authority_listener, AuthorityConnectionRequest,
-        AuthorityConnectionStarter, AuthorityTransportEvent, LocalAuthoritySocketBridgeStarter,
-        QueuedAuthorityStreamSource, QueuedAuthorityStreamStarter,
-        RemoteAuthorityConnectionRuntime,
+        register_authority_stream, register_authority_stream_with_timeouts,
+        spawn_authority_listener, AuthorityConnectionRequest, AuthorityConnectionStarter,
+        AuthorityTransportEvent, LocalAuthoritySocketBridgeStarter, QueuedAuthorityStreamSource,
+        QueuedAuthorityStreamStarter, RemoteAuthorityConnectionRuntime,
     };
     use crate::infra::remote_protocol::{
         ControlPlanePayload, ProtocolEnvelope, RawPtyInputPayload, RawPtyOutputPayload,
         TargetOutputPayload,
     };
     use crate::infra::remote_transport_codec::{
-        read_control_plane_envelope, write_authority_transport_frame, write_control_plane_envelope,
-        write_registration_frame, AuthorityTransportFrame,
+        read_authority_transport_frame, read_control_plane_envelope,
+        write_authority_transport_frame, write_control_plane_envelope, write_registration_frame,
+        AuthorityTransportFrame,
     };
     use crate::runtime::remote_transport_runtime::RemoteConnectionRegistry;
     use std::fs;
@@ -92,6 +93,53 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn register_authority_stream_stays_registered_after_idle_keepalive_pong() {
+        let registry = RemoteConnectionRegistry::new();
+        let (tx, rx) = mpsc::channel();
+        let (mut client, server) = UnixStream::pair().expect("stream pair should open");
+
+        write_registration_frame(&mut client, "peer-a").expect("registration frame should encode");
+        register_authority_stream_with_timeouts(
+            server,
+            registry.clone(),
+            "peer-a".to_string(),
+            tx,
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+        )
+        .expect("authority stream should register");
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("connected event should arrive"),
+            AuthorityTransportEvent::Connected
+        );
+        let frame = read_authority_transport_frame(&mut client)
+            .expect("idle reader should send keepalive ping");
+        assert_eq!(frame, AuthorityTransportFrame::Ping);
+        write_authority_transport_frame(&mut client, &AuthorityTransportFrame::Pong)
+            .expect("pong should encode");
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(registry.has_connection("peer-a"));
+
+        write_control_plane_envelope(&mut client, &authority_target_output_envelope(21))
+            .expect("target output should encode after keepalive");
+        match rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("authority envelope should arrive after keepalive")
+        {
+            AuthorityTransportEvent::Envelope(envelope) => match envelope.payload {
+                ControlPlanePayload::TargetOutput(payload) => {
+                    assert_eq!(payload.output_seq, 21);
+                    assert_eq!(payload.output_bytes, b"a".to_vec());
+                }
+                other => panic!("unexpected payload: {other:?}"),
+            },
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

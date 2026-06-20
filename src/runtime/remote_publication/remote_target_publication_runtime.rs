@@ -5,6 +5,7 @@ use crate::cli::{
     SocketLifecycleHookCommand,
 };
 use crate::domain::session_catalog::{ManagedSessionRecord, SessionAvailability, SessionTransport};
+use crate::infra::error_log::ERROR_LOG;
 use crate::infra::remote_protocol::{ControlPlanePayload, NodeSessionChannel, ProtocolEnvelope};
 use crate::infra::remote_transport_codec::read_node_session_envelope;
 use crate::infra::tmux::{
@@ -96,9 +97,29 @@ impl RemoteTargetPublicationRuntime {
 
     pub fn apply_live_publication_envelope(
         &self,
-        _socket_name: &str,
-        _envelope: ProtocolEnvelope<ControlPlanePayload>,
+        socket_name: &str,
+        envelope: ProtocolEnvelope<ControlPlanePayload>,
     ) -> Result<(), LifecycleError> {
+        let node_id = envelope.sender_id.clone();
+        let remote_session = discovered_remote_session_from_envelope(&node_id, &envelope)?;
+        let mut changed = false;
+        if let Some(session) = remote_session.published_session {
+            if is_publishable_discovered_remote_session(&session) {
+                self.signal_remote_runtime_owner_upsert(&node_id, &session)?;
+                changed = true;
+            }
+        }
+        if let Some((authority_id, transport_session_id)) = remote_session.exited_session {
+            self.signal_remote_runtime_owner_remove(
+                &node_id,
+                &authority_id,
+                &transport_session_id,
+            )?;
+            changed = true;
+        }
+        if changed {
+            self.refresh_live_workspace_socket(socket_name)?;
+        }
         Ok(())
     }
 
@@ -172,7 +193,21 @@ impl RemoteTargetPublicationRuntime {
         node_id: &str,
         session: &ManagedSessionRecord,
     ) -> Result<(), LifecycleError> {
-        self.remote_runtime_owner.upsert_session(node_id, session)
+        let t_upsert = std::time::Instant::now();
+        ERROR_LOG.log(format!(
+            "[diag-sync] upsert discovered remote session node={} target={}",
+            node_id,
+            session.address.qualified_target()
+        ));
+        let result = self.remote_runtime_owner.upsert_session(node_id, session);
+        ERROR_LOG.log(format!(
+            "[diag-newhost] remote_runtime_owner_upsert node={} target={} ok={} elapsed={:?}",
+            node_id,
+            session.address.qualified_target(),
+            result.is_ok(),
+            t_upsert.elapsed()
+        ));
+        result
     }
 
     fn signal_remote_runtime_owner_remove(
@@ -217,6 +252,13 @@ impl RemoteTargetPublicationRuntime {
             spawn_socket_chrome_refresh(&self.current_executable, socket_name)?;
         }
         Ok(())
+    }
+
+    fn refresh_live_workspace_socket(&self, socket_name: &str) -> Result<(), LifecycleError> {
+        if !self.socket_is_live(socket_name) {
+            return Ok(());
+        }
+        spawn_socket_chrome_refresh(&self.current_executable, socket_name)
     }
 
     pub fn run_publication_owner(

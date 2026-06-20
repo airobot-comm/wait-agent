@@ -10,6 +10,7 @@ use crate::runtime::event_driven_ui_pane_runtime::{
     EventDrivenSidebarInputOutcome, EventDrivenUiPaneRuntime,
 };
 use std::io;
+use std::time::Instant;
 
 const WAITAGENT_ACTIVE_TARGET_OPTION: &str = "@waitagent_active_target";
 const WAITAGENT_SIDEBAR_SELECTED_TARGET_OPTION: &str = "@waitagent_sidebar_selected_target";
@@ -145,10 +146,18 @@ where
         &mut self,
         command: &UiPaneCommand,
     ) -> Result<EventDrivenChromeRenderUpdate, LifecycleError> {
+        let t_snapshot = Instant::now();
         let active_target = self
             .gateway
             .show_session_option(&workspace_handle(command), WAITAGENT_ACTIVE_TARGET_OPTION)
             .map_err(tmux_pane_error)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] ui_publish_snapshot active_target socket={} session={} active={:?} elapsed={:?}",
+            command.socket_name,
+            command.session_name,
+            active_target,
+            t_snapshot.elapsed()
+        ));
         let visible_sessions = self
             .target_registry
             .visible_targets_in_workspace(
@@ -157,6 +166,13 @@ where
                 active_target.as_deref(),
             )
             .map_err(tmux_pane_error)?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] ui_publish_snapshot visible_done socket={} session={} visible={} elapsed={:?}",
+            command.socket_name,
+            command.session_name,
+            visible_sessions.len(),
+            t_snapshot.elapsed()
+        ));
         ERROR_LOG.log(format!(
             "[diag-native] publish_session_snapshot: socket={} session={} active_target={:?} visible_sessions={} targets={:?}",
             command.socket_name,
@@ -168,14 +184,21 @@ where
                 .map(|session| session.address.qualified_target())
                 .collect::<Vec<_>>()
         ));
-        Ok(self.pane_runtime.publish_session_snapshot(
+        let update = self.pane_runtime.publish_session_snapshot(
             &command.socket_name,
             &command.session_name,
             active_target.as_deref(),
             visible_sessions,
             Some(self.network.advertised_listener_label().as_str()),
             self.network.connect.as_deref(),
-        ))
+        );
+        ERROR_LOG.log(format!(
+            "[diag-newhost] ui_publish_snapshot render_update_done socket={} session={} elapsed={:?}",
+            command.socket_name,
+            command.session_name,
+            t_snapshot.elapsed()
+        ));
+        Ok(update)
     }
 }
 

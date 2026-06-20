@@ -3,6 +3,7 @@ use crate::domain::session_catalog::{
     ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState, SessionAvailability,
 };
 use crate::domain::workspace::WorkspaceSessionRole;
+use crate::infra::error_log::ERROR_LOG;
 use crate::infra::tmux::EmbeddedTmuxBackend;
 use crate::lifecycle::LifecycleError;
 use crate::runtime::current_executable::current_waitagent_executable;
@@ -16,11 +17,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REMOTE_RUNTIME_OWNER_READY_RETRIES: usize = 20;
 const REMOTE_RUNTIME_OWNER_READY_SLEEP: Duration = Duration::from_millis(25);
-const REMOTE_RUNTIME_OWNER_IDLE_POLL_SLEEP: Duration = Duration::from_millis(100);
+const REMOTE_RUNTIME_OWNER_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRuntimeOwnerRuntime {
@@ -91,23 +92,26 @@ impl RemoteRuntimeOwnerRuntime {
             let _ = fs::remove_file(&socket_path);
         }
         let listener = UnixListener::bind(&socket_path).map_err(remote_runtime_owner_error)?;
-        listener
-            .set_nonblocking(true)
-            .map_err(remote_runtime_owner_error)?;
         let state = RemoteRuntimeOwnerSharedState {
             records: Arc::new(Mutex::new(HashMap::new())),
             running: Arc::new(AtomicBool::new(true)),
         };
-        while state.running.load(Ordering::Relaxed) {
-            if !any_backend_socket_still_live() {
-                break;
-            }
-            let accepted = match listener.accept() {
-                Ok((stream, _)) => Ok(stream),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(REMOTE_RUNTIME_OWNER_IDLE_POLL_SLEEP);
+        let watcher_running = Arc::clone(&state.running);
+        let watcher_socket_path = socket_path.clone();
+        let liveness_watcher = thread::spawn(move || {
+            while watcher_running.load(Ordering::Relaxed) {
+                thread::sleep(REMOTE_RUNTIME_OWNER_LIVENESS_CHECK_INTERVAL);
+                if any_backend_socket_still_live() {
                     continue;
                 }
+                watcher_running.store(false, Ordering::Relaxed);
+                let _ = UnixStream::connect(&watcher_socket_path);
+                break;
+            }
+        });
+        while state.running.load(Ordering::Relaxed) {
+            let accepted = match listener.accept() {
+                Ok((stream, _)) => Ok(stream),
                 Err(error) => Err(error),
             };
             if !state.running.load(Ordering::Relaxed) {
@@ -116,16 +120,41 @@ impl RemoteRuntimeOwnerRuntime {
             let Ok(mut stream) = accepted.map_err(remote_runtime_owner_error) else {
                 break;
             };
+            let t_client = Instant::now();
+            ERROR_LOG.log("[diag-newhost] remote_owner server accepted".to_string());
             let response = handle_remote_runtime_owner_client(&state, &mut stream);
             match response {
                 Ok(Some(payload)) => {
-                    let _ = stream.write_all(payload.as_bytes());
-                    let _ = stream.flush();
+                    let t_write = Instant::now();
+                    let write_ok = stream.write_all(payload.as_bytes()).is_ok();
+                    let flush_ok = stream.flush().is_ok();
+                    ERROR_LOG.log(format!(
+                        "[diag-newhost] remote_owner server write_response bytes={} write_ok={} flush_ok={} elapsed={:?} total={:?}",
+                        payload.len(),
+                        write_ok,
+                        flush_ok,
+                        t_write.elapsed(),
+                        t_client.elapsed()
+                    ));
                 }
-                Ok(None) => {}
-                Err(_) => {}
+                Ok(None) => {
+                    ERROR_LOG.log(format!(
+                        "[diag-newhost] remote_owner server no_response total={:?}",
+                        t_client.elapsed()
+                    ));
+                }
+                Err(error) => {
+                    ERROR_LOG.log(format!(
+                        "[diag-newhost] remote_owner server handle_error error={} total={:?}",
+                        error,
+                        t_client.elapsed()
+                    ));
+                }
             }
         }
+        state.running.store(false, Ordering::Relaxed);
+        let _ = UnixStream::connect(&socket_path);
+        let _ = liveness_watcher.join();
         let _ = fs::remove_file(&socket_path);
         Ok(())
     }
@@ -141,6 +170,7 @@ impl RemoteRuntimeOwnerRuntime {
     ) -> Result<(), LifecycleError> {
         self.ensure_owner_running()?;
         signal_remote_runtime_owner_command(
+            &self.current_executable,
             &self.network,
             RemoteRuntimeOwnerCommandEnvelope::UpsertSession {
                 node_id: node_id.to_string(),
@@ -157,6 +187,7 @@ impl RemoteRuntimeOwnerRuntime {
     ) -> Result<(), LifecycleError> {
         self.ensure_owner_running()?;
         signal_remote_runtime_owner_command(
+            &self.current_executable,
             &self.network,
             RemoteRuntimeOwnerCommandEnvelope::RemoveSession {
                 node_id: node_id.to_string(),
@@ -169,6 +200,7 @@ impl RemoteRuntimeOwnerRuntime {
     pub fn remove_node(&self, node_id: &str) -> Result<(), LifecycleError> {
         self.ensure_owner_running()?;
         signal_remote_runtime_owner_command(
+            &self.current_executable,
             &self.network,
             RemoteRuntimeOwnerCommandEnvelope::RemoveNode {
                 node_id: node_id.to_string(),
@@ -199,14 +231,24 @@ impl RemoteRuntimeOwnerRuntime {
     }
 
     pub fn try_snapshot(&self) -> Result<RemoteRuntimeOwnerSnapshot, LifecycleError> {
+        let t_total = Instant::now();
         let socket_path = remote_runtime_owner_socket_path(&self.network);
         if !socket_path.exists() {
             return Ok(RemoteRuntimeOwnerSnapshot {
                 sessions: Vec::new(),
             });
         }
+        let t_connect = Instant::now();
         let mut stream = match UnixStream::connect(&socket_path) {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                ERROR_LOG.log(format!(
+                    "[diag-newhost] remote_owner try_snapshot connect listener={} elapsed={:?} total={:?}",
+                    self.network.listener_addr(),
+                    t_connect.elapsed(),
+                    t_total.elapsed()
+                ));
+                stream
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Ok(RemoteRuntimeOwnerSnapshot {
                     sessions: Vec::new(),
@@ -237,24 +279,69 @@ impl RemoteRuntimeOwnerRuntime {
         // Gracefully degrade: if the owner is unresponsive, return an empty
         // snapshot so local session switching can continue without remote
         // sessions visible.
-        let _ = stream.write_all(
-            render_remote_runtime_owner_command(&RemoteRuntimeOwnerCommandEnvelope::Snapshot)
-                .as_bytes(),
-        );
-        let _ = stream.flush();
-        let _ = stream.shutdown(Shutdown::Write);
+        let t_write = Instant::now();
+        let write_ok = stream
+            .write_all(
+                render_remote_runtime_owner_command(&RemoteRuntimeOwnerCommandEnvelope::Snapshot)
+                    .as_bytes(),
+            )
+            .is_ok();
+        let flush_ok = stream.flush().is_ok();
+        let shutdown_ok = stream.shutdown(Shutdown::Write).is_ok();
+        ERROR_LOG.log(format!(
+            "[diag-newhost] remote_owner try_snapshot write listener={} write_ok={} flush_ok={} shutdown_ok={} elapsed={:?} total={:?}",
+            self.network.listener_addr(),
+            write_ok,
+            flush_ok,
+            shutdown_ok,
+            t_write.elapsed(),
+            t_total.elapsed()
+        ));
         let mut response = String::new();
+        let t_read = Instant::now();
         match stream.read_to_string(&mut response) {
-            Ok(_) => match parse_remote_runtime_owner_snapshot(&response) {
-                Ok(snapshot) => Ok(snapshot),
-                Err(_) => {
-                    let _ = fs::remove_file(&socket_path);
-                    Ok(RemoteRuntimeOwnerSnapshot {
-                        sessions: Vec::new(),
-                    })
+            Ok(_) => {
+                ERROR_LOG.log(format!(
+                    "[diag-newhost] remote_owner try_snapshot read listener={} bytes={} elapsed={:?} total={:?}",
+                    self.network.listener_addr(),
+                    response.len(),
+                    t_read.elapsed(),
+                    t_total.elapsed()
+                ));
+                let t_parse = Instant::now();
+                match parse_remote_runtime_owner_snapshot(&response) {
+                    Ok(snapshot) => {
+                        ERROR_LOG.log(format!(
+                            "[diag-newhost] remote_owner try_snapshot parse listener={} sessions={} elapsed={:?} total={:?}",
+                            self.network.listener_addr(),
+                            snapshot.sessions.len(),
+                            t_parse.elapsed(),
+                            t_total.elapsed()
+                        ));
+                        Ok(snapshot)
+                    }
+                    Err(_) => {
+                        ERROR_LOG.log(format!(
+                            "[diag-newhost] remote_owner try_snapshot parse_failed listener={} elapsed={:?} total={:?}",
+                            self.network.listener_addr(),
+                            t_parse.elapsed(),
+                            t_total.elapsed()
+                        ));
+                        let _ = fs::remove_file(&socket_path);
+                        Ok(RemoteRuntimeOwnerSnapshot {
+                            sessions: Vec::new(),
+                        })
+                    }
                 }
-            },
-            Err(_) => {
+            }
+            Err(error) => {
+                ERROR_LOG.log(format!(
+                    "[diag-newhost] remote_owner try_snapshot read_failed listener={} error={} elapsed={:?} total={:?}",
+                    self.network.listener_addr(),
+                    error,
+                    t_read.elapsed(),
+                    t_total.elapsed()
+                ));
                 let _ = fs::remove_file(&socket_path);
                 Ok(RemoteRuntimeOwnerSnapshot {
                     sessions: Vec::new(),
@@ -268,8 +355,16 @@ fn handle_remote_runtime_owner_client(
     state: &RemoteRuntimeOwnerSharedState,
     stream: &mut UnixStream,
 ) -> Result<Option<String>, LifecycleError> {
+    let t_total = Instant::now();
     let command = read_remote_runtime_owner_command(stream)?;
-    match command {
+    let command_label = remote_runtime_owner_command_label(&command);
+    ERROR_LOG.log(format!(
+        "[diag-newhost] remote_owner server read_command command={} elapsed={:?}",
+        command_label,
+        t_total.elapsed()
+    ));
+    let t_handle = Instant::now();
+    let response = match command {
         RemoteRuntimeOwnerCommandEnvelope::UpsertSession { node_id, session } => {
             let key = owned_record_key(&node_id, session.address.id().as_str());
             state
@@ -277,7 +372,7 @@ fn handle_remote_runtime_owner_client(
                 .lock()
                 .expect("remote runtime owner state mutex should not be poisoned")
                 .insert(key, OwnerStateRecord { node_id, session });
-            Ok(None)
+            Ok(Some("ok\n".to_string()))
         }
         RemoteRuntimeOwnerCommandEnvelope::RemoveSession {
             node_id,
@@ -294,7 +389,7 @@ fn handle_remote_runtime_owner_client(
                 .lock()
                 .expect("remote runtime owner state mutex should not be poisoned")
                 .remove(&key);
-            Ok(None)
+            Ok(Some("ok\n".to_string()))
         }
         RemoteRuntimeOwnerCommandEnvelope::RemoveNode { node_id } => {
             let mut guard = state
@@ -302,7 +397,7 @@ fn handle_remote_runtime_owner_client(
                 .lock()
                 .expect("remote runtime owner state mutex should not be poisoned");
             guard.retain(|_, record| record.node_id != node_id);
-            Ok(None)
+            Ok(Some("ok\n".to_string()))
         }
         RemoteRuntimeOwnerCommandEnvelope::Snapshot => {
             let snapshot = render_remote_runtime_owner_snapshot(
@@ -316,6 +411,23 @@ fn handle_remote_runtime_owner_client(
             );
             Ok(Some(snapshot))
         }
+    };
+    ERROR_LOG.log(format!(
+        "[diag-newhost] remote_owner server handled command={} ok={} elapsed={:?} total={:?}",
+        command_label,
+        response.is_ok(),
+        t_handle.elapsed(),
+        t_total.elapsed()
+    ));
+    response
+}
+
+fn remote_runtime_owner_command_label(command: &RemoteRuntimeOwnerCommandEnvelope) -> &'static str {
+    match command {
+        RemoteRuntimeOwnerCommandEnvelope::UpsertSession { .. } => "upsert_session",
+        RemoteRuntimeOwnerCommandEnvelope::RemoveSession { .. } => "remove_session",
+        RemoteRuntimeOwnerCommandEnvelope::RemoveNode { .. } => "remove_node",
+        RemoteRuntimeOwnerCommandEnvelope::Snapshot => "snapshot",
     }
 }
 
@@ -348,7 +460,25 @@ pub(crate) fn ensure_remote_runtime_owner_process_running(
 }
 
 fn remote_runtime_owner_available(socket_path: &Path) -> bool {
-    UnixStream::connect(socket_path).is_ok()
+    let Ok(mut stream) = UnixStream::connect(socket_path) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    if stream
+        .write_all(
+            render_remote_runtime_owner_command(&RemoteRuntimeOwnerCommandEnvelope::Snapshot)
+                .as_bytes(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+    if stream.flush().is_err() || stream.shutdown(Shutdown::Write).is_err() {
+        return false;
+    }
+    let mut response = String::new();
+    stream.read_to_string(&mut response).is_ok()
+        && parse_remote_runtime_owner_snapshot(&response).is_ok()
 }
 
 fn any_backend_socket_still_live() -> bool {
@@ -378,18 +508,88 @@ pub(crate) fn remote_runtime_owner_args(network: &RemoteNetworkConfig) -> Vec<St
 }
 
 fn signal_remote_runtime_owner_command(
+    current_executable: &Path,
     network: &RemoteNetworkConfig,
     command: RemoteRuntimeOwnerCommandEnvelope,
 ) -> Result<(), LifecycleError> {
+    match try_signal_remote_runtime_owner_command(network, &command) {
+        Ok(()) => Ok(()),
+        Err(first_error) if remote_runtime_owner_ack_error(&first_error) => {
+            let socket_path = remote_runtime_owner_socket_path(network);
+            let _ = fs::remove_file(&socket_path);
+            ensure_remote_runtime_owner_process_running(current_executable, network)?;
+            try_signal_remote_runtime_owner_command(network, &command).map_err(|second_error| {
+                LifecycleError::Protocol(format!(
+                    "remote runtime owner command failed after protocol restart: {second_error}"
+                ))
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn try_signal_remote_runtime_owner_command(
+    network: &RemoteNetworkConfig,
+    command: &RemoteRuntimeOwnerCommandEnvelope,
+) -> Result<(), LifecycleError> {
+    let t_total = Instant::now();
+    let command_label = remote_runtime_owner_command_label(command);
+    let t_connect = Instant::now();
     let mut stream = UnixStream::connect(remote_runtime_owner_socket_path(network))
         .map_err(remote_runtime_owner_error)?;
+    ERROR_LOG.log(format!(
+        "[diag-newhost] remote_owner signal connect listener={} command={} elapsed={:?} total={:?}",
+        network.listener_addr(),
+        command_label,
+        t_connect.elapsed(),
+        t_total.elapsed()
+    ));
+    let t_write = Instant::now();
     stream
-        .write_all(render_remote_runtime_owner_command(&command).as_bytes())
+        .write_all(render_remote_runtime_owner_command(command).as_bytes())
         .map_err(remote_runtime_owner_error)?;
     stream.flush().map_err(remote_runtime_owner_error)?;
     stream
         .shutdown(Shutdown::Write)
-        .map_err(remote_runtime_owner_error)
+        .map_err(remote_runtime_owner_error)?;
+    ERROR_LOG.log(format!(
+        "[diag-newhost] remote_owner signal write listener={} command={} elapsed={:?} total={:?}",
+        network.listener_addr(),
+        command_label,
+        t_write.elapsed(),
+        t_total.elapsed()
+    ));
+
+    let mut response = String::new();
+    let t_read = Instant::now();
+    stream
+        .read_to_string(&mut response)
+        .map_err(remote_runtime_owner_error)?;
+    ERROR_LOG.log(format!(
+        "[diag-newhost] remote_owner signal read listener={} command={} bytes={} elapsed={:?} total={:?}",
+        network.listener_addr(),
+        command_label,
+        response.len(),
+        t_read.elapsed(),
+        t_total.elapsed()
+    ));
+    if response.trim() == "ok" {
+        Ok(())
+    } else {
+        Err(LifecycleError::Protocol(format!(
+            "remote runtime owner command was not acknowledged: `{}`",
+            response.trim()
+        )))
+    }
+}
+
+fn remote_runtime_owner_ack_error(error: &LifecycleError) -> bool {
+    match error {
+        LifecycleError::Protocol(message) => {
+            message.starts_with("remote runtime owner command was not acknowledged")
+        }
+        _ => false,
+    }
 }
 
 fn render_remote_runtime_owner_command(command: &RemoteRuntimeOwnerCommandEnvelope) -> String {
@@ -867,7 +1067,7 @@ mod tests {
         let response =
             handle_remote_runtime_owner_client(&state, &mut server).expect("command should handle");
 
-        assert!(response.is_none());
+        assert_eq!(response.as_deref(), Some("ok\n"));
         let records = state
             .records
             .lock()

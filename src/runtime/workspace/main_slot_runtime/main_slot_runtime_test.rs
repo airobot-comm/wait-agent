@@ -297,13 +297,24 @@ mod tests {
             active_target.as_deref() == Some(remote_target.address.qualified_target().as_str())
         });
 
-        wait_for_condition(|| {
-            workspace_main_pane_command(&backend, &workspace.workspace_handle).as_deref()
-                == Some("waitagent")
-        });
-        wait_for_condition(|| {
-            workspace_main_pane_pipe(&backend, &workspace.workspace_handle).as_deref() == Some("0")
-        });
+        let remote_main_pane = backend
+            .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
+            .expect("main pane option should read after remote activation")
+            .expect("remote activation should set main pane");
+        assert!(
+            pane_exists(&backend, &workspace.workspace_handle, &remote_main_pane),
+            "remote main pane should be retained even when authority registration fails"
+        );
+        assert_eq!(
+            pane_option(
+                &backend,
+                &workspace.workspace_handle,
+                &remote_main_pane,
+                "remain-on-exit",
+            )
+            .as_deref(),
+            Some("on")
+        );
 
         let target_host_handle = TmuxWorkspaceHandle {
             workspace_id: WorkspaceInstanceId::new(target_host.session_name.as_str().to_string()),
@@ -2748,11 +2759,6 @@ mod tests {
                 .expect("active target should read");
             active_target.as_deref() == Some(remote_target.address.qualified_target().as_str())
         });
-        wait_for_condition(|| {
-            workspace_main_pane_command(&backend, &workspace.workspace_handle).as_deref()
-                == Some("waitagent")
-        });
-
         let recovery_pane_id = backend
             .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
             .expect("main pane option should read")
@@ -2806,16 +2812,15 @@ mod tests {
                 .expect("active target should read");
             active_target.as_deref() == Some(remote_target.address.qualified_target().as_str())
         });
-        wait_for_condition(|| {
-            workspace_main_pane_command(&backend, &workspace.workspace_handle).as_deref()
-                == Some("waitagent")
-        });
-
         let recovered_main_pane = backend
             .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
             .expect("main pane option should read after recovery")
             .expect("main pane option should remain populated");
-        assert!(!recovered_main_pane.is_empty());
+        assert_eq!(recovered_main_pane, recovery_pane_id);
+        assert!(
+            pane_exists(&backend, &workspace.workspace_handle, &recovered_main_pane),
+            "recovery pane should remain available after fallback"
+        );
 
         kill_server(&backend, &workspace.workspace_handle);
         let _ = fs::remove_dir_all(workspace_dir);
@@ -2937,6 +2942,25 @@ mod tests {
         backend
             .pane_pipe_state(workspace, &crate::infra::tmux::TmuxPaneId::new(pane_id))
             .ok()
+    }
+
+    fn pane_exists(
+        backend: &EmbeddedTmuxBackend,
+        workspace: &TmuxWorkspaceHandle,
+        pane_id: &str,
+    ) -> bool {
+        let output = backend
+            .run_on_socket(
+                &workspace.socket_name,
+                &[
+                    "list-panes".to_string(),
+                    "-a".to_string(),
+                    "-F".to_string(),
+                    "#{pane_id}".to_string(),
+                ],
+            )
+            .expect("pane list should read");
+        output.stdout.lines().any(|line| line == pane_id)
     }
 
     fn pane_is_live(

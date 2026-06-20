@@ -189,11 +189,6 @@ impl RemoteMainSlotPaneRuntime {
     where
         F: FnMut(RemoteInteractSignal),
     {
-        let t_surface = std::time::Instant::now();
-        ERROR_LOG.log(format!(
-            "[diag-timing] run_surface_with_signal_sink start target={}",
-            spec.target
-        ));
         let target = self.resolve_remote_target(&spec.target, "remote interact surface")?;
         let terminal = TerminalRuntime::stdio();
         let _raw_mode = terminal.enter_raw_mode()?;
@@ -262,17 +257,13 @@ impl RemoteMainSlotPaneRuntime {
         let mut console_seq = 0u64;
         let mut input_signal_decoder = RemoteInteractInputSignalDecoder::default();
         let mut paused_input_buffer: Vec<Vec<u8>> = Vec::new();
-        ERROR_LOG.log(format!(
-            "[diag-timing] pane setup complete (threads+authority started), attempting initial activation ({:?})",
-            t_surface.elapsed()
-        ));
+        let mut pending_pty_size: Option<TerminalSize> = None;
         let mut binding = None;
         let mut direct_raw_output_last_seq = None;
         let mut raw_screen_initialized = false;
         let mut authority_status = waiting_authority_status.clone();
         // Always attempt activation — output_log replay comes from the
         // local mailbox; no need to wait for authority transport.
-        let t_before_activate = std::time::Instant::now();
         let activated = activate_surface_target_with_mode(
             &remote_runtime,
             &target,
@@ -282,13 +273,15 @@ impl RemoteMainSlotPaneRuntime {
         )
         .map(Some)?;
         if let Some((activated_binding, raw)) = activated {
-            ERROR_LOG.log(format!(
-                "[diag-timing] initial activation got binding ({:?})",
-                t_before_activate.elapsed()
-            ));
             raw_input_route.activate(&target, &activated_binding, &spec.console_host_id);
             schedule_post_activation_resize_probe(event_tx.clone());
-            sync_remote_pty_size(&remote_runtime, &target, &activated_binding, &initial_size)?;
+            sync_or_defer_remote_pty_size(
+                &remote_runtime,
+                &target,
+                &activated_binding,
+                &initial_size,
+                &mut pending_pty_size,
+            )?;
             last_synced_size = initial_size;
             write_remote_raw_output_with_initial_clear(&raw, &mut raw_screen_initialized)?;
             binding = Some(activated_binding);
@@ -299,11 +292,7 @@ impl RemoteMainSlotPaneRuntime {
                 &paused_input_buffer,
                 &mut console_seq,
             )?;
-        } else {
-            ERROR_LOG.log(format!(
-                "[diag-timing] initial activation returned None ({:?})",
-                t_before_activate.elapsed()
-            ));
+            paused_input_buffer.clear();
         }
         let run_result = (|| -> Result<(), LifecycleError> {
             let mut reconnecting_since: Option<Instant> = None;
@@ -335,10 +324,6 @@ impl RemoteMainSlotPaneRuntime {
                 AuthorityTransportStatus::WaitingForRemoteAuthority
             ) && binding.is_some()
             {
-                ERROR_LOG.log(format!(
-                    "[diag-timing] event loop entering initial connecting phase (surface_setup={:?})",
-                    t_surface.elapsed()
-                ));
                 Some(Instant::now())
             } else {
                 None
@@ -440,7 +425,6 @@ impl RemoteMainSlotPaneRuntime {
 
                 match event {
                     RemotePaneEvent::MailboxUpdated => {
-                        let t_mailbox = std::time::Instant::now();
                         let raw = raw_output_reader
                             .sync_and_collect_raw()
                             .map_err(remote_protocol_error)?;
@@ -452,30 +436,22 @@ impl RemoteMainSlotPaneRuntime {
                         if raw.is_empty() {
                             continue;
                         }
-                        let is_first_output = !raw_screen_initialized;
-                        if is_first_output {
-                            ERROR_LOG.log(format!(
-                                "[diag-timing] FIRST OUTPUT received ({} bytes, surface_total={:?})",
-                                raw.len(),
-                                t_surface.elapsed()
-                            ));
-                        }
                         write_remote_raw_output_with_initial_clear(
                             &raw,
                             &mut raw_screen_initialized,
                         )?;
-                        if is_first_output {
-                            ERROR_LOG.log(format!(
-                                "[diag-timing] FIRST OUTPUT written to screen (mailbox_handler={:?})",
-                                t_mailbox.elapsed()
-                            ));
-                        }
                     }
                     RemotePaneEvent::Resize => {
                         let size = current_remote_surface_size(&spec, &terminal);
                         if size != last_synced_size {
                             if let Some(binding) = binding.as_ref() {
-                                sync_remote_pty_size(&remote_runtime, &target, binding, &size)?;
+                                sync_or_defer_remote_pty_size(
+                                    &remote_runtime,
+                                    &target,
+                                    binding,
+                                    &size,
+                                    &mut pending_pty_size,
+                                )?;
                                 last_synced_size = size;
                             }
                         }
@@ -499,11 +475,6 @@ impl RemoteMainSlotPaneRuntime {
                     }
                     RemotePaneEvent::AuthorityTransport(event) => match event {
                         AuthorityTransportEvent::Connected => {
-                            let t_conn = std::time::Instant::now();
-                            ERROR_LOG.log(format!(
-                                "[diag-timing] AuthorityTransportEvent::Connected (elapsed_since_surface_start={:?})",
-                                t_surface.elapsed()
-                            ));
                             let is_present = target_is_present(&target_presence);
                             // Only clear reconnect when target is also present.
                             // Otherwise, keep reconnecting_since to prevent an
@@ -518,6 +489,22 @@ impl RemoteMainSlotPaneRuntime {
                             } else {
                                 AuthorityTransportStatus::Disconnected
                             };
+                            if let Some(binding) = binding.as_ref() {
+                                flush_pending_pty_size(
+                                    &remote_runtime,
+                                    &target,
+                                    binding,
+                                    &mut pending_pty_size,
+                                )?;
+                                flush_paused_input(
+                                    &remote_runtime,
+                                    &target,
+                                    binding,
+                                    &paused_input_buffer,
+                                    &mut console_seq,
+                                )?;
+                                paused_input_buffer.clear();
+                            }
                             let needs_activation = binding.is_none()
                                 || remote_runtime.is_mirror_pending(&target)
                                 || remote_runtime.is_mirror_needed(&target);
@@ -540,11 +527,12 @@ impl RemoteMainSlotPaneRuntime {
                                             &spec.console_host_id,
                                         );
                                         schedule_post_activation_resize_probe(event_tx.clone());
-                                        sync_remote_pty_size(
+                                        sync_or_defer_remote_pty_size(
                                             &remote_runtime,
                                             &target,
                                             &result.0,
                                             &size,
+                                            &mut pending_pty_size,
                                         )?;
                                         last_synced_size = size;
                                         write_remote_raw_output_with_initial_clear(
@@ -553,11 +541,12 @@ impl RemoteMainSlotPaneRuntime {
                                         )?;
                                         binding = Some(result.0);
                                         activated = true;
-                                        ERROR_LOG.log(format!(
-                                            "[diag-timing] Connected: reactivation succeeded (handler_elapsed={:?}, surface_total={:?})",
-                                            t_conn.elapsed(),
-                                            t_surface.elapsed()
-                                        ));
+                                        flush_pending_pty_size(
+                                            &remote_runtime,
+                                            &target,
+                                            binding.as_ref().unwrap(),
+                                            &mut pending_pty_size,
+                                        )?;
                                         flush_paused_input(
                                             &remote_runtime,
                                             &target,
@@ -565,6 +554,7 @@ impl RemoteMainSlotPaneRuntime {
                                             &paused_input_buffer,
                                             &mut console_seq,
                                         )?;
+                                        paused_input_buffer.clear();
                                     }
                                     Err(error) => {
                                         authority_status =
@@ -577,7 +567,7 @@ impl RemoteMainSlotPaneRuntime {
                             // handles its own rendering. Don't overwrite with
                             // a stale snapshot (which would clobber UI elements
                             // like claude's input area separator).
-                            if !activated {
+                            if !activated && binding.is_none() {
                                 let _ = observer.sync();
                                 draw_remote_snapshot(
                                     &terminal,
@@ -592,10 +582,6 @@ impl RemoteMainSlotPaneRuntime {
                             }
                         }
                         AuthorityTransportEvent::Disconnected => {
-                            ERROR_LOG.log(format!(
-                                "[diag-timing] AuthorityTransportEvent::Disconnected (elapsed_since_surface_start={:?})",
-                                t_surface.elapsed()
-                            ));
                             remote_runtime
                                 .handle_authority_disconnect(target.address.authority_id());
                             authority_status = AuthorityTransportStatus::Disconnected;
@@ -767,11 +753,12 @@ impl RemoteMainSlotPaneRuntime {
                                         &spec.console_host_id,
                                     );
                                     schedule_post_activation_resize_probe(event_tx.clone());
-                                    sync_remote_pty_size(
+                                    sync_or_defer_remote_pty_size(
                                         &remote_runtime,
                                         &target,
                                         &result.0,
                                         &size,
+                                        &mut pending_pty_size,
                                     )?;
                                     last_synced_size = size;
                                     write_remote_raw_output_with_initial_clear(
@@ -780,6 +767,12 @@ impl RemoteMainSlotPaneRuntime {
                                     )?;
                                     binding = Some(result.0);
                                     activated = true;
+                                    flush_pending_pty_size(
+                                        &remote_runtime,
+                                        &target,
+                                        binding.as_ref().unwrap(),
+                                        &mut pending_pty_size,
+                                    )?;
                                     flush_paused_input(
                                         &remote_runtime,
                                         &target,
@@ -787,6 +780,7 @@ impl RemoteMainSlotPaneRuntime {
                                         &paused_input_buffer,
                                         &mut console_seq,
                                     )?;
+                                    paused_input_buffer.clear();
                                 }
                                 Err(error) => {
                                     authority_status =
@@ -832,12 +826,22 @@ impl RemoteMainSlotPaneRuntime {
                                 // adding the UI event loop to every keystroke.
                                 continue;
                             }
-                            remote_runtime.send_raw_pty_input(
+                            if !remote_runtime.has_connection(target.address.authority_id()) {
+                                ERROR_LOG.log(format!(
+                                    "[diag-timing] remote input deferred until authority registers: authority={}",
+                                    target.address.authority_id()
+                                ));
+                                paused_input_buffer.push(bytes);
+                                continue;
+                            }
+                            if let Err(error) = remote_runtime.send_raw_pty_input(
                                 &target,
                                 binding,
                                 console_seq,
-                                bytes,
-                            )?;
+                                bytes.clone(),
+                            ) {
+                                return Err(error);
+                            }
                         } else if !bytes.is_empty() && !raw_forwarded {
                             // During reconnection (binding is None), buffer
                             // input locally so keystrokes aren't lost. The
@@ -926,6 +930,51 @@ fn sync_remote_pty_size(
         usize::from(size.cols),
         usize::from(size.rows),
     )
+}
+
+fn sync_or_defer_remote_pty_size(
+    remote_runtime: &RemoteMainSlotRuntime,
+    target: &ManagedSessionRecord,
+    binding: &RemoteAttachmentBinding,
+    size: &TerminalSize,
+    pending_pty_size: &mut Option<TerminalSize>,
+) -> Result<(), LifecycleError> {
+    if !remote_runtime.has_connection(target.address.authority_id()) {
+        ERROR_LOG.log(format!(
+            "[diag-timing] remote PTY resize deferred until authority registers: authority={}",
+            target.address.authority_id()
+        ));
+        *pending_pty_size = Some(*size);
+        return Ok(());
+    }
+    match sync_remote_pty_size(remote_runtime, target, binding, size) {
+        Ok(()) => Ok(()),
+        Err(error) if !remote_runtime.has_connection(target.address.authority_id()) => {
+            ERROR_LOG.log(format!(
+                "[diag-timing] remote PTY resize deferred after authority unregistered: {error}"
+            ));
+            *pending_pty_size = Some(*size);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn flush_pending_pty_size(
+    remote_runtime: &RemoteMainSlotRuntime,
+    target: &ManagedSessionRecord,
+    binding: &RemoteAttachmentBinding,
+    pending_pty_size: &mut Option<TerminalSize>,
+) -> Result<(), LifecycleError> {
+    let Some(size) = *pending_pty_size else {
+        return Ok(());
+    };
+    if !remote_runtime.has_connection(target.address.authority_id()) {
+        return Ok(());
+    }
+    sync_remote_pty_size(remote_runtime, target, binding, &size)?;
+    *pending_pty_size = None;
+    Ok(())
 }
 
 fn signal_clean_remote_target_exit(

@@ -4,11 +4,17 @@ use crate::domain::session_catalog::SessionAvailability;
 use crate::domain::session_catalog::SessionTransport;
 use crate::infra::error_log::ERROR_LOG;
 use crate::infra::tmux::TmuxSessionGateway;
-use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError};
+use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError, TmuxSocketName};
 use crate::runtime::network_state_runtime::recover_network_config_for_socket;
-use crate::runtime::remote_runtime_owner_runtime::RemoteRuntimeOwnerRuntime;
+use crate::runtime::remote_runtime_owner_runtime::{
+    RemoteRuntimeOwnerRuntime, RemoteRuntimeOwnerSnapshot,
+};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const REMOTE_OWNER_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(100);
 
 pub trait TargetCatalogGateway {
     type Error;
@@ -27,11 +33,18 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DefaultTargetCatalogGateway {
     local_tmux: EmbeddedTmuxBackend,
     remote_runtime_owner: RemoteRuntimeOwnerRuntime,
     current_socket_name: Option<String>,
+    remote_snapshot_cache: Arc<Mutex<Option<CachedRemoteRuntimeOwnerSnapshot>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRemoteRuntimeOwnerSnapshot {
+    captured_at: Instant,
+    snapshot: RemoteRuntimeOwnerSnapshot,
 }
 
 impl DefaultTargetCatalogGateway {
@@ -78,7 +91,83 @@ impl DefaultTargetCatalogGateway {
                 ))
             })?,
             current_socket_name,
+            remote_snapshot_cache: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub fn list_local_targets_on_authority(
+        &self,
+        authority_id: &str,
+    ) -> Result<Vec<ManagedSessionRecord>, TmuxError> {
+        Ok(self
+            .local_targets_on_current_socket()?
+            .into_iter()
+            .filter(|target| target.address.authority_id() == authority_id)
+            .collect())
+    }
+
+    pub fn resolve_local_target_on_authority_session(
+        &self,
+        authority_id: &str,
+        transport_session_id: &str,
+    ) -> Result<Option<ManagedSessionRecord>, TmuxError> {
+        Ok(self
+            .list_local_targets_on_authority(authority_id)?
+            .into_iter()
+            .find(|target| target.address.session_id() == transport_session_id))
+    }
+
+    pub fn list_local_workspace_chrome_targets_on_authority(
+        &self,
+        authority_id: &str,
+    ) -> Result<Vec<ManagedSessionRecord>, TmuxError> {
+        Ok(self
+            .list_local_targets_on_authority(authority_id)?
+            .into_iter()
+            .filter(ManagedSessionRecord::is_workspace_chrome)
+            .collect())
+    }
+
+    fn local_targets_on_current_socket(&self) -> Result<Vec<ManagedSessionRecord>, TmuxError> {
+        if let Some(socket_name) = self.current_socket_name.as_deref() {
+            self.local_tmux
+                .list_sessions_on_socket(&TmuxSocketName::new(socket_name))
+        } else {
+            self.local_tmux.list_sessions()
+        }
+    }
+
+    fn remote_snapshot(
+        &self,
+    ) -> Result<RemoteRuntimeOwnerSnapshot, crate::lifecycle::LifecycleError> {
+        if let Some(snapshot) = self.cached_remote_snapshot() {
+            ERROR_LOG.log(format!(
+                "[diag-newhost] list_targets remote_snapshot_cache_hit current_socket={:?} sessions={}",
+                self.current_socket_name,
+                snapshot.sessions.len()
+            ));
+            return Ok(snapshot);
+        }
+        let snapshot = self.remote_runtime_owner.try_snapshot()?;
+        let mut guard = self
+            .remote_snapshot_cache
+            .lock()
+            .expect("remote owner snapshot cache mutex should not be poisoned");
+        *guard = Some(CachedRemoteRuntimeOwnerSnapshot {
+            captured_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
+    }
+
+    fn cached_remote_snapshot(&self) -> Option<RemoteRuntimeOwnerSnapshot> {
+        let guard = self
+            .remote_snapshot_cache
+            .lock()
+            .expect("remote owner snapshot cache mutex should not be poisoned");
+        let cached = guard.as_ref()?;
+        (cached.captured_at.elapsed() <= REMOTE_OWNER_SNAPSHOT_CACHE_TTL)
+            .then(|| cached.snapshot.clone())
     }
 }
 
@@ -86,13 +175,19 @@ impl TargetCatalogGateway for DefaultTargetCatalogGateway {
     type Error = TmuxError;
 
     fn list_targets(&self) -> Result<Vec<ManagedSessionRecord>, Self::Error> {
+        let t_list = std::time::Instant::now();
         let remote_sessions = self
-            .remote_runtime_owner
-            .try_snapshot()
+            .remote_snapshot()
             .map(|snapshot| {
                 ERROR_LOG.log(format!(
                     "[diag-native] list_targets: remote_snapshot_sessions={}",
                     snapshot.sessions.len()
+                ));
+                ERROR_LOG.log(format!(
+                    "[diag-newhost] list_targets remote_snapshot current_socket={:?} sessions={} elapsed={:?}",
+                    self.current_socket_name,
+                    snapshot.sessions.len(),
+                    t_list.elapsed()
                 ));
                 snapshot.sessions
             })
@@ -100,14 +195,28 @@ impl TargetCatalogGateway for DefaultTargetCatalogGateway {
                 ERROR_LOG.log(format!(
                     "[diag] list_targets: remote snapshot failed: {error}"
                 ));
+                ERROR_LOG.log(format!(
+                    "[diag-newhost] list_targets remote_snapshot_failed current_socket={:?} elapsed={:?}",
+                    self.current_socket_name,
+                    t_list.elapsed()
+                ));
                 Vec::new()
             });
-        let local_sessions = self.local_tmux.list_sessions()?;
+        let t_local = std::time::Instant::now();
+        let local_sessions = self.local_targets_on_current_socket()?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] list_targets local_tmux current_socket={:?} sessions={} elapsed={:?} total={:?}",
+            self.current_socket_name,
+            local_sessions.len(),
+            t_local.elapsed(),
+            t_list.elapsed()
+        ));
         let merged = merge_targets_by_identity([local_sessions, remote_sessions]);
         ERROR_LOG.log(format!(
-            "[diag-native] list_targets: current_socket={:?} merged_targets={}",
+            "[diag-newhost] list_targets merged current_socket={:?} sessions={} total={:?}",
             self.current_socket_name,
-            merged.len()
+            merged.len(),
+            t_list.elapsed()
         ));
         Ok(merged)
     }
@@ -176,6 +285,7 @@ where
             .collect())
     }
 
+    #[allow(dead_code)]
     pub fn list_workspace_chrome_targets_on_authority(
         &self,
         authority_id: &str,
@@ -242,13 +352,39 @@ where
         workspace_session_id: &str,
         active_target: Option<&str>,
     ) -> Result<Vec<ManagedSessionRecord>, G::Error> {
+        let t_visible = std::time::Instant::now();
         let targets = self.list_targets()?;
-        Ok(project_visible_targets(
-            &targets,
+        let visible =
+            project_visible_targets(&targets, authority_id, workspace_session_id, active_target);
+        ERROR_LOG.log(format!(
+            "[diag-newhost] visible_targets authority={} workspace={} active={:?} targets={} visible={} elapsed={:?}",
             authority_id,
             workspace_session_id,
             active_target,
-        ))
+            targets.len(),
+            visible.len(),
+            t_visible.elapsed()
+        ));
+        Ok(visible)
+    }
+}
+
+impl TargetRegistryService<DefaultTargetCatalogGateway> {
+    pub fn resolve_local_target_on_authority_session(
+        &self,
+        authority_id: &str,
+        transport_session_id: &str,
+    ) -> Result<Option<ManagedSessionRecord>, TmuxError> {
+        self.gateway
+            .resolve_local_target_on_authority_session(authority_id, transport_session_id)
+    }
+
+    pub fn list_local_workspace_chrome_targets_on_authority(
+        &self,
+        authority_id: &str,
+    ) -> Result<Vec<ManagedSessionRecord>, TmuxError> {
+        self.gateway
+            .list_local_workspace_chrome_targets_on_authority(authority_id)
     }
 }
 

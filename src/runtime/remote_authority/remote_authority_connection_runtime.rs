@@ -201,10 +201,28 @@ pub fn spawn_authority_listener(
 }
 
 pub fn register_authority_stream(
+    stream: UnixStream,
+    registry: RemoteConnectionRegistry,
+    authority_id: String,
+    tx: mpsc::Sender<AuthorityTransportEvent>,
+) -> Result<(), RemoteAuthorityConnectionError> {
+    register_authority_stream_with_timeouts(
+        stream,
+        registry,
+        authority_id,
+        tx,
+        AUTHORITY_TRANSPORT_SOCKET_TIMEOUT,
+        AUTHORITY_TRANSPORT_READ_TIMEOUT,
+    )
+}
+
+pub(super) fn register_authority_stream_with_timeouts(
     mut stream: UnixStream,
     registry: RemoteConnectionRegistry,
     authority_id: String,
     tx: mpsc::Sender<AuthorityTransportEvent>,
+    socket_timeout: Duration,
+    read_timeout: Duration,
 ) -> Result<(), RemoteAuthorityConnectionError> {
     let t_register = std::time::Instant::now();
     let node_id = read_registration_frame(&mut stream)?;
@@ -214,7 +232,7 @@ pub fn register_authority_stream(
         )));
     }
 
-    stream.set_read_timeout(Some(AUTHORITY_TRANSPORT_SOCKET_TIMEOUT))?;
+    stream.set_read_timeout(Some(socket_timeout))?;
     let writer = stream.try_clone()?;
     writer.set_write_timeout(Some(AUTHORITY_TRANSPORT_WRITE_TIMEOUT))?;
     let connected = Arc::new(AtomicBool::new(true));
@@ -239,11 +257,13 @@ pub fn register_authority_stream(
 
     thread::spawn(move || {
         let mut last_received = Instant::now();
+        let mut keepalive_sent_at: Option<Instant> = None;
         let mut next_expected_output_seq: u64 = 1;
         while connected.load(Ordering::Relaxed) {
             match read_authority_transport_frame(&mut stream) {
                 Ok(AuthorityTransportFrame::Ping) => {
                     last_received = Instant::now();
+                    keepalive_sent_at = None;
                     // Respond with Pong to confirm liveness.
                     let mut buf = Vec::new();
                     if write_authority_transport_frame(&mut buf, &AuthorityTransportFrame::Pong)
@@ -255,9 +275,11 @@ pub fn register_authority_stream(
                 Ok(AuthorityTransportFrame::Pong) => {
                     // Remote side is alive; reset idle timer.
                     last_received = Instant::now();
+                    keepalive_sent_at = None;
                 }
                 Ok(AuthorityTransportFrame::ControlPlane(envelope)) => {
                     last_received = Instant::now();
+                    keepalive_sent_at = None;
                     if reader_tx
                         .send(AuthorityTransportEvent::Envelope(envelope))
                         .is_err()
@@ -267,6 +289,7 @@ pub fn register_authority_stream(
                 }
                 Ok(AuthorityTransportFrame::RawPtyOutput(payload)) => {
                     last_received = Instant::now();
+                    keepalive_sent_at = None;
                     // Detect gaps in the output sequence. When frames are
                     // dropped by the network or channel, the sequence number
                     // jumps. We track the expected next seq and log a gap
@@ -296,6 +319,7 @@ pub fn register_authority_stream(
                     // here the frame was misrouted. Consume silently rather than
                     // crashing the reader thread.
                     last_received = Instant::now();
+                    keepalive_sent_at = None;
                 }
                 Ok(AuthorityTransportFrame::SyncRequest { .. }) => {
                     // Remote peer is requesting replay from our output cache.
@@ -304,6 +328,7 @@ pub fn register_authority_stream(
                     // Full SyncRequest handling requires plumbing to the
                     // output cache (layer 1 ring buffer), which is deferred.
                     last_received = Instant::now();
+                    keepalive_sent_at = None;
                 }
                 Ok(AuthorityTransportFrame::SyncResponse {
                     session_id,
@@ -314,6 +339,7 @@ pub fn register_authority_stream(
                     // Remote peer is replaying frames we requested.
                     // Deliver as RawPtyOutput so the display path processes them.
                     last_received = Instant::now();
+                    keepalive_sent_at = None;
                     if reader_tx
                         .send(AuthorityTransportEvent::RawPtyOutput {
                             authority_id: node_id.clone(),
@@ -330,35 +356,34 @@ pub fn register_authority_stream(
                     }
                 }
                 Err(ref e) if e.is_read_timeout() => {
-                    // Read timed out — check total idle duration. If the remote
-                    // has been silent past the timeout, consider it dead.
-                    // is_read_timeout covers both TimedOut and WouldBlock
-                    // because Linux SO_RCVTIMEO produces EAGAIN (WouldBlock).
-                    if last_received.elapsed() > AUTHORITY_TRANSPORT_READ_TIMEOUT {
-                        ERROR_LOG.log(format!(
-                            "[diag-timing] reader thread: idle timeout reached ({:?}), exiting",
-                            last_received.elapsed()
-                        ));
-                        break;
-                    }
-                    // Probe liveness: send Ping to check if remote is still there.
-                    let mut buf = Vec::new();
-                    if write_authority_transport_frame(&mut buf, &AuthorityTransportFrame::Ping)
-                        .is_ok()
-                    {
-                        if pong_writer.write_all(&buf).is_err() {
+                    if let Some(sent_at) = keepalive_sent_at {
+                        if sent_at.elapsed() >= read_timeout {
                             ERROR_LOG.log(
-                                "[diag-timing] reader thread: pong_writer.write_all failed, exiting"
+                                "[diag-timing] reader thread: keepalive timed out, exiting"
                                     .to_string(),
                             );
                             break;
                         }
-                    } else {
-                        ERROR_LOG.log(
-                            "[diag-timing] reader thread: write_authority_transport_frame(Ping) failed, exiting"
-                                .to_string(),
-                        );
-                        break;
+                        continue;
+                    }
+                    if last_received.elapsed() >= read_timeout {
+                        let mut buf = Vec::new();
+                        if let Err(error) = write_authority_transport_frame(
+                            &mut buf,
+                            &AuthorityTransportFrame::Ping,
+                        ) {
+                            ERROR_LOG.log(format!(
+                                "[diag-timing] reader thread: encode Ping failed, exiting: {error}"
+                            ));
+                            break;
+                        }
+                        if let Err(error) = pong_writer.write_all(&buf) {
+                            ERROR_LOG.log(format!(
+                                "[diag-timing] reader thread: Ping write failed, exiting: {error}"
+                            ));
+                            break;
+                        }
+                        keepalive_sent_at = Some(Instant::now());
                     }
                 }
                 Err(ref e) => {

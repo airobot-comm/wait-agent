@@ -1,6 +1,8 @@
 use crate::application::target_registry_service::{TargetCatalogGateway, TargetRegistryService};
 use crate::cli::RemoteNetworkConfig;
-use crate::domain::session_catalog::ManagedSessionRecord;
+use crate::domain::session_catalog::{
+    ManagedSessionAddress, ManagedSessionRecord, ManagedSessionTaskState, SessionAvailability,
+};
 use crate::infra::remote_protocol::{
     ControlPlanePayload, CreateSessionAcceptedPayload, CreateSessionRejectedPayload,
     CreateSessionRequestPayload, NodeSessionChannel, NodeSessionEnvelope, ProtocolEnvelope,
@@ -16,12 +18,9 @@ use std::fmt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -167,16 +166,12 @@ pub struct RemoteSessionCreationRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSessionCreationConfig {
     pub accept_timeout: Duration,
-    pub catalog_timeout: Duration,
-    pub catalog_poll_interval: Duration,
 }
 
 impl Default for RemoteSessionCreationConfig {
     fn default() -> Self {
         Self {
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
-            catalog_timeout: DEFAULT_CATALOG_TIMEOUT,
-            catalog_poll_interval: DEFAULT_CATALOG_POLL_INTERVAL,
         }
     }
 }
@@ -255,36 +250,27 @@ where
             }
         };
 
-        self.wait_for_catalog_target(&request.authority_node_id, &accepted)
+        self.resolve_accepted_target(&request, &accepted)
     }
 
-    fn wait_for_catalog_target(
+    fn resolve_accepted_target(
         &self,
-        authority_node_id: &str,
+        request: &RemoteSessionCreationRequest,
         accepted: &CreateSessionAcceptedPayload,
     ) -> Result<ManagedSessionRecord, RemoteSessionCreationError> {
-        let deadline = Instant::now() + self.config.catalog_timeout;
-        loop {
-            let targets = self
-                .catalog
-                .list_targets_on_authority(authority_node_id)
-                .map_err(|error| RemoteSessionCreationError::Catalog(error.to_string()))?;
-            if let Some(target) = targets.into_iter().find(|target| {
-                target.address.session_id() == accepted.session_id
-                    || target.address.id().as_str() == accepted.target_id
-                    || target.address.qualified_target() == accepted.target_id
-            }) {
-                return Ok(target);
-            }
-            if Instant::now() >= deadline {
-                return Err(RemoteSessionCreationError::CatalogTimeout {
-                    authority_node_id: authority_node_id.to_string(),
-                    session_id: accepted.session_id.clone(),
-                    target_id: accepted.target_id.clone(),
-                });
-            }
-            thread::sleep(self.config.catalog_poll_interval);
+        let targets = self
+            .catalog
+            .list_targets_on_authority(&request.authority_node_id)
+            .map_err(|error| RemoteSessionCreationError::Catalog(error.to_string()))?;
+        if let Some(target) = targets.into_iter().find(|target| {
+            target.address.session_id() == accepted.session_id
+                || target.address.id().as_str() == accepted.target_id
+                || target.address.qualified_target() == accepted.target_id
+        }) {
+            return Ok(target);
         }
+
+        Ok(accepted_target_record(request, accepted))
     }
 }
 
@@ -292,36 +278,29 @@ where
 pub enum RemoteSessionCreationError {
     InvalidRequest(String),
     Transport(String),
-    Rejected {
-        code: &'static str,
-        message: String,
-    },
+    Rejected { code: &'static str, message: String },
     Protocol(String),
     Catalog(String),
-    CatalogTimeout {
-        authority_node_id: String,
-        session_id: String,
-        target_id: String,
-    },
 }
 
 impl fmt::Display for RemoteSessionCreationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRequest(message) => write!(f, "invalid remote session creation request: {message}"),
-            Self::Transport(message) => write!(f, "remote session creation transport failed: {message}"),
+            Self::InvalidRequest(message) => {
+                write!(f, "invalid remote session creation request: {message}")
+            }
+            Self::Transport(message) => {
+                write!(f, "remote session creation transport failed: {message}")
+            }
             Self::Rejected { code, message } => {
                 write!(f, "remote session creation rejected ({code}): {message}")
             }
-            Self::Protocol(message) => write!(f, "remote session creation protocol error: {message}"),
-            Self::Catalog(message) => write!(f, "remote session creation catalog lookup failed: {message}"),
-            Self::CatalogTimeout {
-                authority_node_id,
-                session_id,
-                target_id,
-            } => write!(
+            Self::Protocol(message) => {
+                write!(f, "remote session creation protocol error: {message}")
+            }
+            Self::Catalog(message) => write!(
                 f,
-                "remote session `{authority_node_id}:{session_id}` accepted as `{target_id}` but did not appear in the catalog before timeout"
+                "remote session creation catalog lookup failed: {message}"
             ),
         }
     }
@@ -340,6 +319,32 @@ fn next_request_id() -> String {
     let millis = now_millis();
     let seq = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     format!("create-session-{}-{millis}-{seq}", std::process::id())
+}
+
+fn accepted_target_record(
+    request: &RemoteSessionCreationRequest,
+    accepted: &CreateSessionAcceptedPayload,
+) -> ManagedSessionRecord {
+    ManagedSessionRecord {
+        address: ManagedSessionAddress::remote_peer(
+            request.authority_node_id.clone(),
+            accepted.session_id.clone(),
+        ),
+        selector: Some(format!(
+            "{}:{}",
+            request.authority_node_id, accepted.session_id
+        )),
+        availability: SessionAvailability::Online,
+        workspace_dir: request.cwd_hint.clone(),
+        workspace_key: Some(accepted.session_id.clone()),
+        session_role: Some(crate::domain::workspace::WorkspaceSessionRole::TargetHost),
+        opened_by: Vec::new(),
+        attached_clients: 0,
+        window_count: 1,
+        command_name: Some("bash".to_string()),
+        current_path: request.cwd_hint.clone(),
+        task_state: ManagedSessionTaskState::Input,
+    }
 }
 
 #[cfg(test)]
@@ -404,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn create_session_waits_for_catalog_convergence_after_acceptance() {
+    fn create_session_prefers_catalog_target_when_it_is_already_published() {
         let requests = Rc::new(RefCell::new(Vec::new()));
         let transport = FakeTransport {
             requests: requests.clone(),
@@ -416,17 +421,12 @@ mod tests {
         };
         let catalog = FakeCatalog {
             calls: Rc::new(RefCell::new(0)),
-            targets_by_call: Rc::new(RefCell::new(vec![
-                vec![remote_target("peer-a", "session-1")],
-                Vec::new(),
-            ])),
+            targets_by_call: Rc::new(RefCell::new(vec![vec![remote_target(
+                "peer-a",
+                "session-1",
+            )]])),
         };
-        let service = RemoteSessionCreationService::new(transport, catalog.clone()).with_config(
-            RemoteSessionCreationConfig {
-                catalog_poll_interval: Duration::from_millis(1),
-                ..RemoteSessionCreationConfig::default()
-            },
-        );
+        let service = RemoteSessionCreationService::new(transport, catalog.clone());
 
         let created = service
             .create_session(RemoteSessionCreationRequest {
@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(created.address.session_id(), "session-1");
         assert_eq!(requests.borrow()[0].authority_node_id, "peer-a");
         assert_eq!(requests.borrow()[0].cwd_hint.as_deref(), Some("/tmp/demo"));
-        assert_eq!(*catalog.calls.borrow(), 2);
+        assert_eq!(*catalog.calls.borrow(), 1);
     }
 
     #[test]
@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn create_session_times_out_when_catalog_never_publishes_target() {
+    fn create_session_returns_accepted_target_before_catalog_converges() {
         let service = RemoteSessionCreationService::new(
             FakeTransport {
                 requests: Rc::new(RefCell::new(Vec::new())),
@@ -497,24 +497,25 @@ mod tests {
             },
         )
         .with_config(RemoteSessionCreationConfig {
-            catalog_timeout: Duration::from_millis(1),
-            catalog_poll_interval: Duration::from_millis(1),
             ..RemoteSessionCreationConfig::default()
         });
 
-        let error = service
+        let created = service
             .create_session(RemoteSessionCreationRequest {
                 authority_node_id: "peer-a".to_string(),
-                cwd_hint: None,
+                cwd_hint: Some(PathBuf::from("/tmp/demo")),
                 cols: 80,
                 rows: 24,
             })
-            .expect_err("missing catalog target should time out");
+            .expect("accepted session should be usable before catalog convergence");
 
-        assert!(matches!(
-            error,
-            RemoteSessionCreationError::CatalogTimeout { .. }
-        ));
+        assert_eq!(created.address.qualified_target(), "peer-a:session-1");
+        assert_eq!(
+            created.address.id().as_str(),
+            "remote-peer:peer-a:session-1"
+        );
+        assert_eq!(created.current_path, Some(PathBuf::from("/tmp/demo")));
+        assert_eq!(created.availability, SessionAvailability::Online);
     }
 
     fn remote_target(authority_id: &str, session_id: &str) -> ManagedSessionRecord {
