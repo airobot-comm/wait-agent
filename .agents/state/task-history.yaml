@@ -12,57 +12,39 @@ hot_history_policy:
     - repeated in_progress lifecycle snapshots for older tasks
     - long-tail historical records that are not shaping the active queue
 history:
-  - task_id: task.t5-08c4d3b
+  - task_id: task.remote-exit-latency-1
     status: in_progress
-    summary: with backend-scoped export and lifecycle continuity now validated, active work moves first to explicit session-scoped remote mirror open or close protocol plus server-owned per-session mirror-route ownership, because opened remote sessions still fall back to placeholder state without that contract
+    summary: active work moves to acknowledged local catalog changed notify for the remote session sync owner so WaitAgent-managed remote session exits can wake sync immediately instead of waiting for the 500ms periodic catalog diff
     source_of_truth:
       file: .agents/tasks/current.yaml
       reference: status
-  - task_id: task.t5-08c4d3a
+  - task_id: task.remote-create-9f-acceptance
     status: done
-    summary: the missing session-scoped remote live-mirror design is now explicit: protocol additions, server-side per-session mirror ownership, PTY-owner lifecycle, bootstrap replay, and final implementation slices are all fixed in one governing design document
-    source_of_truth:
-      file: .agents/tasks/queued/task.t5-08c4d3a.yaml
-      reference: status
-  - task_id: task.t5-08c4d2
-    status: done
-    summary: backend-scoped remote lifecycle is now continuous on the runtime-only path: public ingress moved onto a detached socket-scoped sidecar, hidden pane target catalogs bind to their explicit workspace socket instead of ambient `TMUX`, and manual connect plus detach plus reattach validation now preserves one live remote row without duplicate replay
-    source_of_truth:
-      file: .agents/tasks/queued/task.t5-08c4d2.yaml
-      reference: status
-  - task_id: task.t5-08c4d1
-    status: done
-    summary: outbound remote session publication is now backend-scoped: `workspace` and `attach` start session sync only after resolving the active socket, session sync enumerates only that socket, and only target-host sessions are exported so workspace chrome and same-machine unrelated backends no longer leak into the remote catalog
-    source_of_truth:
-      file: .agents/tasks/queued/task.t5-08c4d1.yaml
-      reference: status
-  - task_id: task.t5-08c4d3c
-    status: done
-    summary: PTY-owner session mirror lifecycle and reuse is fully implemented and verified — MirrorState tracks active/inactive, repeated opens reuse the active mirror, close tears down cleanly, all tests pass
+    summary: corrected Ctrl-W and Ctrl-S behavior is accepted by user validation, covering first connect, existing endpoint session creation, selected remote Ctrl-S creation, and the no-direct-dial design boundary
     source_of_truth:
       file: .agents/tasks/backlog.yaml
       reference: next
-  - task_id: task.t5-08c4d3d
+  - task_id: task.remote-create-9e-daemon-parity
     status: done
-    summary: bootstrap replay and live remote output are bound into visible parity — RemoteObserverRuntime handles begin_bootstrap/apply_bootstrap_chunk/apply_bootstrap_complete/apply_target_output, emit_bootstrap captures and sends screen chunks, cross-host acceptance is code-complete with full test coverage
+    summary: __remote-daemon parity is accepted as part of the corrected Ctrl-W flow; SSH bootstrap default-session publication now matches the manual waitagent --connect contract from the task design
     source_of_truth:
       file: .agents/tasks/backlog.yaml
       reference: next
-  - task_id: task.t5-08c3
-    status: done
-    summary: remote authority and observer traffic now carry explicit `session_id` end to end, server fanout state is keyed by session instead of publication-centric target ownership, `attachment_id` remains only the session-local observer handle, and grpc plus local control-plane bridges preserve `target_id` only as the catalog-facing qualified remote target identity
+  - task_id: task.remote-exit-latency-2
+    status: ready
+    summary: next slice will wire WaitAgent-managed target lifecycle paths to the acknowledged notify and remove normal-path dependence on the 500ms sync poll
     source_of_truth:
-      file: .agents/tasks/queued/task.t5-08c3.yaml
-      reference: status
-  - task_id: task.t5-08a3
-    status: done
-    summary: the remote render path already has an accepted replay baseline: the server owns a bounded per-target replay window of ordered target output, new observers bootstrap by replaying that stream in order before joining the live tail, reconnect recovery is reopen-based, and truncation is explicit
+      file: .agents/tasks/backlog.yaml
+      reference: next
+  - task_id: task.remote-exit-latency-3
+    status: ready
+    summary: later slice will replace TargetExited hot-path all-socket tmux discovery with a live workspace socket registry
     source_of_truth:
-      file: .agents/tasks/queued/task.t5-08a3.yaml
-      reference: status
-  - task_id: task.t5-08a
-    status: done
-    summary: the accepted production ingress path already supports real cross-host node sessions through repo-owned gRPC transport and ingress runtimes, so current live-mirror work must build on that transport boundary rather than introducing a parallel path
+      file: .agents/tasks/backlog.yaml
+      reference: next
+  - task_id: task.remote-exit-latency-4
+    status: ready
+    summary: final slice will validate end-to-end remote session exit latency and remove temporary diagnostics that are no longer needed
     source_of_truth:
-      file: .agents/tasks/queued/task.t5-08a.yaml
-      reference: status
+      file: .agents/tasks/backlog.yaml
+      reference: next

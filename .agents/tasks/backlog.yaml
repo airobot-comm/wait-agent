@@ -220,7 +220,7 @@ next:
     status: done
   - id: task.remote-exit-latency-1
     title: add acknowledged local catalog notify to the remote session sync event loop
-    status: ready
+    status: in_progress
   - id: task.remote-exit-latency-2
     title: wire WaitAgent-managed target lifecycle exits to session sync notify
     status: ready
@@ -467,7 +467,7 @@ next:
         activate it.
   - id: task.remote-create-9e-daemon-parity
     title: verify and fix __remote-daemon parity with manual waitagent --connect default session publication
-    status: ready
+    status: done
     design_ref:
       file: docs/remote-host-connect-and-session-creation-design.md
       section: 8.4, 16.3
@@ -477,7 +477,7 @@ next:
         default session as manual waitagent --connect while skipping TUI attach.
   - id: task.remote-create-9f-acceptance
     title: validate corrected Ctrl-W and Ctrl-S behavior across localhost and 10.1.29.130
-    status: ready
+    status: done
     design_ref:
       file: docs/remote-host-connect-and-session-creation-design.md
       section: 17

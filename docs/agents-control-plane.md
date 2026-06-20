@@ -1,8 +1,8 @@
 # WaitAgent Assistant Control Plane
 
-Version: `v1.8`  
-Status: `Active`  
-Date: `2026-04-30`
+Version: `v1.9`
+Status: `Active`
+Date: `2026-06-20`
 
 ## 1. Purpose
 
@@ -72,11 +72,11 @@ Responsibilities:
 
 ## 4. Current Default Route
 
-The current default task is `task.t5-08c4d3b`:
+The current default task is `task.remote-exit-latency-1`:
 
-> Implement explicit remote mirror open or close protocol messages and server-side session-route ownership.
+> Add acknowledged local catalog notify to the remote session sync event loop.
 
-The default prompt route is now intentionally minimal.
+The default prompt route is intentionally minimal.
 
 Assistants should load by default:
 
@@ -97,7 +97,7 @@ Those heavier files are now on-demand inputs.
 They should be loaded only when task selection, verification refresh, history
 review, or a regression investigation actually needs them.
 
-`task-history.yaml` is now a hot near-term history file, not a full project log.
+`task-history.yaml` is a hot near-term history file, not a full project log.
 It should keep only one latest-state snapshot per task for the active queue,
 its immediate predecessors, and its immediate next tasks.
 
@@ -107,12 +107,12 @@ default prompt.
 
 This keeps assistants focused on:
 
-- landing the session-scoped remote live-mirror control slice without paying
-  prompt cost for unrelated completed-task history
-- preserving the accepted local fixed-chrome activation model while real cross-host remote paths are introduced
-- avoiding remote designs that assume server-owned remote PTYs, a second console UX contract, or resurrected auto-switch behavior
-- keeping phase-2 work anchored on the current explicit completion queue
-  `task.t5-08c4d3b -> task.t5-08c4d3c -> task.t5-08c4d3d`
+- landing acknowledged local catalog notification without bypassing the unified
+  remote session sync owner event loop
+- preserving corrected Ctrl-W and Ctrl-S creation semantics while improving
+  remote session exit responsiveness
+- keeping exit-latency work anchored on the accepted queue
+  `task.remote-exit-latency-1 -> task.remote-exit-latency-2 -> task.remote-exit-latency-3 -> task.remote-exit-latency-4`
 
 ## 5. Maintenance Rules
 

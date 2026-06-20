@@ -1,13 +1,13 @@
 kind: state
 version: 1
-current_task: task.remote-create-2-sidebar-selection-state
+current_task: task.remote-exit-latency-1
 focus_statement: >
-  task.remote-create-1-ui-keys is complete: Ctrl-N remains local-only, Prefix-c
-  remains a hidden local alias outside primary UI copy, and Ctrl-W/Ctrl-S hidden
-  entrypoints plus bindings are present with explicit first-slice placeholders.
-  Current focus is task.remote-create-2-sidebar-selection-state: persist the
-  sidebar selected target in workspace-scoped tmux state for later Ctrl-S remote
-  endpoint resolution.
+  task.remote-create-9e-daemon-parity and task.remote-create-9f-acceptance are
+  complete after user acceptance of the corrected Ctrl-W and Ctrl-S remote-host
+  workflows. Current focus is task.remote-exit-latency-1: add an acknowledged
+  local catalog changed notify into the remote session sync owner event loop so
+  WaitAgent-managed remote session exits no longer wait for the normal 500ms
+  catalog sync interval.
 last_updated_from:
   file: .agents/tasks/backlog.yaml
-  reference: task.remote-create-2-sidebar-selection-state
+  reference: task.remote-exit-latency-1

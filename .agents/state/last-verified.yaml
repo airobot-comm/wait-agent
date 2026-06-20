@@ -1,7 +1,13 @@
 kind: state
 version: 1
-last_updated_from: task.t5-08c4d runtime-only remote catalog cleanup and owner lifecycle verification refreshed on 2026-05-02
+last_updated_from: task.remote-create-9e/task.remote-create-9f user acceptance refreshed on 2026-06-20
 checks:
+  - id: remote-create-9f-user-acceptance-ctrl-w-ctrl-s
+    command: manual user acceptance on 2026-06-20: corrected Ctrl-W and Ctrl-S remote-host workflows are accepted, including first Ctrl-W default-session activation, repeated Ctrl-W or existing endpoint session creation, Ctrl-S creation on selected remote session, and no reintroduction of direct server-to-remote create-session dialing
+    status: pass
+  - id: remote-create-9e-user-acceptance-daemon-parity
+    command: manual user acceptance on 2026-06-20: __remote-daemon behavior is accepted as equivalent to manual waitagent --connect default-session publication for the corrected Ctrl-W first-connect path
+    status: pass
   - id: t5-08c4d2-cargo-test-remote-node-ingress-server-runtime
     command: cargo test remote_node_ingress_server_runtime -- --nocapture after moving public remote ingress onto a backend-scoped detached sidecar and keeping its socket-scoped projection logic explicit
     status: pass

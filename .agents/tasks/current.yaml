@@ -1,37 +1,40 @@
-id: task.remote-create-9e-daemon-parity
+id: task.remote-exit-latency-1
 kind: task
 version: 1
-title: verify and fix __remote-daemon parity with manual waitagent --connect default session publication
+title: add acknowledged local catalog notify to the remote session sync event loop
 status: in_progress
 priority: high
 design_ref:
-  doc: docs/remote-host-connect-and-session-creation-design.md
+  doc: docs/remote-session-exit-latency-design.md
   why:
-    - Accepted design v1.2 requires __remote-daemon to be only a no-TTY startup mode that publishes the same default session as manual waitagent --connect.
+    - Accepted design requires WaitAgent-managed local target lifecycle changes to wake remote session sync through an acknowledged local IPC event instead of waiting for the 500ms periodic catalog diff.
 source_of_truth:
   file: .agents/tasks/backlog.yaml
   reference: next
 depends_on:
-  - task.remote-create-9b-remove-direct-dial
-  - task.remote-create-9c-owner-create-session-routing
-  - task.remote-create-9d-ctrl-w-first-connect
+  - task.remote-create-9f-acceptance
 
 linked_primitives:
   - primitive.verification-refresh
   - primitive.task-board-sync
+
 done_criteria:
-  - __remote-daemon starts the remote runtime without TUI attach and publishes a default session equivalent to manual waitagent --connect.
-  - First Ctrl-W to an unconnected endpoint activates that default published session without creating an extra session.
+  - Session sync owner accepts a LocalCatalogChanged event through a local IPC or hidden runtime boundary.
+  - The notifier waits for an owner acknowledgement before returning success.
+  - Missing owner socket handling ensures the owner is started and retries notify once without mutating remote catalog state directly.
+  - sync_local_sessions remains the only producer of TargetPublished and TargetExited diffs.
 verification:
   - cargo check
-  - cargo test remote_host -- --test-threads=1
   - cargo test remote_node_session_sync_runtime -- --test-threads=1
-  - manual: compare manual waitagent --connect and __remote-daemon publication behavior
+  - targeted test: local catalog notify wakes sync owner and receives acknowledgement
 
 touched_paths:
-  - src/runtime/workspace/workspace_command_runtime.rs
-  - src/runtime/remote_host/ssh_remote_host_bootstrapper.rs
   - src/runtime/remote_node/remote_node_session_sync_runtime.rs
+  - src/command/dispatch.rs
+  - src/cli.rs
+  - src/infra/tmux_backend.rs
 
 notes:
-  - Direct server-to-remote create-session dialing has been removed; do not reintroduce it for daemon parity.
+  - Do not reintroduce periodic polling as the normal low-latency path.
+  - Do not add durable event persistence in this slice.
+  - The local notify is only a wake; catalog diff remains authoritative.

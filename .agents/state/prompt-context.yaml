@@ -34,29 +34,20 @@ completed_context_policy:
     - current focus state
     - compact predecessor summaries from this file
 completed_task_compact_summaries:
-  - task_id: task.t5-08c4d2
-    why_it_matters_now: backend-scoped detach or reattach continuity is already validated, so current work must not reopen owner-lifecycle semantics while adding live-mirror control
+  - task_id: task.remote-create-9f-acceptance
+    why_it_matters_now: corrected Ctrl-W and Ctrl-S behavior has user acceptance, so remote exit latency work should not reopen remote creation semantics while improving exit responsiveness
     load_full_history_only_if:
-      - remote mirror work appears to break detach or reattach continuity
-      - owner-side lifecycle ownership is being modified directly
-  - task_id: task.t5-08c4d1
-    why_it_matters_now: outbound remote publication is already constrained to backend-owned target-host sessions, so current mirror work can assume remote rows represent real publishable sessions rather than helper chrome
+      - a regression suggests Ctrl-W first connect, repeated Ctrl-W, or Ctrl-S no longer creates or activates the expected remote session
+      - remote session exit latency changes touch remote session creation or activation code
+  - task_id: task.remote-create-9e-daemon-parity
+    why_it_matters_now: __remote-daemon parity with manual waitagent --connect is accepted, so the remote default-session publication path is treated as stable while exit-latency work focuses on session sync wakeup and publication refresh cost
     load_full_history_only_if:
-      - a new bug suggests helper sessions are leaking into remote mirror routing
-      - session identity assumptions become unclear
-  - task_id: task.t5-08c3
-    why_it_matters_now: routing is already session-scoped and attachment is observer scope only; current mirror work must preserve that contract
+      - remote daemon startup or default-session publication is modified
+      - first Ctrl-W to an unconnected endpoint stops activating the default published session
+  - task_id: task.remote-exit-latency-1
+    why_it_matters_now: active task; it adds acknowledged local catalog changed notify into the remote session sync event loop without changing catalog diff authority
     load_full_history_only_if:
-      - the implementation needs exact prior routing invariants
-      - a regression suggests attachment is accidentally being used as a session key again
-  - task_id: task.t5-08a3
-    why_it_matters_now: replay and reconnect policy is already designed; current work only needs to apply that policy on the real live-mirror path
-    load_full_history_only_if:
-      - bootstrap replay encoding or reconnect replay semantics are being changed
-  - task_id: task.t5-08a
-    why_it_matters_now: real cross-host ingress already exists, so current work should build on the accepted gRPC ingress rather than inventing a parallel transport path
-    load_full_history_only_if:
-      - ingress ownership or transport boundaries are being reconsidered
+      - local notify delivery or session sync owner ownership becomes unclear
 load_heavy_state_only_when:
   task_history:
     file: .agents/state/task-history.yaml

@@ -1,8 +1,8 @@
 # WaitAgent Execution Status Board
 
-Version: `v1.35`  
-Status: `Active`  
-Date: `2026-05-02`
+Version: `v1.36`
+Status: `Active`
+Date: `2026-06-20`
 
 ## 1. Purpose
 
@@ -35,22 +35,15 @@ Current phase:
 
 Current gate:
 
-- `task.t5-08c4d3b` add explicit session-scoped remote live-mirror control so opened remote sessions stop falling back to placeholder-only state
+- `task.remote-exit-latency-1` add acknowledged local catalog notify so WaitAgent-managed remote session exits no longer wait for the periodic session-sync interval
 
 Why this is the current gate:
 
-- the shared transport-agnostic target registry, control-plane routing, and manual-only server-console model are already in place
-- the dedicated remote node connection architecture is now explicit, including the accepted node-scoped long-connection, bounded backpressure, and reconnect ownership model
-- the node-session proto and RPC contract are now explicit in the protocol doc, including the accepted gRPC service shape, envelope, versioning, status mapping, and reconnect baseline
-- the production trust model, dialing direction, duplicate-session collapse, and canonical ownership policy are now explicit in the remote-node architecture doc
-- the CLI-first network entry contract is now explicit too: remote networking must move off environment-variable startup knobs and onto public `--port` plus `--connect` arguments, with default listener bind `0.0.0.0` and default port `7474`
-- the render bootstrap, replay, and observer catch-up policy is now explicit too, so the remaining blocker is no longer transport or ownership design drift but the final visible render binding and end-to-end product validation
-- the first production cross-host ingress path is now landed through the repo-owned gRPC transport and ingress boundary
-- shared live node-session ownership, disconnect-to-offline projection, and reconnect ownership are now centralized behind the node-session owner runtime
-- the file-backed remote sidebar source has now been removed from the accepted visible-catalog path
-- backend-scoped export and detach or reattach continuity work are now closed enough in substance to stop being the product blocker
-- the latest cross-host review exposed the remaining product gap instead: remote session rows and remote activation exist, but the opened remote surface still lacks an explicit session-scoped live-mirror lifecycle, so real cross-host opens can fall back to placeholder-only state instead of showing the client session's actual screen
-- that makes the current gate the missing live-mirror contract itself: explicit mirror open or close protocol, server-side per-session mirror ownership, PTY-owner mirror lifecycle, and visible first-screen parity on the accepted `--port` plus `--connect` path
+- corrected Ctrl-W and Ctrl-S remote-host creation behavior is accepted by user validation
+- `__remote-daemon` parity with manual `waitagent --connect` default-session publication is accepted as part of that corrected flow
+- the remaining user-visible remote workflow issue is exit responsiveness: after `exit` in a remote session, the sidebar item can disappear noticeably later than expected
+- the accepted latency design identifies two concrete hot-path costs: waiting up to `500ms` for periodic remote session sync and scanning all WaitAgent tmux sockets on each `TargetExited`
+- the current implementation gate is the first bounded slice: add an acknowledged local catalog changed notify into the remote session sync owner event loop without changing catalog-diff authority, adding durable persistence, or bypassing the unified runtime event model
 
 ## 3. Current Snapshot
 
@@ -95,7 +88,7 @@ Project status at a glance:
 - the latest cross-host validation attempt also exposed that `task.t5-08c4d3` was too coarse: it mixed protocol gap, PTY-owner lifecycle gap, visible-bootstrap gap, and final acceptance into one umbrella even though the opened remote session still lacked a complete live-mirror design
 - that umbrella is now split as `task.t5-08c4d3a -> task.t5-08c4d3d`, with the design now explicit in `docs/remote-live-mirror-design.md`
 - `task.t5-08c4d3a` is now closed in substance: the accepted session-scoped live-mirror design, protocol additions, bootstrap rule, and bounded implementation split are explicit
-- `task.t5-08c4d3b` is now the active gate: the protocol and server runtime must gain explicit mirror open or close control plus per-session mirror-route ownership before further cross-host UI validation can be trusted
+- corrected Ctrl-W and Ctrl-S remote-host creation slices through `task.remote-create-9f-acceptance` are accepted by user validation; active work has moved to `task.remote-exit-latency-1` for acknowledged session-sync wakeup on WaitAgent-managed exits
 - the dedicated server-console runtime now carries explicit focus and selection state while waiting attention stays visible through per-session state only
 - a dedicated `remote_main_slot_runtime` boundary now exists: the main-slot remote branch can derive console identity plus viewport size and turn remote activation into routed control-plane messages against an explicit transport sink, while remote render-path work remains the next gap
 - remote control-plane fanout is now resolved to concrete per-node deliveries before the sink boundary, so future transport code can send node-bound messages directly instead of reinterpreting internal broadcast destinations
@@ -189,9 +182,9 @@ Execution tracks at human-summary level:
 
 Current focus:
 
-- add explicit session-scoped live-mirror control on the accepted remote path so opening a remote session yields the client session's real visible screen rather than placeholder-only transport state
-- close the three real remote Codex fidelity defects now confirmed in end-to-end use: application-cursor-aware remote input forwarding, reopen-safe remote terminal bootstrap parity, and prompt command-name freshness for remote sidebar rows
-- close the SSH-parity raw PTY optimization queue now captured in `docs/raw-pty-tunnel-design.md`: local input must not block on transport writes, the authority side should stop using FIFO/output-pump bridging as the normal data plane, raw PTY frames should be lightweight, authority bridge discovery should become event-driven, and remote attach should reduce tmux bootstrap capture cost
+- add acknowledged local catalog changed notify to the remote session sync owner event loop, preserving catalog diff as the only producer of `TargetPublished` and `TargetExited`
+- keep Ctrl-W/Ctrl-S creation semantics stable while improving the post-`exit` visible disappearance latency for remote session rows
+- after notify lands, continue the accepted remote-exit-latency queue: wire WaitAgent-managed lifecycle paths to notify, replace hot-path all-socket tmux discovery with a live workspace socket registry, then validate E2E latency and remove temporary diagnostics
 
 Accepted local architecture direction:
 
@@ -217,15 +210,10 @@ Priority rule:
 
 Remaining remote queue for phase completion:
 
-1. `task.t5-08c4d3b` Implement explicit remote mirror open or close protocol messages and server-side session-route ownership
-2. `task.t5-08c4d3c` Implement PTY-owner session mirror lifecycle and reuse on the connected client node
-3. `task.t5-08c4d3d` Bind bootstrap replay plus live output into visible parity and close cross-host acceptance
-4. `task.t5-08c4d3e` Decouple local raw PTY input from synchronous transport writes
-5. `task.t5-08c4d3f` Replace FIFO and output-pump bridging with direct remote PTY ownership
-6. `task.t5-08c4d3g` Introduce a lightweight raw PTY authority frame path
-7. `task.t5-08c4d3h` Make authority bridge discovery event-driven
-8. `task.t5-08c4d3i` Reduce remote attach bootstrap capture cost
-9. `T3-07` Implement narrow-terminal compaction rules for the fixed-chrome workspace layout only if acceptance evidence proves compact layout is blocking
+1. `task.remote-exit-latency-1` Add acknowledged local catalog notify to the remote session sync event loop
+2. `task.remote-exit-latency-2` Wire WaitAgent-managed target lifecycle exits to session sync notify
+3. `task.remote-exit-latency-3` Replace `TargetExited` hot-path tmux socket scan with live workspace socket registry
+4. `task.remote-exit-latency-4` Validate remote session exit latency end to end and clean temporary diagnostics
 
 The exact machine ordering for that queue lives in `.agents/tasks/backlog.yaml`.
 
