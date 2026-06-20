@@ -5,6 +5,7 @@ use std::str;
 const WAITAGENT_SIDEBAR_PANE_TITLE: &str = "waitagent-sidebar";
 const WAITAGENT_FOOTER_PANE_TITLE: &str = "waitagent-footer";
 const WAITAGENT_MAIN_PANE_OPTION: &str = "@waitagent_main_pane_id";
+const WAITAGENT_PANE_TARGET_SESSION_OPTION: &str = "@waitagent_target_session_name";
 
 impl EmbeddedTmuxBackend {
     pub(crate) fn target_presentation_pane_on_socket(
@@ -18,9 +19,9 @@ impl EmbeddedTmuxBackend {
             return Ok(pane);
         }
 
-        // Fallback for target sessions that have not been adopted into a
-        // workspace display slot yet.
-        Ok(TmuxPaneId::new(format!("{}:0.0", target_session_name)))
+        Err(TmuxError::new(format!(
+            "target session `{target_session_name}` on socket `{socket_name}` has no authoritative presentation pane"
+        )))
     }
 
     fn configured_target_presentation_pane_on_socket(
@@ -44,10 +45,55 @@ impl EmbeddedTmuxBackend {
             Err(error) => return Err(error),
         };
         let pane = output.stdout.trim();
-        if pane.is_empty() || !self.presentation_pane_is_live_on_socket(socket_name, pane)? {
+        if pane.is_empty() {
             return Ok(None);
         }
+        if !self.presentation_pane_is_live_on_socket(socket_name, pane)? {
+            return Err(TmuxError::new(format!(
+                "authoritative presentation pane `{pane}` for target session `{target_session_name}` on socket `{socket_name}` is not live"
+            )));
+        }
+        let pane_target_session = self
+            .pane_target_session_name_on_socket(socket_name, pane)?
+            .ok_or_else(|| {
+                TmuxError::new(format!(
+                    "authoritative presentation pane `{pane}` on socket `{socket_name}` is missing `{WAITAGENT_PANE_TARGET_SESSION_OPTION}`"
+                ))
+            })?;
+        if pane_target_session != target_session_name {
+            return Err(TmuxError::new(format!(
+                "authoritative presentation pane `{pane}` on socket `{socket_name}` belongs to target session `{pane_target_session}`, expected `{target_session_name}`"
+            )));
+        }
         Ok(Some(TmuxPaneId::new(pane)))
+    }
+
+    fn pane_target_session_name_on_socket(
+        &self,
+        socket_name: &str,
+        pane: &str,
+    ) -> Result<Option<String>, TmuxError> {
+        let socket = TmuxSocketName::new(socket_name);
+        let output = match self.run_on_socket(
+            &socket,
+            &[
+                "show-options".to_string(),
+                "-pqv".to_string(),
+                "-t".to_string(),
+                pane.to_string(),
+                WAITAGENT_PANE_TARGET_SESSION_OPTION.to_string(),
+            ],
+        ) {
+            Ok(output) => output,
+            Err(error) if error.is_command_failure() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let value = output.stdout.trim();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value.to_string()))
+        }
     }
 
     fn presentation_pane_is_live_on_socket(

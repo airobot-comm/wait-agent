@@ -128,6 +128,21 @@ impl RemoteTargetPublicationRuntime {
         node_id: &str,
         envelope: ProtocolEnvelope<ControlPlanePayload>,
     ) -> Result<(), LifecycleError> {
+        let live_workspace_sockets = self.live_workspace_socket_names()?;
+        self.apply_discovered_remote_session_envelope_for_sockets(
+            node_id,
+            envelope,
+            &live_workspace_sockets,
+        )
+    }
+
+    pub fn apply_discovered_remote_session_envelope_for_sockets(
+        &self,
+        node_id: &str,
+        envelope: ProtocolEnvelope<ControlPlanePayload>,
+        live_workspace_sockets: &[String],
+    ) -> Result<(), LifecycleError> {
+        let t_total = std::time::Instant::now();
         let remote_session = discovered_remote_session_from_envelope(node_id, &envelope)?;
         if let Some(session) = remote_session.published_session {
             if is_publishable_discovered_remote_session(&session) {
@@ -135,11 +150,38 @@ impl RemoteTargetPublicationRuntime {
             }
         }
         if let Some((authority_id, transport_session_id)) = remote_session.exited_session {
+            ERROR_LOG.log(format!(
+                "[diag-exit] publication_apply_exit_start node={} authority={} session={} stage=publication_apply",
+                node_id, authority_id, transport_session_id
+            ));
+            let t_remove = std::time::Instant::now();
             self.signal_remote_runtime_owner_remove(node_id, &authority_id, &transport_session_id)?;
+            ERROR_LOG.log(format!(
+                "[diag-exit] publication_apply_remove node={} authority={} session={} elapsed={:?} total={:?} stage=publication_apply",
+                node_id,
+                authority_id,
+                transport_session_id,
+                t_remove.elapsed(),
+                t_total.elapsed()
+            ));
         }
-        let live_workspace_sockets = self.live_workspace_socket_names()?;
+        ERROR_LOG.log(format!(
+            "[diag-exit] publication_apply_live_sockets node={} count={} elapsed={:?} total={:?} stage=publication_apply",
+            node_id,
+            live_workspace_sockets.len(),
+            std::time::Duration::ZERO,
+            t_total.elapsed()
+        ));
         if !live_workspace_sockets.is_empty() {
-            self.refresh_live_workspaces(&live_workspace_sockets)?;
+            let t_refresh = std::time::Instant::now();
+            self.refresh_live_workspaces(live_workspace_sockets)?;
+            ERROR_LOG.log(format!(
+                "[diag-exit] publication_apply_refresh node={} sockets={:?} elapsed={:?} total={:?} stage=publication_apply",
+                node_id,
+                live_workspace_sockets,
+                t_refresh.elapsed(),
+                t_total.elapsed()
+            ));
         }
         Ok(())
     }
@@ -216,8 +258,19 @@ impl RemoteTargetPublicationRuntime {
         authority_id: &str,
         transport_session_id: &str,
     ) -> Result<(), LifecycleError> {
-        self.remote_runtime_owner
-            .remove_session(node_id, authority_id, transport_session_id)
+        let t_remove = std::time::Instant::now();
+        let result =
+            self.remote_runtime_owner
+                .remove_session(node_id, authority_id, transport_session_id);
+        ERROR_LOG.log(format!(
+            "[diag-exit] remote_runtime_owner_remove node={} authority={} session={} ok={} elapsed={:?} stage=publication_apply",
+            node_id,
+            authority_id,
+            transport_session_id,
+            result.is_ok(),
+            t_remove.elapsed()
+        ));
+        result
     }
 
     fn signal_remote_runtime_owner_remove_node(&self, node_id: &str) -> Result<(), LifecycleError> {
@@ -249,7 +302,13 @@ impl RemoteTargetPublicationRuntime {
 
     fn refresh_live_workspaces(&self, socket_names: &[String]) -> Result<(), LifecycleError> {
         for socket_name in socket_names {
+            let t_spawn = std::time::Instant::now();
             spawn_socket_chrome_refresh(&self.current_executable, socket_name)?;
+            ERROR_LOG.log(format!(
+                "[diag-exit] publication_refresh_spawn socket={} elapsed={:?} stage=publication_apply",
+                socket_name,
+                t_spawn.elapsed()
+            ));
         }
         Ok(())
     }

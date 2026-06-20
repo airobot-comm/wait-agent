@@ -9,6 +9,7 @@ use crate::runtime::event_driven_chrome_runtime::EventDrivenChromeRenderUpdate;
 use crate::runtime::event_driven_ui_pane_runtime::{
     EventDrivenSidebarInputOutcome, EventDrivenUiPaneRuntime,
 };
+use std::collections::HashSet;
 use std::io;
 use std::time::Instant;
 
@@ -20,6 +21,7 @@ pub struct EventDrivenTmuxPaneRuntime<G, R = G> {
     target_registry: TargetRegistryService<R>,
     pane_runtime: EventDrivenUiPaneRuntime,
     network: RemoteNetworkConfig,
+    previous_visible_targets: HashSet<String>,
 }
 
 impl<G> EventDrivenTmuxPaneRuntime<G, G>
@@ -34,6 +36,7 @@ where
             gateway,
             pane_runtime: EventDrivenUiPaneRuntime::new(),
             network: RemoteNetworkConfig::default(),
+            previous_visible_targets: HashSet::new(),
         }
     }
 }
@@ -55,6 +58,7 @@ where
             target_registry,
             pane_runtime: EventDrivenUiPaneRuntime::new(),
             network,
+            previous_visible_targets: HashSet::new(),
         }
     }
 
@@ -173,6 +177,36 @@ where
             visible_sessions.len(),
             t_snapshot.elapsed()
         ));
+        let visible_targets = visible_sessions
+            .iter()
+            .map(|session| session.address.qualified_target())
+            .collect::<HashSet<_>>();
+        for disappeared_target in self.previous_visible_targets.difference(&visible_targets) {
+            ERROR_LOG.log(format!(
+                "[diag-exit] sidebar_item_gone target={} socket={} session={} visible={} elapsed={:?} stage=sidebar_snapshot",
+                disappeared_target,
+                command.socket_name,
+                command.session_name,
+                visible_sessions.len(),
+                t_snapshot.elapsed()
+            ));
+        }
+        if self.previous_visible_targets.is_empty() {
+            if let Some(active_target) = active_target.as_deref() {
+                let active_visible = visible_targets.contains(active_target);
+                if !active_visible {
+                    ERROR_LOG.log(format!(
+                        "[diag-exit] sidebar_item_gone target={} socket={} session={} visible={} elapsed={:?} stage=sidebar_snapshot",
+                        active_target,
+                        command.socket_name,
+                        command.session_name,
+                        visible_sessions.len(),
+                        t_snapshot.elapsed()
+                    ));
+                }
+            }
+        }
+        self.previous_visible_targets = visible_targets;
         ERROR_LOG.log(format!(
             "[diag-native] publish_session_snapshot: socket={} session={} active_target={:?} visible_sessions={} targets={:?}",
             command.socket_name,

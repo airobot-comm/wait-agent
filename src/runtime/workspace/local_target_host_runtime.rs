@@ -8,6 +8,9 @@ use crate::infra::tmux::{
     TmuxWorkspaceHandle,
 };
 use crate::lifecycle::LifecycleError;
+use crate::runtime::remote_node_session_sync_runtime::{
+    LocalCatalogChangeReason, RemoteNodeSessionSyncRuntime,
+};
 use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
 use crate::runtime::sidecar_process_runtime::spawn_waitagent_sidecar;
 use std::io;
@@ -122,23 +125,75 @@ impl LocalTargetHostRuntime {
                 .backend
                 .kill_server(&TmuxSocketName::new(&command.socket_name))
             {
-                Ok(()) => Ok(()),
-                Err(error) if error.is_command_failure() => Ok(()),
+                Ok(()) => {
+                    self.notify_session_sync_local_target_exited(
+                        &command.socket_name,
+                        &command.target_session_name,
+                    );
+                    Ok(())
+                }
+                Err(error) if error.is_command_failure() => {
+                    self.notify_session_sync_local_target_exited(
+                        &command.socket_name,
+                        &command.target_session_name,
+                    );
+                    Ok(())
+                }
                 Err(error) => Err(local_target_host_error(error)),
             };
         }
 
+        let target_session_name = command.target_session_name.clone();
         match self.backend.run_socket_command(
             &TmuxSocketName::new(&command.socket_name),
             &[
                 "kill-session".to_string(),
                 "-t".to_string(),
-                command.target_session_name,
+                target_session_name,
             ],
         ) {
-            Ok(()) => Ok(()),
-            Err(error) if error.is_command_failure() => Ok(()),
+            Ok(()) => {
+                self.notify_session_sync_local_target_exited(
+                    &command.socket_name,
+                    &command.target_session_name,
+                );
+                Ok(())
+            }
+            Err(error) if error.is_command_failure() => {
+                self.notify_session_sync_local_target_exited(
+                    &command.socket_name,
+                    &command.target_session_name,
+                );
+                Ok(())
+            }
             Err(error) => Err(local_target_host_error(error)),
+        }
+    }
+
+    fn notify_session_sync_local_target_exited(
+        &self,
+        socket_name: &str,
+        target_session_name: &str,
+    ) {
+        let t_notify = std::time::Instant::now();
+        match RemoteNodeSessionSyncRuntime::notify_local_catalog_changed(
+            socket_name,
+            &self.network,
+            LocalCatalogChangeReason::LocalTargetExited {
+                target_session_name: target_session_name.to_string(),
+            },
+        ) {
+            Ok(()) => ERROR_LOG.log(format!(
+                "[diag-exit] local_catalog_notify_acked socket={} elapsed={:?} stage=local_target_exit",
+                socket_name,
+                t_notify.elapsed()
+            )),
+            Err(error) => ERROR_LOG.log(format!(
+                "[diag-exit] local_catalog_notify_failed socket={} error={} elapsed={:?} stage=local_target_exit",
+                socket_name,
+                error,
+                t_notify.elapsed()
+            )),
         }
     }
 

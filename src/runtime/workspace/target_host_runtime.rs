@@ -16,6 +16,9 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 
+const WAITAGENT_MAIN_PANE_OPTION: &str = "@waitagent_main_pane_id";
+const WAITAGENT_PANE_TARGET_SESSION_OPTION: &str = "@waitagent_target_session_name";
+
 pub struct TargetHostRuntime {
     workspace_runtime: WorkspaceRuntime<EmbeddedTmuxBackend>,
     backend: EmbeddedTmuxBackend,
@@ -113,6 +116,26 @@ impl TargetHostRuntime {
             workspace.workspace_handle.session_name.as_str(),
             pane.as_str(),
             t_respawn.elapsed(),
+            t_total.elapsed()
+        ));
+        let t_metadata = Instant::now();
+        self.backend.set_pane_option(
+            &workspace.workspace_handle,
+            &pane,
+            WAITAGENT_PANE_TARGET_SESSION_OPTION,
+            workspace.workspace_handle.session_name.as_str(),
+        )?;
+        self.backend.set_session_option(
+            &workspace.workspace_handle,
+            WAITAGENT_MAIN_PANE_OPTION,
+            pane.as_str(),
+        )?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] target_host write_metadata socket={} session={} pane={} elapsed={:?} total={:?}",
+            workspace.workspace_handle.socket_name.as_str(),
+            workspace.workspace_handle.session_name.as_str(),
+            pane.as_str(),
+            t_metadata.elapsed(),
             t_total.elapsed()
         ));
         Ok(workspace)

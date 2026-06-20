@@ -528,6 +528,7 @@ impl RawPtyInputRoute {
             return Ok(false);
         };
         let input_seq = self.next_input_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        log_exit_submit_if_detected(&route, input_seq, &input_bytes);
         let payload = RawPtyInputPayload {
             attachment_id: route.attachment_id.clone(),
             session_id: route.session_id.clone(),
@@ -542,6 +543,29 @@ impl RawPtyInputRoute {
             .map_err(|error| RemoteSocketTransportError::new(error.to_string()))?;
         Ok(true)
     }
+}
+
+fn log_exit_submit_if_detected(route: &RawPtyInputRouteState, input_seq: u64, bytes: &[u8]) {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    let submitted = text.ends_with('\r') || text.ends_with('\n');
+    if !submitted {
+        return;
+    }
+    let command = text.trim_matches(|ch| ch == '\r' || ch == '\n').trim();
+    if command != "exit" {
+        return;
+    }
+    ERROR_LOG.log(format!(
+        "[diag-exit] input_exit_enter target={} session={} attachment={} console={} input_seq={} bytes={} stage=input_enter",
+        route.target_id,
+        route.session_id,
+        route.attachment_id,
+        route.console_id,
+        input_seq,
+        bytes.len()
+    ));
 }
 
 pub(super) fn spawn_input_thread(tx: mpsc::Sender<RemotePaneEvent>, raw_input: RawInputMode) {
@@ -654,6 +678,13 @@ pub(super) fn spawn_target_presence_watcher(
                 *guard = is_present;
             }
             if is_present != last_present {
+                ERROR_LOG.log(format!(
+                    "[diag-exit] presence_changed target={} present={} raw_present={} consecutive_misses={} stage=presence_watcher",
+                    target_id,
+                    is_present,
+                    raw_present,
+                    consecutive_misses
+                ));
                 last_present = is_present;
                 if tx
                     .send(RemotePaneEvent::TargetPresenceChanged(is_present))
@@ -768,7 +799,14 @@ pub(crate) fn apply_authority_envelope(
                 )
                 .map_err(|error| RemoteSocketTransportError::new(error.to_string()))
         }
-        ControlPlanePayload::TargetExited(_) => {
+        ControlPlanePayload::TargetExited(payload) => {
+            ERROR_LOG.log(format!(
+                "[diag-exit] authority_target_exited target={} session={} source_session={:?} sender={} stage=authority_envelope",
+                target.address.qualified_target(),
+                payload.transport_session_id,
+                payload.source_session_name,
+                envelope.sender_id
+            ));
             // Authority explicitly signalled session exit — return a
             // distinguished error so the event loop can perform a clean
             // shutdown instead of entering reconnection.

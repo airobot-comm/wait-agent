@@ -398,16 +398,8 @@ enum AuthorityOutputMessage {
     },
 }
 
-struct OutputPipeGuard<G>
-where
-    G: RemoteTargetPtyGateway,
-{
-    gateway: G,
-    socket_name: String,
+struct AuthorityPaneBinding {
     pane: TmuxPaneId,
-    owner: String,
-    ingest_socket_path: PathBuf,
-    event_socket_path: PathBuf,
 }
 
 pub struct RemoteAuthorityOutputPumpRuntime;
@@ -439,10 +431,6 @@ where
         &self,
         command: RemoteAuthorityTargetHostCommand,
     ) -> Result<(), LifecycleError> {
-        let pane = self
-            .gateway
-            .target_presentation_pane(&command.socket_name, &command.target_session_name)
-            .map_err(remote_authority_error)?;
         let authority_socket_path = self
             .publication_gateway
             .ensure_live_session_registered(
@@ -465,22 +453,8 @@ where
             bind_output_ingest_listener(&ingest_socket_path).map_err(remote_authority_error)?;
         let event_listener =
             bind_output_ingest_listener(&event_socket_path).map_err(remote_authority_error)?;
-        let pane_died_hook = remote_authority_pane_died_hook_command(
-            self.current_executable.to_string_lossy().as_ref(),
-            &event_socket_path,
-            pane.as_str(),
-        );
-        self.gateway
-            .set_pane_died_hook(&command.socket_name, &pane, &pane_died_hook)
-            .map_err(remote_authority_error)?;
-        let _output_guard = OutputPipeGuard {
-            gateway: self.gateway.clone(),
-            socket_name: command.socket_name.clone(),
-            pane: pane.clone(),
-            owner: remote_mirror_pipe_owner(&command.target_id),
-            ingest_socket_path: ingest_socket_path.clone(),
-            event_socket_path: event_socket_path.clone(),
-        };
+        let mut current_binding = None;
+        ensure_authority_pane_binding(self, &command, &mut current_binding, &event_socket_path)?;
 
         let (event_tx, event_rx) = mpsc::channel();
         let (output_tx, output_rx) =
@@ -552,6 +526,15 @@ where
                     payload,
                 )) => {
                     health.record_event();
+                    let pane = match ensure_authority_pane_binding(
+                        self,
+                        &command,
+                        &mut current_binding,
+                        &event_socket_path,
+                    ) {
+                        Ok(pane) => pane,
+                        Err(error) => break Err(error),
+                    };
                     if matches!(mirror_state, MirrorState::Active { .. }) {
                         match self
                             .gateway
@@ -650,6 +633,15 @@ where
                     payload,
                 )) => {
                     health.record_event();
+                    let pane = match ensure_authority_pane_binding(
+                        self,
+                        &command,
+                        &mut current_binding,
+                        &event_socket_path,
+                    ) {
+                        Ok(pane) => pane,
+                        Err(error) => break Err(error),
+                    };
                     if let Err(error) = self
                         .gateway
                         .send_input(&command.socket_name, &pane, &payload.input_bytes)
@@ -667,6 +659,15 @@ where
                     payload,
                 )) => {
                     health.record_event();
+                    let pane = match ensure_authority_pane_binding(
+                        self,
+                        &command,
+                        &mut current_binding,
+                        &event_socket_path,
+                    ) {
+                        Ok(pane) => pane,
+                        Err(error) => break Err(error),
+                    };
                     if let Err(error) = self
                         .gateway
                         .resize_pty(&command.socket_name, &pane, payload.cols, payload.rows)
@@ -680,6 +681,15 @@ where
                 )) => {
                     health.record_event();
                     if matches!(mirror_state, MirrorState::Active { .. }) {
+                        let pane = match ensure_authority_pane_binding(
+                            self,
+                            &command,
+                            &mut current_binding,
+                            &event_socket_path,
+                        ) {
+                            Ok(pane) => pane,
+                            Err(error) => break Err(error),
+                        };
                         if let Err(error) = deactivate_mirror(self, &command, &pane) {
                             break Err(error);
                         }
@@ -734,17 +744,24 @@ where
                 }
                 AuthorityHostEvent::PaneDied { pane_id } => {
                     health.record_event();
+                    let current_pane = current_binding
+                        .as_ref()
+                        .map(|binding| binding.pane.as_str().to_string());
                     ERROR_LOG.log(format!(
-                        "[diag-timing] target host: pane-died event pane={} target={}",
-                        pane_id, command.target_id
+                        "[diag-timing] target host: pane-died event pane={} current={:?} target={}",
+                        pane_id, current_pane, command.target_id
                     ));
-                    break Ok(());
+                    if current_pane.as_deref() == Some(pane_id.as_str()) {
+                        break Ok(());
+                    }
                 }
                 AuthorityHostEvent::TransportClosed => {
                     health.record_event();
                     if matches!(mirror_state, MirrorState::Active { .. }) {
-                        if let Err(error) = deactivate_mirror(self, &command, &pane) {
-                            break Err(error);
+                        if let Some(binding) = current_binding.as_ref() {
+                            if let Err(error) = deactivate_mirror(self, &command, &binding.pane) {
+                                break Err(error);
+                            }
                         }
                     }
                     break Ok(());
@@ -773,11 +790,16 @@ where
             .publication_gateway
             .signal_source_session_closed(&command.socket_name, &command.target_session_name);
         if matches!(mirror_state, MirrorState::Active { .. }) {
-            let _ = deactivate_mirror(self, &command, &pane);
+            if let Some(binding) = current_binding.as_ref() {
+                let _ = deactivate_mirror(self, &command, &binding.pane);
+            }
         }
+        cleanup_authority_pane_binding(self, &command, current_binding.take());
         running.store(false, Ordering::Relaxed);
         let _ = UnixStream::connect(&ingest_socket_path);
         let _ = UnixStream::connect(&event_socket_path);
+        let _ = fs::remove_file(&ingest_socket_path);
+        let _ = fs::remove_file(&event_socket_path);
         let _ = self
             .publication_gateway
             .ensure_live_session_unregistered(&command.socket_name, &command.target_session_name);
@@ -804,6 +826,79 @@ where
 pub fn run_pane_died_event(command: RemoteAuthorityPaneDiedCommand) -> Result<(), LifecycleError> {
     send_pane_died_event(&command.event_socket_path, &command.pane_id);
     Ok(())
+}
+
+fn ensure_authority_pane_binding<G, P>(
+    runtime: &RemoteAuthorityTargetHostRuntime<G, P>,
+    command: &RemoteAuthorityTargetHostCommand,
+    current_binding: &mut Option<AuthorityPaneBinding>,
+    event_socket_path: &Path,
+) -> Result<TmuxPaneId, LifecycleError>
+where
+    G: RemoteTargetPtyGateway,
+    P: RemoteAuthorityPublicationGateway,
+{
+    let pane = runtime
+        .gateway
+        .target_presentation_pane(&command.socket_name, &command.target_session_name)
+        .map_err(remote_authority_error)?;
+    if current_binding
+        .as_ref()
+        .is_some_and(|binding| binding.pane == pane)
+    {
+        return Ok(pane);
+    }
+
+    if let Some(previous) = current_binding.take() {
+        let owner = remote_mirror_pipe_owner(&command.target_id);
+        let _ = runtime.gateway.clear_output_pipe_if_owner(
+            &command.socket_name,
+            &previous.pane,
+            &owner,
+        );
+        let _ = runtime
+            .gateway
+            .clear_pane_died_hook(&command.socket_name, &previous.pane);
+    }
+
+    let pane_died_hook = remote_authority_pane_died_hook_command(
+        runtime.current_executable.to_string_lossy().as_ref(),
+        event_socket_path,
+        pane.as_str(),
+    );
+    runtime
+        .gateway
+        .set_pane_died_hook(&command.socket_name, &pane, &pane_died_hook)
+        .map_err(remote_authority_error)?;
+    ERROR_LOG.log(format!(
+        "[diag-authority-pane] bound target={} session={} socket={} pane={}",
+        command.target_id,
+        command.target_session_name,
+        command.socket_name,
+        pane.as_str()
+    ));
+    *current_binding = Some(AuthorityPaneBinding { pane: pane.clone() });
+    Ok(pane)
+}
+
+fn cleanup_authority_pane_binding<G, P>(
+    runtime: &RemoteAuthorityTargetHostRuntime<G, P>,
+    command: &RemoteAuthorityTargetHostCommand,
+    binding: Option<AuthorityPaneBinding>,
+) where
+    G: RemoteTargetPtyGateway,
+    P: RemoteAuthorityPublicationGateway,
+{
+    if let Some(binding) = binding {
+        let owner = remote_mirror_pipe_owner(&command.target_id);
+        let _ =
+            runtime
+                .gateway
+                .clear_output_pipe_if_owner(&command.socket_name, &binding.pane, &owner);
+        let _ = runtime
+            .gateway
+            .clear_pane_died_hook(&command.socket_name, &binding.pane);
+    }
 }
 
 pub(crate) fn remote_authority_target_host_args(
@@ -843,22 +938,6 @@ impl RemoteAuthorityOutputPumpRuntime {
         ));
         let ingest = command.ingest_socket_path.clone();
         pump_stdin_to_ingest_socket(&ingest, command.stream_id).map_err(remote_authority_error)
-    }
-}
-
-impl<G> Drop for OutputPipeGuard<G>
-where
-    G: RemoteTargetPtyGateway,
-{
-    fn drop(&mut self) {
-        let _ = self
-            .gateway
-            .clear_output_pipe_if_owner(&self.socket_name, &self.pane, &self.owner);
-        let _ = fs::remove_file(&self.ingest_socket_path);
-        let _ = self
-            .gateway
-            .clear_pane_died_hook(&self.socket_name, &self.pane);
-        let _ = fs::remove_file(&self.event_socket_path);
     }
 }
 

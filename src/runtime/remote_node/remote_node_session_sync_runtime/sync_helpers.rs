@@ -32,7 +32,7 @@ use crate::runtime::remote_node_session_runtime::{
 use crate::runtime::remote_node_transport_runtime::{read_client_hello, write_server_hello};
 use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -47,6 +47,44 @@ use super::{
     LIVE_AUTHORITY_SERVER_ID, SESSION_SYNC_AUTHORITY_ID, WAITAGENT_ACTIVE_TARGET_OPTION,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalCatalogChangeReason {
+    LocalTargetExited { target_session_name: String },
+}
+
+impl LocalCatalogChangeReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LocalTargetExited { .. } => "local-target-exited",
+        }
+    }
+
+    fn encode(&self) -> String {
+        match self {
+            Self::LocalTargetExited {
+                target_session_name,
+            } => format!("local-target-exited	{target_session_name}"),
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let (reason, detail) = value.split_once('\t').unwrap_or((value, ""));
+        match reason {
+            "local-target-exited" if !detail.is_empty() => Some(Self::LocalTargetExited {
+                target_session_name: detail.to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SessionSyncEvent {
+    Transport(RemoteNodeTransportEvent),
+    LocalCatalogChanged(LocalCatalogChangeReason),
+    Stop,
+}
+
 pub(super) fn run_remote_session_sync_loop<G, T, O>(
     gateway: G,
     transport: T,
@@ -54,7 +92,8 @@ pub(super) fn run_remote_session_sync_loop<G, T, O>(
     local_target_exit_observer: O,
     node_id: String,
     endpoint_uri: String,
-    poll_interval: Duration,
+    local_catalog_rx: mpsc::Receiver<LocalCatalogChangeReason>,
+    _poll_interval: Duration,
     reconnect_delay: Duration,
     stop_rx: mpsc::Receiver<()>,
 ) where
@@ -79,13 +118,13 @@ pub(super) fn run_remote_session_sync_loop<G, T, O>(
             return;
         }
 
-        let (event_tx, event_rx) = mpsc::channel();
+        let (transport_event_tx, transport_event_rx) = mpsc::channel();
         let _transport_guard = match transport.connect_outbound(
             OutboundNodeSessionRequest {
                 node_id: node_id.clone(),
                 endpoint_uri: endpoint_uri.clone(),
             },
-            event_tx,
+            transport_event_tx,
         ) {
             Ok(guard) => guard,
             Err(_) => {
@@ -101,23 +140,18 @@ pub(super) fn run_remote_session_sync_loop<G, T, O>(
         let mut authority_manager =
             SessionSyncAuthorityManager::new(network.clone(), local_target_socket_name.clone());
         let mut should_reconnect = false;
-        let mut next_sync_at = Instant::now();
 
         while !should_reconnect {
-            let wait_duration = next_sync_at.saturating_duration_since(Instant::now());
-            if let Ok(event) = event_rx.recv_timeout(wait_duration) {
-                let outcome = handle_transport_event(
-                    event,
-                    &mut active_session,
-                    &mut authority_manager,
-                    publication_runtime.as_ref(),
-                    &node_id,
-                );
-                if active_session.is_some() {
-                    next_sync_at = Instant::now();
-                }
-                should_reconnect |= outcome.should_reconnect;
-                while let Ok(event) = event_rx.try_recv() {
+            let event =
+                match recv_session_sync_event(&transport_event_rx, &local_catalog_rx, &stop_rx) {
+                    Some(event) => event,
+                    None => return,
+                };
+
+            match event {
+                SessionSyncEvent::Transport(event) => {
+                    let session_opened =
+                        matches!(event, RemoteNodeTransportEvent::SessionOpened { .. });
                     let outcome = handle_transport_event(
                         event,
                         &mut active_session,
@@ -125,42 +159,119 @@ pub(super) fn run_remote_session_sync_loop<G, T, O>(
                         publication_runtime.as_ref(),
                         &node_id,
                     );
-                    if active_session.is_some() {
-                        next_sync_at = Instant::now();
-                    }
                     should_reconnect |= outcome.should_reconnect;
+                    if session_opened {
+                        if let Some(session_handle) = active_session.as_ref() {
+                            if let Err(_) = sync_local_sessions(
+                                &gateway,
+                                &node_id,
+                                session_handle,
+                                &local_target_exit_observer,
+                                &mut synced_sessions,
+                                &mut next_message_id,
+                            ) {
+                                ERROR_LOG.log(
+                                    "[diag-sync] sync_local_sessions after SessionOpened failed, will reconnect"
+                                        .to_string(),
+                                );
+                                should_reconnect = true;
+                            }
+                        }
+                    }
+                    while let Ok(event) = transport_event_rx.try_recv() {
+                        let session_opened =
+                            matches!(event, RemoteNodeTransportEvent::SessionOpened { .. });
+                        let outcome = handle_transport_event(
+                            event,
+                            &mut active_session,
+                            &mut authority_manager,
+                            publication_runtime.as_ref(),
+                            &node_id,
+                        );
+                        should_reconnect |= outcome.should_reconnect;
+                        if session_opened {
+                            if let Some(session_handle) = active_session.as_ref() {
+                                if let Err(_) = sync_local_sessions(
+                                    &gateway,
+                                    &node_id,
+                                    session_handle,
+                                    &local_target_exit_observer,
+                                    &mut synced_sessions,
+                                    &mut next_message_id,
+                                ) {
+                                    ERROR_LOG.log(
+                                        "[diag-sync] sync_local_sessions after queued SessionOpened failed, will reconnect"
+                                            .to_string(),
+                                    );
+                                    should_reconnect = true;
+                                }
+                            }
+                        }
+                    }
                 }
+                SessionSyncEvent::LocalCatalogChanged(reason) => {
+                    ERROR_LOG.log(format!(
+                        "[diag-exit] sync_event_received reason={} stage=session_sync",
+                        reason.as_str()
+                    ));
+                    if let Some(session_handle) = active_session.as_ref() {
+                        if let Err(_) = sync_explicit_local_catalog_change(
+                            &node_id,
+                            session_handle,
+                            &reason,
+                            &mut synced_sessions,
+                            &mut next_message_id,
+                        ) {
+                            ERROR_LOG.log(
+                                "[diag-sync] explicit local catalog change sync failed, will reconnect"
+                                    .to_string(),
+                            );
+                            should_reconnect = true;
+                        }
+                        if let Err(_) = sync_local_sessions(
+                            &gateway,
+                            &node_id,
+                            session_handle,
+                            &local_target_exit_observer,
+                            &mut synced_sessions,
+                            &mut next_message_id,
+                        ) {
+                            ERROR_LOG.log(
+                                "[diag-sync] sync_local_sessions after local catalog change failed, will reconnect"
+                                    .to_string(),
+                            );
+                            should_reconnect = true;
+                        }
+                    }
+                }
+                SessionSyncEvent::Stop => return,
             }
-
-            if should_stop(&stop_rx) {
-                return;
-            }
-
-            let Some(session_handle) = active_session.as_ref() else {
-                next_sync_at = Instant::now() + poll_interval;
-                continue;
-            };
-            if Instant::now() < next_sync_at {
-                continue;
-            }
-            if let Err(_) = sync_local_sessions(
-                &gateway,
-                &node_id,
-                session_handle,
-                &local_target_exit_observer,
-                &mut synced_sessions,
-                &mut next_message_id,
-            ) {
-                ERROR_LOG.log("[diag-sync] sync_local_sessions failed, will reconnect".to_string());
-                should_reconnect = true;
-            }
-            next_sync_at = Instant::now() + poll_interval;
         }
 
         if wait_or_stop(&stop_rx, reconnect_delay) {
             return;
         }
         authority_manager.shutdown();
+    }
+}
+
+fn recv_session_sync_event(
+    transport_event_rx: &mpsc::Receiver<RemoteNodeTransportEvent>,
+    local_catalog_rx: &mpsc::Receiver<LocalCatalogChangeReason>,
+    stop_rx: &mpsc::Receiver<()>,
+) -> Option<SessionSyncEvent> {
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            return Some(SessionSyncEvent::Stop);
+        }
+        if let Ok(reason) = local_catalog_rx.try_recv() {
+            return Some(SessionSyncEvent::LocalCatalogChanged(reason));
+        }
+        match transport_event_rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(event) => return Some(SessionSyncEvent::Transport(event)),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
     }
 }
 
@@ -228,6 +339,41 @@ pub(super) fn handle_transport_event(
             }
         }
     }
+}
+
+pub(crate) fn sync_explicit_local_catalog_change(
+    node_id: &str,
+    session_handle: &RemoteNodeSessionHandle,
+    reason: &LocalCatalogChangeReason,
+    synced_sessions: &mut HashMap<String, ManagedSessionRecord>,
+    next_message_id: &mut u64,
+) -> Result<(), io::Error> {
+    match reason {
+        LocalCatalogChangeReason::LocalTargetExited {
+            target_session_name,
+        } => {
+            let t_exit = Instant::now();
+            synced_sessions
+                .retain(|_, session| session.address.session_id() != target_session_name.as_str());
+            next_message_id_increment(next_message_id);
+            session_handle
+                .send(remote_session_exited_envelope(
+                    node_id,
+                    session_handle.session_instance_id(),
+                    *next_message_id,
+                    target_session_name,
+                ))
+                .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))?;
+            ERROR_LOG.log(format!(
+                "[diag-exit] sync_exit_send node={} target=remote-peer:{}:{} elapsed={:?} stage=session_sync explicit=true",
+                node_id,
+                node_id,
+                target_session_name,
+                t_exit.elapsed()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn sync_local_sessions<G, O>(
@@ -337,7 +483,15 @@ where
     }
 
     for previous in &delta.exit {
+        let t_exit = Instant::now();
+        ERROR_LOG.log(format!(
+            "[diag-exit] sync_exit_start node={} target={} total={:?} stage=session_sync",
+            node_id,
+            previous.address.qualified_target(),
+            t_sync.elapsed()
+        ));
         if previous.is_target_host() {
+            let t_observe = Instant::now();
             if let Err(error) = local_target_exit_observer.observe_local_target_exit(
                 previous.address.server_id(),
                 previous.address.session_id(),
@@ -348,7 +502,15 @@ where
                     previous.address.session_id()
                 ));
             }
+            ERROR_LOG.log(format!(
+                "[diag-exit] sync_exit_observe_local node={} target={} elapsed={:?} total={:?} stage=session_sync",
+                node_id,
+                previous.address.qualified_target(),
+                t_observe.elapsed(),
+                t_sync.elapsed()
+            ));
         }
+        let t_send = Instant::now();
         next_message_id_increment(next_message_id);
         session_handle
             .send(remote_session_exited_envelope(
@@ -358,6 +520,14 @@ where
                 previous.address.session_id(),
             ))
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))?;
+        ERROR_LOG.log(format!(
+            "[diag-exit] sync_exit_send node={} target={} elapsed={:?} total={:?} exit_total={:?} stage=session_sync",
+            node_id,
+            previous.address.qualified_target(),
+            t_send.elapsed(),
+            t_sync.elapsed(),
+            t_exit.elapsed()
+        ));
     }
 
     *synced_sessions = current_sessions;
@@ -1043,16 +1213,84 @@ pub(crate) fn remote_session_sync_owner_socket_path(socket_name: &str) -> PathBu
 }
 
 pub(crate) fn remote_session_sync_owner_available(socket_path: &Path) -> bool {
-    UnixStream::connect(socket_path).is_ok()
+    send_owner_command(socket_path, "ping\n").is_ok()
 }
 
-pub(super) fn drain_owner_ping(listener: &UnixListener) -> io::Result<()> {
+pub(crate) fn notify_remote_session_sync_owner(
+    socket_path: &Path,
+    reason: LocalCatalogChangeReason,
+) -> Result<(), LifecycleError> {
+    send_owner_command(
+        socket_path,
+        &format!("local-catalog-changed {}\n", reason.encode()),
+    )
+}
+
+pub(super) fn drain_owner_commands(
+    listener: &UnixListener,
+    local_catalog_tx: &mpsc::Sender<LocalCatalogChangeReason>,
+) -> io::Result<()> {
     loop {
         match listener.accept() {
-            Ok((_stream, _addr)) => continue,
+            Ok((mut stream, _addr)) => {
+                let mut request = String::new();
+                let _ = stream.read_to_string(&mut request);
+                let response = match parse_owner_command(request.trim()) {
+                    OwnerCommand::Ping => "ok\n".to_string(),
+                    OwnerCommand::LocalCatalogChanged(reason) => {
+                        if local_catalog_tx.send(reason).is_ok() {
+                            "ok\n".to_string()
+                        } else {
+                            "error local-catalog-channel-closed\n".to_string()
+                        }
+                    }
+                    OwnerCommand::Invalid(message) => format!("error {message}\n"),
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(error),
         }
+    }
+}
+
+enum OwnerCommand {
+    Ping,
+    LocalCatalogChanged(LocalCatalogChangeReason),
+    Invalid(String),
+}
+
+fn parse_owner_command(request: &str) -> OwnerCommand {
+    if request.is_empty() || request == "ping" {
+        return OwnerCommand::Ping;
+    }
+    if let Some(reason) = request.strip_prefix("local-catalog-changed ") {
+        return LocalCatalogChangeReason::parse(reason)
+            .map(OwnerCommand::LocalCatalogChanged)
+            .unwrap_or_else(|| OwnerCommand::Invalid(format!("unknown-reason-{reason}")));
+    }
+    OwnerCommand::Invalid("unknown-command".to_string())
+}
+
+fn send_owner_command(socket_path: &Path, command: &str) -> Result<(), LifecycleError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(remote_session_sync_error)?;
+    stream
+        .write_all(command.as_bytes())
+        .map_err(remote_session_sync_error)?;
+    stream.shutdown(Shutdown::Write).ok();
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(remote_session_sync_error)?;
+    if response.trim() == "ok" {
+        Ok(())
+    } else {
+        Err(LifecycleError::Protocol(format!(
+            "remote session sync owner rejected command `{}` with `{}`",
+            command.trim(),
+            response.trim()
+        )))
     }
 }
 

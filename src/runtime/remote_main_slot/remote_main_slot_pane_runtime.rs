@@ -982,8 +982,22 @@ fn signal_clean_remote_target_exit(
     pane_id: &str,
 ) -> Result<(), LifecycleError> {
     if pane_id.is_empty() {
+        ERROR_LOG.log(format!(
+            "[diag-exit] signal_clean_exit_skip_empty_pane target={} socket={} session={} stage=signal_clean_exit",
+            spec.target,
+            spec.socket_name,
+            spec.surface_scope
+        ));
         return Ok(());
     }
+
+    ERROR_LOG.log(format!(
+        "[diag-exit] signal_clean_exit_start target={} socket={} session={} pane={} stage=signal_clean_exit",
+        spec.target,
+        spec.socket_name,
+        spec.surface_scope,
+        pane_id
+    ));
 
     let backend =
         crate::infra::tmux::EmbeddedTmuxBackend::from_build_env().map_err(remote_pane_error)?;
@@ -1011,12 +1025,21 @@ fn signal_clean_remote_target_exit(
         shell_escape(pane_id),
     ]
     .join(" ");
-    backend
+    let result = backend
         .run_socket_command(
             &workspace.socket_name,
             &["run-shell".to_string(), "-b".to_string(), shell_command],
         )
-        .map_err(remote_pane_error)
+        .map_err(remote_pane_error);
+    ERROR_LOG.log(format!(
+        "[diag-exit] signal_clean_exit_dispatched target={} socket={} session={} pane={} ok={} stage=signal_clean_exit",
+        spec.target,
+        spec.socket_name,
+        spec.surface_scope,
+        pane_id,
+        result.is_ok()
+    ));
+    result
 }
 
 fn shell_escape(value: &str) -> String {

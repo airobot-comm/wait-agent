@@ -1,9 +1,9 @@
 mod tests {
     use super::super::{
         discover_authority_socket_paths, enqueue_ingress_event, extract_target_component,
-        has_active_ingress_session_for_node, next_ingress_event, route_transport_envelope,
-        ActiveAuthoritySocketBridge, ActiveNodeIngressSession, IngressServerEvent, InternalEvent,
-        RemoteNodeIngressServerRuntime,
+        handle_internal_event, has_active_ingress_session_for_node, next_ingress_event,
+        route_transport_envelope, ActiveAuthoritySocketBridge, ActiveNodeIngressSession,
+        IngressServerEvent, InternalEvent, RemoteNodeIngressServerRuntime,
     };
     use crate::cli::RemoteNetworkConfig;
     use crate::infra::remote_grpc_proto::v1::node_session_envelope::Body;
@@ -16,7 +16,7 @@ mod tests {
         authority_transport_socket_path, RemoteAuthorityTransportRuntime,
     };
     use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::fs;
     use std::net::Shutdown;
     use std::path::PathBuf;
@@ -64,6 +64,29 @@ mod tests {
             _ => panic!("local create-session should be handled before publication sync"),
         }
         drop(reply_rx);
+    }
+
+    #[test]
+    fn register_workspace_socket_event_updates_ingress_registry() {
+        let mut sessions = std::collections::HashMap::new();
+        let mut registered = BTreeSet::new();
+        let (internal_tx, _internal_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        handle_internal_event(
+            &mut sessions,
+            &mut registered,
+            internal_tx,
+            InternalEvent::RegisterWorkspaceSocket {
+                socket_name: "wa-test".to_string(),
+                reply_tx,
+            },
+        );
+
+        assert!(registered.contains("wa-test"));
+        assert!(reply_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok());
     }
 
     #[test]
@@ -265,6 +288,7 @@ mod tests {
             node_id,
             mirror_bootstrap_chunk_envelope(),
             Some(&mut active),
+            &BTreeSet::new(),
         )
         .expect("bootstrap chunk should route");
         route_transport_envelope(
@@ -272,6 +296,7 @@ mod tests {
             node_id,
             mirror_bootstrap_complete_envelope(),
             Some(&mut active),
+            &BTreeSet::new(),
         )
         .expect("bootstrap complete should route");
         route_transport_envelope(
@@ -279,6 +304,7 @@ mod tests {
             node_id,
             target_output_envelope(),
             Some(&mut active),
+            &BTreeSet::new(),
         )
         .expect("target output should route");
 
@@ -393,6 +419,7 @@ mod tests {
             &node_id,
             target_exited_envelope_for("shell-a"),
             Some(&mut active),
+            &BTreeSet::new(),
         )
         .expect("target exited should route");
 

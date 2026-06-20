@@ -29,7 +29,7 @@ use crate::runtime::remote_node_session_runtime::{
 use crate::runtime::remote_node_session_sync_runtime::SessionSyncAuthorityManager;
 use crate::runtime::remote_target_publication_runtime::RemoteTargetPublicationRuntime;
 use crate::runtime::sidecar_process_runtime::spawn_waitagent_sidecar;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -103,6 +103,10 @@ enum InternalEvent {
         socket_path: PathBuf,
         reply_tx: mpsc::Sender<AuthoritySocketReadyReply>,
     },
+    RegisterWorkspaceSocket {
+        socket_name: String,
+        reply_tx: mpsc::Sender<AuthoritySocketReadyReply>,
+    },
     RetrySocketDiscovery {
         attempts_remaining: u8,
     },
@@ -146,11 +150,12 @@ impl RemoteNodeIngressServerRuntime {
     }
 
     pub fn ensure_owner_running(
-        _socket_name: &str,
+        socket_name: &str,
         network: &RemoteNetworkConfig,
     ) -> Result<(), LifecycleError> {
         let socket_path = remote_node_ingress_owner_socket_path(network);
         if remote_node_ingress_owner_available(&socket_path) {
+            register_workspace_socket_with_owner(network, socket_name)?;
             return Ok(());
         }
         if socket_path.exists() {
@@ -161,6 +166,7 @@ impl RemoteNodeIngressServerRuntime {
             .map_err(remote_node_ingress_error)?;
         for _ in 0..REMOTE_NODE_INGRESS_OWNER_READY_RETRIES {
             if remote_node_ingress_owner_available(&socket_path) {
+                register_workspace_socket_with_owner(network, socket_name)?;
                 return Ok(());
             }
             thread::sleep(REMOTE_NODE_INGRESS_OWNER_READY_SLEEP);
@@ -220,6 +226,31 @@ pub(crate) fn notify_authority_socket_ready(
             status: AuthoritySocketReadyStatus::Error,
             message,
         } => Err(io::Error::new(io::ErrorKind::Other, message)),
+    }
+}
+
+fn register_workspace_socket_with_owner(
+    network: &RemoteNetworkConfig,
+    socket_name: &str,
+) -> Result<(), LifecycleError> {
+    if socket_name == "__shared__" || socket_name.is_empty() {
+        return Ok(());
+    }
+    let mut stream = UnixStream::connect(remote_node_ingress_owner_socket_path(network))
+        .map_err(remote_node_ingress_error)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(remote_node_ingress_error)?;
+    write_owner_control_register_workspace_socket(&mut stream, socket_name)
+        .map_err(remote_node_ingress_error)?;
+    match read_owner_control_reply(&mut stream).map_err(remote_node_ingress_error)? {
+        AuthoritySocketReadyReply {
+            status: AuthoritySocketReadyStatus::Registered,
+            ..
+        } => Ok(()),
+        AuthoritySocketReadyReply { message, .. } => Err(LifecycleError::Protocol(format!(
+            "remote node ingress owner rejected workspace socket registration `{socket_name}`: {message}"
+        ))),
     }
 }
 
@@ -299,6 +330,32 @@ fn handle_owner_stream(mut stream: UnixStream, owner_tx: mpsc::Sender<InternalEv
                         });
                     let _ = write_owner_control_reply(&mut stream, &reply);
                 }
+                Ok(OwnerControlMessage::RegisterWorkspaceSocket { socket_name }) => {
+                    let (reply_tx, reply_rx) = mpsc::channel();
+                    if owner_tx
+                        .send(InternalEvent::RegisterWorkspaceSocket {
+                            socket_name,
+                            reply_tx,
+                        })
+                        .is_err()
+                    {
+                        let _ = write_owner_control_reply(
+                            &mut stream,
+                            &AuthoritySocketReadyReply {
+                                status: AuthoritySocketReadyStatus::Error,
+                                message: "remote-node-ingress owner loop is closed".to_string(),
+                            },
+                        );
+                        return;
+                    }
+                    let reply = reply_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap_or_else(|_| AuthoritySocketReadyReply {
+                            status: AuthoritySocketReadyStatus::Pending,
+                            message: "workspace socket registration is pending".to_string(),
+                        });
+                    let _ = write_owner_control_reply(&mut stream, &reply);
+                }
                 Err(_) => {}
             }
             return;
@@ -364,6 +421,9 @@ enum OwnerControlMessage {
         node_id: String,
         socket_path: PathBuf,
     },
+    RegisterWorkspaceSocket {
+        socket_name: String,
+    },
 }
 fn write_owner_control_authority_socket_ready(
     writer: &mut impl Write,
@@ -374,6 +434,16 @@ fn write_owner_control_authority_socket_ready(
     writer.write_all(&[1])?;
     write_owner_control_string(writer, node_id)?;
     write_owner_control_string(writer, &socket_path.to_string_lossy())?;
+    writer.flush()
+}
+
+fn write_owner_control_register_workspace_socket(
+    writer: &mut impl Write,
+    socket_name: &str,
+) -> io::Result<()> {
+    writer.write_all(OWNER_CONTROL_MAGIC)?;
+    writer.write_all(&[2])?;
+    write_owner_control_string(writer, socket_name)?;
     writer.flush()
 }
 
@@ -420,6 +490,10 @@ fn read_owner_control_message(reader: &mut impl Read) -> io::Result<OwnerControl
                 node_id,
                 socket_path,
             })
+        }
+        2 => {
+            let socket_name = read_owner_control_string(reader)?;
+            Ok(OwnerControlMessage::RegisterWorkspaceSocket { socket_name })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -591,6 +665,7 @@ fn run_node_ingress_server_loop(
         SessionSyncAuthorityManager::new(RemoteNetworkConfig::default(), None);
     let mut pending_create_sessions =
         HashMap::<String, mpsc::Sender<GrpcNodeSessionEnvelope>>::new();
+    let mut registered_workspace_sockets = BTreeSet::<String>::new();
     let (event_tx, event_rx) = mpsc::channel::<IngressServerEvent>();
 
     let _transport_bridge = {
@@ -667,6 +742,7 @@ fn run_node_ingress_server_loop(
                 &mut authority_manager,
                 &mut sessions,
                 &mut pending_create_sessions,
+                &registered_workspace_sockets,
                 internal_tx.clone(),
                 event,
             ),
@@ -688,7 +764,12 @@ fn run_node_ingress_server_loop(
                 pending_create_sessions.remove(&request_id);
             }
             IngressServerEvent::Internal(event) => {
-                handle_internal_event(&mut sessions, internal_tx.clone(), event);
+                handle_internal_event(
+                    &mut sessions,
+                    &mut registered_workspace_sockets,
+                    internal_tx.clone(),
+                    event,
+                );
             }
         }
     }
@@ -747,6 +828,7 @@ fn handle_transport_event(
     authority_manager: &mut SessionSyncAuthorityManager,
     sessions: &mut HashMap<String, ActiveNodeIngressSession>,
     pending_create_sessions: &mut HashMap<String, mpsc::Sender<GrpcNodeSessionEnvelope>>,
+    registered_workspace_sockets: &BTreeSet<String>,
     internal_tx: mpsc::Sender<InternalEvent>,
     event: RemoteNodeTransportEvent,
 ) {
@@ -799,10 +881,21 @@ fn handle_transport_event(
                 return;
             }
             if let Some(active) = sessions.get_mut(&session_instance_id) {
-                let _ =
-                    route_transport_envelope(publication_runtime, &node_id, envelope, Some(active));
+                let _ = route_transport_envelope(
+                    publication_runtime,
+                    &node_id,
+                    envelope,
+                    Some(active),
+                    registered_workspace_sockets,
+                );
             } else {
-                let _ = route_transport_envelope(publication_runtime, &node_id, envelope, None);
+                let _ = route_transport_envelope(
+                    publication_runtime,
+                    &node_id,
+                    envelope,
+                    None,
+                    registered_workspace_sockets,
+                );
             }
         }
         RemoteNodeTransportEvent::SessionClosed {
@@ -1046,6 +1139,7 @@ fn local_create_session_rejected_grpc_envelope(
 
 fn handle_internal_event(
     sessions: &mut HashMap<String, ActiveNodeIngressSession>,
+    registered_workspace_sockets: &mut BTreeSet<String>,
     internal_tx: mpsc::Sender<InternalEvent>,
     event: InternalEvent,
 ) {
@@ -1073,6 +1167,16 @@ fn handle_internal_event(
             );
             let reply = authority_socket_ready_reply(&node_id, &socket_path, outcome);
             let _ = reply_tx.send(reply);
+        }
+        InternalEvent::RegisterWorkspaceSocket {
+            socket_name,
+            reply_tx,
+        } => {
+            registered_workspace_sockets.insert(socket_name);
+            let _ = reply_tx.send(AuthoritySocketReadyReply {
+                status: AuthoritySocketReadyStatus::Registered,
+                message: "workspace socket registered".to_string(),
+            });
         }
         InternalEvent::SocketDirChanged => {
             refresh_authority_bridges_for_sessions(
@@ -1112,6 +1216,7 @@ fn route_transport_envelope(
     node_id: &str,
     envelope: GrpcNodeSessionEnvelope,
     session: Option<&mut ActiveNodeIngressSession>,
+    registered_workspace_sockets: &BTreeSet<String>,
 ) -> Result<(), LifecycleError> {
     match envelope.body.as_ref() {
         Some(Body::TargetPublished(payload)) => {
@@ -1133,12 +1238,28 @@ fn route_transport_envelope(
             publication_runtime.apply_discovered_remote_session_envelope(node_id, mapped)
         }
         Some(Body::TargetExited(payload)) => {
+            let t_exit = std::time::Instant::now();
             ERROR_LOG.log(format!(
                 "[diag-bug] ingress_server route_transport_envelope: received TargetExited node={node_id} session={}",
                 payload.transport_session_id
             ));
             let mapped = map_target_exited_envelope(node_id, &envelope, payload);
-            publication_runtime.apply_discovered_remote_session_envelope(node_id, mapped)?;
+            let t_apply = std::time::Instant::now();
+            publication_runtime.apply_discovered_remote_session_envelope_for_sockets(
+                node_id,
+                mapped,
+                &registered_workspace_sockets
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )?;
+            ERROR_LOG.log(format!(
+                "[diag-exit] ingress_target_exited_apply node={} session={} elapsed={:?} total={:?} stage=ingress_server",
+                node_id,
+                payload.transport_session_id,
+                t_apply.elapsed(),
+                t_exit.elapsed()
+            ));
             ERROR_LOG.log(format!(
                 "[diag-bug] ingress_server: applied TargetExited to live workspaces node={node_id} session={}",
                 payload.transport_session_id

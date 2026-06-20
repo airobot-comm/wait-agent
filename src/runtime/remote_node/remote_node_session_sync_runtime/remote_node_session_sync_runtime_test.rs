@@ -2,11 +2,12 @@ mod tests {
     use super::super::{
         authority_host_signal, compute_session_sync_delta, deliver_command_to_ready_host,
         exportable_local_sessions_for_socket, local_sessions_by_local_id,
-        overlay_workspace_runtime_onto_active_local_target_hosts, remote_session_exited_envelope,
-        remote_session_published_envelope, remote_session_sync_owner_available,
-        remote_session_sync_owner_socket_path, sync_local_sessions, AuthorityHostSignal,
-        LocalSessionCatalog, LocalTargetExitObserver, OutboundRemoteNodeTransport,
-        RemoteNodeSessionSyncRuntime, SessionSyncAuthorityHost,
+        notify_remote_session_sync_owner, overlay_workspace_runtime_onto_active_local_target_hosts,
+        remote_session_exited_envelope, remote_session_published_envelope,
+        remote_session_sync_owner_available, remote_session_sync_owner_socket_path,
+        sync_explicit_local_catalog_change, sync_local_sessions, AuthorityHostSignal,
+        LocalCatalogChangeReason, LocalSessionCatalog, LocalTargetExitObserver,
+        OutboundRemoteNodeTransport, RemoteNodeSessionSyncRuntime, SessionSyncAuthorityHost,
     };
     use crate::cli::RemoteNetworkConfig;
     use crate::domain::session_catalog::{
@@ -26,6 +27,7 @@ mod tests {
     use crate::runtime::remote_authority_transport_runtime::RemoteAuthorityCommand;
     use std::collections::HashMap;
     use std::fs;
+    use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
@@ -139,6 +141,34 @@ mod tests {
     fn remote_session_exited_envelope_uses_remote_peer_identity() {
         let envelope = remote_session_exited_envelope("10.0.0.2", "server-session-1", 8, "shell-1");
 
+        let Some(Body::TargetExited(payload)) = envelope.body else {
+            panic!("expected target_exited body");
+        };
+        assert_eq!(payload.target_id, "remote-peer:10.0.0.2:shell-1");
+        assert_eq!(payload.transport_session_id, "shell-1");
+    }
+
+    #[test]
+    fn explicit_local_target_exit_sends_exit_without_synced_baseline() {
+        let (handle, mut receiver) =
+            RemoteNodeSessionHandle::new_for_tests("10.0.0.2", "server-session-1");
+        let mut synced_sessions = HashMap::new();
+        let mut next_message_id = 0;
+
+        sync_explicit_local_catalog_change(
+            "10.0.0.2",
+            &handle,
+            &LocalCatalogChangeReason::LocalTargetExited {
+                target_session_name: "shell-1".to_string(),
+            },
+            &mut synced_sessions,
+            &mut next_message_id,
+        )
+        .expect("explicit local exit should be sent");
+
+        let envelope = receiver
+            .try_recv()
+            .expect("remote target exit envelope should be sent");
         let Some(Body::TargetExited(payload)) = envelope.body else {
             panic!("expected target_exited body");
         };
@@ -288,6 +318,54 @@ mod tests {
         };
         assert_eq!(payload.transport_session_id, "shell-1");
         drop(guard);
+    }
+
+    #[test]
+    fn local_catalog_notify_wakes_sync_without_poll_wait() {
+        let socket_name = format!("wa-test-sync-notify-{}", std::process::id());
+        let socket_path = remote_session_sync_owner_socket_path(&socket_name);
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path);
+        }
+        let listener = UnixListener::bind(&socket_path).expect("owner socket should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("owner socket should become nonblocking");
+        let (local_catalog_tx, local_catalog_rx) = mpsc::channel();
+
+        let notifier = thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                notify_remote_session_sync_owner(
+                    &socket_path,
+                    LocalCatalogChangeReason::LocalTargetExited {
+                        target_session_name: "shell-1".to_string(),
+                    },
+                )
+                .expect("notify should be acknowledged")
+            }
+        });
+
+        let start = std::time::Instant::now();
+        loop {
+            super::super::drain_owner_commands(&listener, &local_catalog_tx)
+                .expect("owner commands should drain");
+            if start.elapsed() > Duration::from_secs(1) {
+                panic!("timed out waiting for owner notify");
+            }
+            if let Ok(reason) = local_catalog_rx.try_recv() {
+                assert_eq!(
+                    reason,
+                    LocalCatalogChangeReason::LocalTargetExited {
+                        target_session_name: "shell-1".to_string(),
+                    }
+                );
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        notifier.join().expect("notifier should join");
+        let _ = fs::remove_file(&socket_path);
     }
 
     #[test]
@@ -459,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_session_sync_owner_available_observes_bound_owner_socket() {
+    fn remote_session_sync_owner_available_requires_acknowledged_ping() {
         let socket_name = format!("wa-test-sync-owner-{}", std::process::id());
         let socket_path = remote_session_sync_owner_socket_path(&socket_name);
         if socket_path.exists() {
@@ -467,8 +545,17 @@ mod tests {
         }
         assert!(!remote_session_sync_owner_available(&socket_path));
         let listener = UnixListener::bind(&socket_path).expect("owner socket should bind");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("ping client should connect");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("ping request should read");
+            assert_eq!(request.trim(), "ping");
+            stream.write_all(b"ok\n").expect("ping ack should write");
+        });
         assert!(remote_session_sync_owner_available(&socket_path));
-        drop(listener);
+        handle.join().expect("fake owner should join");
         let _ = fs::remove_file(&socket_path);
     }
 

@@ -34,18 +34,46 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct FakeGateway {
-        resize_calls: Arc<Mutex<Vec<(usize, usize)>>>,
-        pipe_calls: Arc<Mutex<Vec<String>>>,
+        current_pane: Arc<Mutex<String>>,
+        resize_calls: Arc<Mutex<Vec<(String, usize, usize)>>>,
+        pipe_calls: Arc<Mutex<Vec<(String, String)>>>,
         pipe_live: Arc<Mutex<bool>>,
         clear_calls: Arc<Mutex<usize>>,
-        input_calls: Arc<Mutex<Vec<Vec<u8>>>>,
-        hook_calls: Arc<Mutex<Vec<String>>>,
-        clear_hook_calls: Arc<Mutex<usize>>,
+        input_calls: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        hook_calls: Arc<Mutex<Vec<(String, String)>>>,
+        clear_hook_calls: Arc<Mutex<Vec<String>>>,
         capture_bootstrap_screen: Arc<Mutex<String>>,
         cursor_position: Arc<Mutex<(usize, usize)>>,
         terminal_flags: Arc<Mutex<RemoteTargetTerminalFlags>>,
+    }
+
+    impl Default for FakeGateway {
+        fn default() -> Self {
+            Self {
+                current_pane: Arc::new(Mutex::new("%7".to_string())),
+                resize_calls: Arc::new(Mutex::new(Vec::new())),
+                pipe_calls: Arc::new(Mutex::new(Vec::new())),
+                pipe_live: Arc::new(Mutex::new(false)),
+                clear_calls: Arc::new(Mutex::new(0)),
+                input_calls: Arc::new(Mutex::new(Vec::new())),
+                hook_calls: Arc::new(Mutex::new(Vec::new())),
+                clear_hook_calls: Arc::new(Mutex::new(Vec::new())),
+                capture_bootstrap_screen: Arc::new(Mutex::new(String::new())),
+                cursor_position: Arc::new(Mutex::new((0, 0))),
+                terminal_flags: Arc::new(Mutex::new(RemoteTargetTerminalFlags::default())),
+            }
+        }
+    }
+
+    impl FakeGateway {
+        fn set_current_pane(&self, pane: &str) {
+            *self
+                .current_pane
+                .lock()
+                .expect("current pane mutex should not be poisoned") = pane.to_string();
+        }
     }
 
     impl RemoteTargetPtyGateway for FakeGateway {
@@ -56,20 +84,25 @@ mod tests {
             _socket_name: &str,
             _target_session_name: &str,
         ) -> Result<TmuxPaneId, Self::Error> {
-            Ok(TmuxPaneId::new("%7"))
+            Ok(TmuxPaneId::new(
+                self.current_pane
+                    .lock()
+                    .expect("current pane mutex should not be poisoned")
+                    .clone(),
+            ))
         }
 
         fn resize_pty(
             &self,
             _socket_name: &str,
-            _pane: &TmuxPaneId,
+            pane: &TmuxPaneId,
             cols: usize,
             rows: usize,
         ) -> Result<(), Self::Error> {
             self.resize_calls
                 .lock()
                 .expect("resize calls mutex should not be poisoned")
-                .push((cols, rows));
+                .push((pane.as_str().to_string(), cols, rows));
             Ok(())
         }
 
@@ -137,14 +170,14 @@ mod tests {
         fn set_output_pipe_owned(
             &self,
             _socket_name: &str,
-            _pane: &TmuxPaneId,
+            pane: &TmuxPaneId,
             _owner: &str,
             command: &str,
         ) -> Result<(), Self::Error> {
             self.pipe_calls
                 .lock()
                 .expect("pipe calls mutex should not be poisoned")
-                .push(command.to_string());
+                .push((pane.as_str().to_string(), command.to_string()));
             *self
                 .pipe_live
                 .lock()
@@ -155,39 +188,38 @@ mod tests {
         fn send_input(
             &self,
             _socket_name: &str,
-            _pane: &TmuxPaneId,
+            pane: &TmuxPaneId,
             bytes: &[u8],
         ) -> Result<(), Self::Error> {
             self.input_calls
                 .lock()
                 .expect("input calls mutex should not be poisoned")
-                .push(bytes.to_vec());
+                .push((pane.as_str().to_string(), bytes.to_vec()));
             Ok(())
         }
 
         fn set_pane_died_hook(
             &self,
             _socket_name: &str,
-            _pane: &TmuxPaneId,
+            pane: &TmuxPaneId,
             command: &str,
         ) -> Result<(), Self::Error> {
             self.hook_calls
                 .lock()
                 .expect("hook calls mutex should not be poisoned")
-                .push(command.to_string());
+                .push((pane.as_str().to_string(), command.to_string()));
             Ok(())
         }
 
         fn clear_pane_died_hook(
             &self,
             _socket_name: &str,
-            _pane: &TmuxPaneId,
+            pane: &TmuxPaneId,
         ) -> Result<(), Self::Error> {
-            let mut clear_hook_calls = self
-                .clear_hook_calls
+            self.clear_hook_calls
                 .lock()
-                .expect("clear hook calls mutex should not be poisoned");
-            *clear_hook_calls += 1;
+                .expect("clear hook calls mutex should not be poisoned")
+                .push(pane.as_str().to_string());
             Ok(())
         }
     }
@@ -509,7 +541,7 @@ mod tests {
                 .lock()
                 .expect("input calls mutex should not be poisoned")
                 .clone(),
-            vec![b"a".to_vec()]
+            vec![("%7".to_string(), b"a".to_vec())]
         );
         assert_eq!(
             fake_gateway
@@ -517,7 +549,7 @@ mod tests {
                 .lock()
                 .expect("resize calls mutex should not be poisoned")
                 .clone(),
-            vec![(80, 24), (160, 50)]
+            vec![("%7".to_string(), 80, 24), ("%7".to_string(), 160, 50)]
         );
         assert_eq!(
             accepted,
@@ -569,6 +601,7 @@ mod tests {
             .pipe_calls
             .lock()
             .expect("pipe calls mutex should not be poisoned")[0]
+            .1
             .contains("__remote-authority-output-pump"));
         let _ = fs::remove_file(&transport_socket_path);
     }
@@ -653,13 +686,15 @@ mod tests {
             .hook_calls
             .lock()
             .expect("hook calls mutex should not be poisoned")[0]
+            .1
             .contains("__remote-authority-pane-died"));
         assert_eq!(
-            *fake_gateway
+            fake_gateway
                 .clear_hook_calls
                 .lock()
-                .expect("clear hook calls mutex should not be poisoned"),
-            1
+                .expect("clear hook calls mutex should not be poisoned")
+                .clone(),
+            vec!["%7".to_string()]
         );
         let _ = fs::remove_file(&transport_socket_path);
     }
@@ -909,7 +944,7 @@ mod tests {
                 .lock()
                 .expect("resize calls mutex should not be poisoned")
                 .clone(),
-            vec![(80, 24), (80, 24)]
+            vec![("%7".to_string(), 80, 24), ("%7".to_string(), 80, 24)]
         );
         assert_eq!(
             fake_gateway
@@ -1046,8 +1081,103 @@ mod tests {
                 .lock()
                 .expect("resize calls mutex should not be poisoned")
                 .clone(),
-            vec![(80, 24), (80, 24)]
+            vec![("%7".to_string(), 80, 24), ("%7".to_string(), 80, 24)]
         );
+        let _ = fs::remove_file(&transport_socket_path);
+    }
+
+    #[test]
+    fn authority_host_runtime_resolves_current_pane_before_each_input() {
+        let socket_name = unique_test_socket_name("wa-pane-refresh");
+        let transport_socket_path = transport_socket_path("host-pane-refresh");
+        let transport_listener =
+            UnixListener::bind(&transport_socket_path).expect("transport listener should bind");
+        let fake_gateway = FakeGateway::default();
+        let fake_gateway_for_server = fake_gateway.clone();
+        let runtime = RemoteAuthorityTargetHostRuntime::new(
+            fake_gateway.clone(),
+            FakePublicationGateway::default(),
+            PathBuf::from("/tmp/waitagent"),
+        );
+        let command = RemoteAuthorityTargetHostCommand {
+            socket_name: socket_name.clone(),
+            target_session_name: "target-1".to_string(),
+            transport_session_id: "target-1".to_string(),
+            authority_id: "peer-a".to_string(),
+            target_id: "remote-peer:peer-a:target-1".to_string(),
+            transport_socket_path: transport_socket_path.to_string_lossy().into_owned(),
+        };
+
+        let (server_tx, server_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = transport_listener
+                .accept()
+                .expect("transport should accept");
+            let hello = read_control_plane_envelope(&mut stream).expect("hello should decode");
+            match hello.payload {
+                ControlPlanePayload::ClientHello(ClientHelloPayload { .. }) => {}
+                other => panic!("unexpected hello payload: {other:?}"),
+            }
+            write_server_hello(&mut stream, "waitagent-remote-node-session")
+                .expect("server hello should encode");
+            write_node_session_envelope(
+                &mut stream,
+                &NodeSessionEnvelope {
+                    channel: NodeSessionChannel::Authority,
+                    envelope: raw_input_envelope(b"a"),
+                },
+            )
+            .expect("first input should encode");
+            wait_for_input_count(&fake_gateway_for_server, 1);
+            fake_gateway_for_server.set_current_pane("%8");
+            write_node_session_envelope(
+                &mut stream,
+                &NodeSessionEnvelope {
+                    channel: NodeSessionChannel::Authority,
+                    envelope: raw_input_envelope(b"b"),
+                },
+            )
+            .expect("second input should encode");
+            wait_for_input_count(&fake_gateway_for_server, 2);
+            stream
+                .shutdown(Shutdown::Both)
+                .expect("server shutdown should succeed");
+            server_tx.send(()).expect("server completion should send");
+        });
+
+        runtime
+            .run_target_host(command)
+            .expect("runtime should finish cleanly");
+        server_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("server harness should complete");
+
+        assert_eq!(
+            fake_gateway
+                .input_calls
+                .lock()
+                .expect("input calls mutex should not be poisoned")
+                .clone(),
+            vec![
+                ("%7".to_string(), b"a".to_vec()),
+                ("%8".to_string(), b"b".to_vec()),
+            ]
+        );
+        assert_eq!(
+            fake_gateway
+                .hook_calls
+                .lock()
+                .expect("hook calls mutex should not be poisoned")
+                .iter()
+                .map(|(pane, _)| pane.clone())
+                .collect::<Vec<_>>(),
+            vec!["%7".to_string(), "%8".to_string()]
+        );
+        assert!(fake_gateway
+            .clear_hook_calls
+            .lock()
+            .expect("clear hook calls mutex should not be poisoned")
+            .contains(&"%7".to_string()));
         let _ = fs::remove_file(&transport_socket_path);
     }
 
@@ -1096,6 +1226,22 @@ mod tests {
         panic!("path did not appear at {}", path.display());
     }
 
+    fn wait_for_input_count(fake_gateway: &FakeGateway, expected: usize) {
+        for _ in 0..100 {
+            if fake_gateway
+                .input_calls
+                .lock()
+                .expect("input calls mutex should not be poisoned")
+                .len()
+                >= expected
+            {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("input count did not reach {expected}");
+    }
+
     fn transport_socket_path(name: &str) -> PathBuf {
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1127,6 +1273,10 @@ mod tests {
     }
 
     fn raw_pty_input_envelope() -> ProtocolEnvelope<ControlPlanePayload> {
+        raw_input_envelope(b"a")
+    }
+
+    fn raw_input_envelope(bytes: &[u8]) -> ProtocolEnvelope<ControlPlanePayload> {
         ProtocolEnvelope {
             protocol_version: "1.1".to_string(),
             message_id: "msg-raw-pty-input".to_string(),
@@ -1145,7 +1295,7 @@ mod tests {
                 console_id: "console-a".to_string(),
                 console_host_id: "observer-a".to_string(),
                 input_seq: 1,
-                input_bytes: b"a".to_vec(),
+                input_bytes: bytes.to_vec(),
             }),
         }
     }

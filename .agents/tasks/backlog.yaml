@@ -218,6 +218,18 @@ next:
   - id: task.t5-08c4d3d
     title: bind bootstrap replay and live remote output into visible parity and close cross-host acceptance
     status: done
+  - id: task.remote-exit-latency-1
+    title: add acknowledged local catalog notify to the remote session sync event loop
+    status: ready
+  - id: task.remote-exit-latency-2
+    title: wire WaitAgent-managed target lifecycle exits to session sync notify
+    status: ready
+  - id: task.remote-exit-latency-3
+    title: replace TargetExited hot-path tmux socket scan with live workspace socket registry
+    status: ready
+  - id: task.remote-exit-latency-4
+    title: validate remote session exit latency end to end and clean temporary diagnostics
+    status: ready
   - id: task.t5-08c4d3e
     title: decouple local raw PTY input from synchronous transport writes
     status: superseded

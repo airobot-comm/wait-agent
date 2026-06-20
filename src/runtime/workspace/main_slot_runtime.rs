@@ -16,6 +16,9 @@ use crate::infra::tmux::{
 };
 use crate::lifecycle::LifecycleError;
 use crate::runtime::remote_node::remote_runtime_owner_runtime::RemoteRuntimeOwnerRuntime;
+use crate::runtime::remote_node_session_sync_runtime::{
+    LocalCatalogChangeReason, RemoteNodeSessionSyncRuntime,
+};
 use crate::runtime::target_host_runtime::TargetHostRuntime;
 use crate::runtime::workspace_layout_runtime::WorkspaceLayoutRuntime;
 use crate::terminal::TerminalRuntime;
@@ -464,13 +467,24 @@ impl MainSlotRuntime {
                     ));
                     error
                 })?;
-                self.activate_target_in_workspace(&current_workspace, &target)
+                let result = self.activate_target_in_workspace(&current_workspace, &target)
                     .map_err(|error| {
                         ERROR_LOG.log(format!(
                             "[diag-bug] run_main_pane_died: activate fallback target failed: {error}"
                         ));
                         error
-                    })
+                    });
+                if result.is_ok() {
+                    if let Some(target_session_name) =
+                        Self::active_target_session_name(active_target.as_deref())
+                    {
+                        self.notify_session_sync_local_target_exited(
+                            workspace.socket_name.as_str(),
+                            target_session_name,
+                        );
+                    }
+                }
+                result
             }
             None => {
                 ERROR_LOG.log(format!(
@@ -483,15 +497,58 @@ impl MainSlotRuntime {
                         ));
                         error
                     })?;
-                self.backend
+                let result = self
+                    .backend
                     .kill_server(&TmuxSocketName::new(workspace.socket_name.as_str()))
                     .map_err(|error| {
                         ERROR_LOG.log(format!(
                             "[diag-bug] run_main_pane_died: kill socket failed: {error:?}"
                         ));
                         main_slot_error(error)
-                    })
+                    });
+                if result.is_ok() {
+                    if let Some(target_session_name) =
+                        Self::active_target_session_name(active_target.as_deref())
+                    {
+                        self.notify_session_sync_local_target_exited(
+                            workspace.socket_name.as_str(),
+                            target_session_name,
+                        );
+                    }
+                }
+                result
             }
+        }
+    }
+
+    fn active_target_session_name(active_target: Option<&str>) -> Option<&str> {
+        active_target?.rsplit_once(':').map(|(_, session)| session)
+    }
+
+    fn notify_session_sync_local_target_exited(
+        &self,
+        socket_name: &str,
+        target_session_name: &str,
+    ) {
+        let t_notify = std::time::Instant::now();
+        match RemoteNodeSessionSyncRuntime::notify_local_catalog_changed(
+            socket_name,
+            &self.network,
+            LocalCatalogChangeReason::LocalTargetExited {
+                target_session_name: target_session_name.to_string(),
+            },
+        ) {
+            Ok(()) => ERROR_LOG.log(format!(
+                "[diag-exit] local_catalog_notify_acked socket={} elapsed={:?} stage=main_pane_died",
+                socket_name,
+                t_notify.elapsed()
+            )),
+            Err(error) => ERROR_LOG.log(format!(
+                "[diag-exit] local_catalog_notify_failed socket={} error={} elapsed={:?} stage=main_pane_died",
+                socket_name,
+                error,
+                t_notify.elapsed()
+            )),
         }
     }
 
@@ -1000,22 +1057,79 @@ impl MainSlotRuntime {
         &self,
         command: RemoteTargetExitedCommand,
     ) -> Result<(), LifecycleError> {
+        let t_total = Instant::now();
+        ERROR_LOG.log(format!(
+            "[diag-exit] workspace_remote_exit_start target={} socket={} session={} pane={:?} stage=workspace_exit",
+            command.target,
+            command.socket_name,
+            command.session_name,
+            command.pane_id
+        ));
         let current_workspace =
             self.current_workspace_from_names(&command.socket_name, &command.session_name)?;
         let workspace = workspace_handle(&command.socket_name, &command.session_name);
+        let t_lock = Instant::now();
         let _state_guard = self.claim_main_pane_state(&workspace)?;
+        ERROR_LOG.log(format!(
+            "[diag-exit] workspace_remote_exit_lock target={} elapsed={:?} total={:?} stage=workspace_exit",
+            command.target,
+            t_lock.elapsed(),
+            t_total.elapsed()
+        ));
+        let t_remove = Instant::now();
         self.remove_remote_target_runtime_record(&command.socket_name, &command.target)?;
+        ERROR_LOG.log(format!(
+            "[diag-exit] workspace_remote_exit_remove_owner target={} elapsed={:?} total={:?} stage=workspace_exit",
+            command.target,
+            t_remove.elapsed(),
+            t_total.elapsed()
+        ));
+        let t_active = Instant::now();
         let active_target = self.active_target(&workspace)?;
+        ERROR_LOG.log(format!(
+            "[diag-exit] workspace_remote_exit_active target={} active={:?} elapsed={:?} total={:?} stage=workspace_exit",
+            command.target,
+            active_target,
+            t_active.elapsed(),
+            t_total.elapsed()
+        ));
         if active_target.as_deref() != Some(command.target.as_str()) {
+            ERROR_LOG.log(format!(
+                "[diag-exit] workspace_remote_exit_skip_inactive target={} total={:?} stage=workspace_exit",
+                command.target,
+                t_total.elapsed()
+            ));
             return Ok(());
         }
+        let t_session_pane = Instant::now();
         let session_pane = self.read_session_pane(&workspace, &command.target)?;
+        ERROR_LOG.log(format!(
+            "[diag-exit] workspace_remote_exit_session_pane target={} pane={:?} elapsed={:?} total={:?} stage=workspace_exit",
+            command.target,
+            session_pane,
+            t_session_pane.elapsed(),
+            t_total.elapsed()
+        ));
+        let t_transition = Instant::now();
         let transition =
             self.remote_target_exit_transition(&workspace, Some(command.target.as_str()))?;
+        let transition_label = match &transition {
+            RemoteTargetExitTransition::ActivateRemote(_) => "activate_remote",
+            RemoteTargetExitTransition::ActivateLocal(_) => "activate_local",
+            RemoteTargetExitTransition::CloseWorkspace => "close_workspace",
+        };
+        ERROR_LOG.log(format!(
+            "[diag-exit] workspace_remote_exit_transition target={} transition={} elapsed={:?} total={:?} stage=workspace_exit",
+            command.target,
+            transition_label,
+            t_transition.elapsed(),
+            t_total.elapsed()
+        ));
         let mut cleanup_pane = session_pane.clone();
 
         match transition {
             RemoteTargetExitTransition::ActivateRemote(target) => {
+                let t_activate = Instant::now();
                 match self.next_remote_target_pane_after_exit(
                     &workspace,
                     &command,
@@ -1024,6 +1138,13 @@ impl MainSlotRuntime {
                 )? {
                     RemoteTargetExitPanePlan::ActivateTargetSessionPane => {
                         self.activate_remote_target_in_workspace(&current_workspace, &target)?;
+                        ERROR_LOG.log(format!(
+                            "[diag-exit] workspace_remote_exit_activate_remote target={} next={} elapsed={:?} total={:?} stage=workspace_exit",
+                            command.target,
+                            target.address.qualified_target(),
+                            t_activate.elapsed(),
+                            t_total.elapsed()
+                        ));
                     }
                     RemoteTargetExitPanePlan::AssignExitedPaneToNextTarget(pane) => {
                         self.assign_remote_target_to_content_pane(
@@ -1033,10 +1154,19 @@ impl MainSlotRuntime {
                             &target,
                         )?;
                         cleanup_pane = None;
+                        ERROR_LOG.log(format!(
+                            "[diag-exit] workspace_remote_exit_assign_pane target={} next={} pane={} elapsed={:?} total={:?} stage=workspace_exit",
+                            command.target,
+                            target.address.qualified_target(),
+                            pane.as_str(),
+                            t_activate.elapsed(),
+                            t_total.elapsed()
+                        ));
                     }
                 }
             }
             RemoteTargetExitTransition::ActivateLocal(target) => {
+                let t_activate = Instant::now();
                 let recovery_pane = self.exited_remote_content_pane(
                     &workspace,
                     &command.target,
@@ -1052,8 +1182,17 @@ impl MainSlotRuntime {
                     )
                     .map_err(main_slot_error)?;
                 self.activate_target_in_workspace(&current_workspace, &target)?;
+                ERROR_LOG.log(format!(
+                    "[diag-exit] workspace_remote_exit_activate_local target={} next={} recovery_pane={} elapsed={:?} total={:?} stage=workspace_exit",
+                    command.target,
+                    target.address.qualified_target(),
+                    recovery_pane.as_str(),
+                    t_activate.elapsed(),
+                    t_total.elapsed()
+                ));
             }
             RemoteTargetExitTransition::CloseWorkspace => {
+                let t_close = Instant::now();
                 self.cleanup_exited_remote_session_pane(
                     &workspace,
                     &command.target,
@@ -1062,15 +1201,28 @@ impl MainSlotRuntime {
                 self.backend
                     .kill_server(&TmuxSocketName::new(workspace.socket_name.as_str()))
                     .map_err(main_slot_error)?;
+                ERROR_LOG.log(format!(
+                    "[diag-exit] workspace_remote_exit_close_workspace target={} elapsed={:?} total={:?} stage=workspace_exit",
+                    command.target,
+                    t_close.elapsed(),
+                    t_total.elapsed()
+                ));
                 return Ok(());
             }
         }
 
+        let t_cleanup = Instant::now();
         self.cleanup_exited_remote_session_pane(
             &workspace,
             &command.target,
             cleanup_pane.as_ref(),
         )?;
+        ERROR_LOG.log(format!(
+            "[diag-exit] workspace_remote_exit_cleanup target={} elapsed={:?} total={:?} stage=workspace_exit",
+            command.target,
+            t_cleanup.elapsed(),
+            t_total.elapsed()
+        ));
         Ok(())
     }
 

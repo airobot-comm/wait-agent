@@ -33,6 +33,7 @@ mod sync_helpers;
 pub(crate) use sync_helpers::*;
 
 const SESSION_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SESSION_SYNC_OWNER_COMMAND_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 const SESSION_SYNC_RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 const REMOTE_SESSION_SYNC_OWNER_READY_RETRIES: usize = 20;
@@ -254,11 +255,12 @@ impl RemoteNodeSessionSyncRuntime<SocketScopedLocalSessionCatalog<EmbeddedTmuxBa
         listener
             .set_nonblocking(true)
             .map_err(remote_session_sync_error)?;
-        let _guard =
-            Self::from_build_env_with_network_and_socket(network, &command.socket_name)?.start()?;
+        let (local_catalog_tx, local_catalog_rx) = mpsc::channel();
+        let _guard = Self::from_build_env_with_network_and_socket(network, &command.socket_name)?
+            .start_with_local_catalog_changes(local_catalog_rx)?;
         while backend_socket_still_exists(&command.socket_name) {
-            let _ = drain_owner_ping(&listener);
-            thread::sleep(SESSION_SYNC_POLL_INTERVAL);
+            let _ = drain_owner_commands(&listener, &local_catalog_tx);
+            thread::sleep(SESSION_SYNC_OWNER_COMMAND_CHECK_INTERVAL);
         }
         let _ = fs::remove_file(&socket_path);
         Ok(())
@@ -313,6 +315,30 @@ impl RemoteNodeSessionSyncRuntime<SocketScopedLocalSessionCatalog<EmbeddedTmuxBa
             "remote session sync owner for socket `{socket_name}` did not become ready"
         )))
     }
+
+    pub fn notify_local_catalog_changed(
+        socket_name: &str,
+        network: &RemoteNetworkConfig,
+        reason: LocalCatalogChangeReason,
+    ) -> Result<(), LifecycleError> {
+        if network.connect_endpoint_uri().is_none() {
+            return Ok(());
+        }
+        let socket_path = remote_session_sync_owner_socket_path(socket_name);
+        match notify_remote_session_sync_owner(&socket_path, reason.clone()) {
+            Ok(()) => Ok(()),
+            Err(first_error) => {
+                ERROR_LOG.log(format!(
+                    "[diag-exit] session_sync_notify retry socket={} reason={} first_error={}",
+                    socket_name,
+                    reason.as_str(),
+                    first_error
+                ));
+                Self::ensure_owner_running(socket_name, network)?;
+                notify_remote_session_sync_owner(&socket_path, reason)
+            }
+        }
+    }
 }
 
 impl<G, T, O> RemoteNodeSessionSyncRuntime<G, T, O>
@@ -337,7 +363,16 @@ where
         }
     }
 
+    #[cfg(test)]
     pub fn start(self) -> Result<RemoteNodeSessionSyncGuard, LifecycleError> {
+        let (_local_catalog_tx, local_catalog_rx) = mpsc::channel();
+        self.start_with_local_catalog_changes(local_catalog_rx)
+    }
+
+    pub fn start_with_local_catalog_changes(
+        self,
+        local_catalog_rx: mpsc::Receiver<LocalCatalogChangeReason>,
+    ) -> Result<RemoteNodeSessionSyncGuard, LifecycleError> {
         let endpoint_uri = self.network.connect_endpoint_uri().ok_or_else(|| {
             LifecycleError::Protocol("remote session sync requires `--connect`".to_string())
         })?;
@@ -351,6 +386,7 @@ where
                 self.local_target_exit_observer,
                 node_id,
                 endpoint_uri,
+                local_catalog_rx,
                 self.poll_interval,
                 self.reconnect_delay,
                 stop_rx,
