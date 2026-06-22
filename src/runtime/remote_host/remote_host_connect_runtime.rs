@@ -52,6 +52,7 @@ pub struct RemoteHostConnectRequest {
     pub profile_name: Option<String>,
     pub direct_profile: Option<RemoteHostProfile>,
     pub save_profile_name: Option<String>,
+    pub replace_profile_name: Option<String>,
     pub local_connect_endpoint: String,
     pub cwd_hint: Option<PathBuf>,
     pub use_install_proxy: bool,
@@ -114,11 +115,9 @@ where
         }
 
         if let Some(endpoint) = self.find_connected_endpoint(&profile)? {
-            let created = self.create_remote_session(&endpoint, request.cwd_hint)?;
+            let created = self.create_remote_session(&endpoint, request.cwd_hint.clone())?;
             if should_save_profile {
-                self.history_store
-                    .upsert_profile(profile)
-                    .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+                self.save_connected_profile(&request, profile)?;
             }
             return Ok(RemoteHostConnectOutcome {
                 authority_node_id: endpoint,
@@ -160,9 +159,7 @@ where
         profile.last_endpoint = Some(format!("{}:{}", profile.host, port.port));
         profile.use_install_proxy = request.use_install_proxy;
         if should_save_profile {
-            self.history_store
-                .upsert_profile(profile)
-                .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+            self.save_connected_profile(&request, profile)?;
         }
 
         Ok(RemoteHostConnectOutcome {
@@ -246,6 +243,23 @@ where
             })
             .map_err(|error| LifecycleError::Protocol(error.to_string()))
     }
+
+    fn save_connected_profile(
+        &self,
+        request: &RemoteHostConnectRequest,
+        profile: RemoteHostProfile,
+    ) -> Result<(), LifecycleError> {
+        if let Some(replace_name) = request.replace_profile_name.as_deref() {
+            if replace_name != profile.name {
+                self.history_store
+                    .remove_profile(replace_name)
+                    .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+            }
+        }
+        self.history_store
+            .upsert_profile(profile)
+            .map_err(|error| LifecycleError::Protocol(error.to_string()))
+    }
 }
 
 pub fn request_from_command(
@@ -261,6 +275,7 @@ pub fn request_from_command(
         profile_name: command.profile.clone(),
         direct_profile,
         save_profile_name: command.save_profile.clone(),
+        replace_profile_name: command.replace_profile.clone(),
         local_connect_endpoint,
         cwd_hint,
         use_install_proxy: command.use_install_proxy.unwrap_or(true),
@@ -643,6 +658,7 @@ mod tests {
                 profile_name: Some("130".to_string()),
                 direct_profile: None,
                 save_profile_name: None,
+                replace_profile_name: None,
                 local_connect_endpoint: "10.1.26.84:7474".to_string(),
                 cwd_hint: None,
                 use_install_proxy: true,
@@ -697,6 +713,7 @@ mod tests {
                 profile_name: Some("130".to_string()),
                 direct_profile: None,
                 save_profile_name: None,
+                replace_profile_name: None,
                 local_connect_endpoint: "10.1.26.84:7474".to_string(),
                 cwd_hint: Some(PathBuf::from("/opt/data/workspace/app-insight")),
                 use_install_proxy: true,
@@ -760,6 +777,7 @@ mod tests {
             profile_name: None,
             direct_profile: Some(profile()),
             save_profile_name: Some("130".to_string()),
+            replace_profile_name: None,
             local_connect_endpoint: "10.1.26.84:7474".to_string(),
             cwd_hint: None,
             use_install_proxy: true,
@@ -767,6 +785,63 @@ mod tests {
 
         assert!(result.is_err());
         assert!(history.load().unwrap().hosts.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_host_connect_replaces_old_profile_name_after_success() {
+        let path = unique_path("remote-host-connect-replace-profile.toml");
+        let history = RemoteHostHistoryStore::new(&path);
+        let mut original = profile();
+        original.name = "kk@10.1.29.130".to_string();
+        original.host = "10.1.29.130".to_string();
+        original.ssh_user = "kk".to_string();
+        history.upsert_profile(original).unwrap();
+        let catalog_targets = Rc::new(RefCell::new(Vec::new()));
+        let gateway = FakeGateway {
+            targets: catalog_targets.clone(),
+        };
+        let registry = TargetRegistryService::new(gateway.clone());
+        let runtime = RemoteHostConnectRuntime::new(
+            history.clone(),
+            FakeProbe {
+                calls: Rc::new(RefCell::new(0)),
+                port: 7476,
+            },
+            FakeBootstrapper {
+                plans: Rc::new(RefCell::new(Vec::new())),
+                catalog_targets: Some(catalog_targets.clone()),
+            },
+            registry.clone(),
+            RemoteSessionCreationService::new(
+                FakeCreateTransport {
+                    requests: Rc::new(RefCell::new(Vec::new())),
+                    catalog_targets,
+                },
+                registry,
+            ),
+        );
+        let mut edited = profile();
+        edited.name = "kk@10.1.29.140".to_string();
+        edited.host = "10.1.29.140".to_string();
+        edited.ssh_user = "kk".to_string();
+
+        runtime
+            .connect(RemoteHostConnectRequest {
+                profile_name: None,
+                direct_profile: Some(edited),
+                save_profile_name: Some("kk@10.1.29.140".to_string()),
+                replace_profile_name: Some("kk@10.1.29.130".to_string()),
+                local_connect_endpoint: "10.1.26.84:7474".to_string(),
+                cwd_hint: None,
+                use_install_proxy: true,
+            })
+            .unwrap();
+
+        let hosts = history.load().unwrap().hosts;
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "kk@10.1.29.140");
+        assert_eq!(hosts[0].host, "10.1.29.140");
         let _ = std::fs::remove_file(path);
     }
 
@@ -804,6 +879,7 @@ mod tests {
                 profile_name: None,
                 direct_profile: Some(profile()),
                 save_profile_name: None,
+                replace_profile_name: None,
                 local_connect_endpoint: "10.1.26.84:7474".to_string(),
                 cwd_hint: None,
                 use_install_proxy: true,
@@ -885,6 +961,7 @@ mod tests {
                 profile_name: None,
                 direct_profile: Some(profile()),
                 save_profile_name: None,
+                replace_profile_name: None,
                 local_connect_endpoint: "10.1.26.84:7474".to_string(),
                 cwd_hint: None,
                 use_install_proxy: false,

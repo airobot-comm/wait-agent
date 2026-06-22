@@ -363,6 +363,7 @@ pub struct ConnectRemoteHostCommand {
     pub sudo_password_stdin: bool,
     pub remote_port: Option<String>,
     pub save_profile: Option<String>,
+    pub replace_profile: Option<String>,
     pub use_install_proxy: Option<bool>,
 }
 
@@ -1361,6 +1362,7 @@ fn parse_connect_remote_host(args: Vec<String>) -> Result<ConnectRemoteHostComma
     let mut sudo_password_stdin = false;
     let mut remote_port = None;
     let mut save_profile = None;
+    let mut replace_profile = None;
     let mut use_install_proxy = None;
 
     while let Some(arg) = iter.next() {
@@ -1387,6 +1389,9 @@ fn parse_connect_remote_host(args: Vec<String>) -> Result<ConnectRemoteHostComma
             "--sudo-password-stdin" => sudo_password_stdin = true,
             "--remote-port" => remote_port = Some(expect_value("--remote-port", &mut iter)?),
             "--save-profile" => save_profile = Some(expect_value("--save-profile", &mut iter)?),
+            "--replace-profile" => {
+                replace_profile = Some(expect_value("--replace-profile", &mut iter)?)
+            }
             "--use-install-proxy" => {
                 let value = expect_value("--use-install-proxy", &mut iter)?;
                 use_install_proxy = Some(parse_bool_flag("--use-install-proxy", &value)?);
@@ -1412,6 +1417,7 @@ fn parse_connect_remote_host(args: Vec<String>) -> Result<ConnectRemoteHostComma
         sudo_password_stdin,
         remote_port,
         save_profile,
+        replace_profile,
         use_install_proxy,
     })
 }
@@ -1829,6 +1835,8 @@ mod tests {
             "auto",
             "--save-profile",
             "130",
+            "--replace-profile",
+            "old-130",
             "--use-install-proxy",
             "false",
         ])
@@ -1851,6 +1859,7 @@ mod tests {
                 assert!(command.sudo_password_stdin);
                 assert_eq!(command.remote_port.as_deref(), Some("auto"));
                 assert_eq!(command.save_profile.as_deref(), Some("130"));
+                assert_eq!(command.replace_profile.as_deref(), Some("old-130"));
                 assert_eq!(command.use_install_proxy, Some(false));
             }
             other => panic!("unexpected command: {other:?}"),

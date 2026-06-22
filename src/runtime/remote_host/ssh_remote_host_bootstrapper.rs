@@ -7,7 +7,7 @@ use crate::runtime::remote_host::remote_host_secret_store::{
     FileRemoteHostSecretStore, RemoteHostSecretId, RemoteHostSecretStore, RemoteHostSecretValue,
 };
 use crate::runtime::remote_host::remote_ssh_executor::{
-    RemoteSshAuth, RemoteSshExecutor, RemoteSshTarget, RusshRemoteSshExecutor,
+    RemoteSshAuth, RemoteSshExecutor, RemoteSshOutput, RemoteSshTarget, RusshRemoteSshExecutor,
 };
 use std::fmt;
 
@@ -164,7 +164,9 @@ where
         &self,
         plan: &RemoteHostBootstrapPlan,
     ) -> Result<(), Self::Error> {
-        self.run_ssh_command(plan, &plan.install_or_update_command, true)?;
+        if !self.remote_waitagent_is_current(plan)? {
+            self.run_ssh_command(plan, &plan.install_or_update_command, true)?;
+        }
         self.run_ssh_command(plan, &plan.start_plan.command, false)
     }
 }
@@ -176,31 +178,21 @@ where
     E: RemoteSshExecutor,
     E::Error: ToString,
 {
+    fn remote_waitagent_is_current(
+        &self,
+        plan: &RemoteHostBootstrapPlan,
+    ) -> Result<bool, RemoteHostBootstrapError> {
+        let output = self.run_ssh_output(plan, &current_version_check_command(), false)?;
+        Ok(output.status == 0)
+    }
+
     fn run_ssh_command(
         &self,
         plan: &RemoteHostBootstrapPlan,
         remote_command: &str,
         allow_sudo: bool,
     ) -> Result<(), RemoteHostBootstrapError> {
-        let ssh_password = self.ssh_password(plan)?;
-        let sudo_password = if allow_sudo {
-            self.sudo_password(plan)?
-        } else {
-            None
-        };
-        let target = self.ssh_target(plan, ssh_password)?;
-        let remote_command = if sudo_password.is_some() {
-            format!("sudo -S sh -lc {}", shell_single_quote(remote_command))
-        } else {
-            remote_command.to_string()
-        };
-        let stdin = sudo_password
-            .as_ref()
-            .map(|secret| format!("{}\n", secret.expose_secret()));
-        let output = self
-            .ssh_executor
-            .exec(&target, &remote_command, stdin.as_deref())
-            .map_err(|error| RemoteHostBootstrapError::new(error.to_string()))?;
+        let output = self.run_ssh_output(plan, remote_command, allow_sudo)?;
         if output.status == 0 {
             Ok(())
         } else {
@@ -210,6 +202,32 @@ where
                 stderr_summary(&output.stderr)
             )))
         }
+    }
+
+    fn run_ssh_output(
+        &self,
+        plan: &RemoteHostBootstrapPlan,
+        remote_command: &str,
+        allow_sudo: bool,
+    ) -> Result<RemoteSshOutput, RemoteHostBootstrapError> {
+        let ssh_password = self.ssh_password(plan)?;
+        let sudo_password = if allow_sudo {
+            self.sudo_password(plan)?
+        } else {
+            None
+        };
+        let target = self.ssh_target(plan, ssh_password)?;
+        let remote_command = if sudo_password.is_some() {
+            sudo_shell_command(remote_command)
+        } else {
+            remote_command.to_string()
+        };
+        let stdin = sudo_password
+            .as_ref()
+            .map(|secret| format!("{}\n", secret.expose_secret()));
+        self.ssh_executor
+            .exec(&target, &remote_command, stdin.as_deref())
+            .map_err(|error| RemoteHostBootstrapError::new(error.to_string()))
     }
 
     fn ssh_target(
@@ -302,17 +320,32 @@ fn stderr_summary(stderr: &[u8]) -> String {
 }
 
 pub fn install_or_update_command() -> String {
-    let expected_version = env!("CARGO_PKG_VERSION");
     let install = format!(
         "curl -fsSL {} | bash",
         shell_single_quote(WAITAGENT_INSTALL_SCRIPT_URL)
     );
     format!(
-        "if ! command -v waitagent >/dev/null 2>&1 || ! waitagent --version 2>/dev/null | grep -q {}; then {}; fi",
-        shell_single_quote(expected_version),
+        "if ! {}; then {}; fi",
+        current_version_check_command(),
         install
     )
 }
+
+fn current_version_check_command() -> String {
+    let expected_version = env!("CARGO_PKG_VERSION");
+    format!(
+        "command -v waitagent >/dev/null 2>&1 && waitagent --version 2>/dev/null | grep -q {}",
+        shell_single_quote(expected_version)
+    )
+}
+
+fn sudo_shell_command(remote_command: &str) -> String {
+    format!(
+        "sudo -S -p '' sh -lc {}",
+        shell_single_quote(remote_command)
+    )
+}
+
 fn shell_single_quote(value: &str) -> String {
     let quote = char::from(39);
     let slash = char::from(92);
@@ -347,6 +380,7 @@ mod tests {
     #[derive(Clone)]
     struct RecordingSshExecutor {
         calls: Rc<RefCell<Vec<(RemoteSshTarget, String, Option<String>)>>>,
+        statuses: Rc<RefCell<Vec<u32>>>,
     }
 
     impl RemoteSshExecutor for RecordingSshExecutor {
@@ -363,8 +397,9 @@ mod tests {
                 command.to_string(),
                 stdin.map(str::to_string),
             ));
+            let status = self.statuses.borrow_mut().pop().unwrap_or(0);
             Ok(RemoteSshOutput {
-                status: 0,
+                status,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             })
@@ -505,6 +540,61 @@ mod tests {
             store,
             RecordingSshExecutor {
                 calls: calls.clone(),
+                statuses: Rc::new(RefCell::new(vec![0, 0, 1])),
+            },
+        );
+
+        bootstrapper.ensure_waitagent_and_start(&plan).unwrap();
+
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0.host, "10.1.29.130");
+        assert_eq!(calls[0].0.user, "kk");
+        assert!(calls[0].1.contains("waitagent --version"));
+        assert_eq!(calls[0].2, None);
+        assert!(calls[1].1.starts_with("sudo -S -p '' sh -lc "));
+        assert_eq!(calls[1].2.as_deref(), Some("sudo-secret\n"));
+        assert!(calls[2].1.contains("__remote-daemon"));
+        assert_eq!(calls[2].2, None);
+    }
+
+    #[test]
+    fn remote_host_bootstrapper_skips_sudo_install_when_waitagent_is_current() {
+        let ssh_id = RemoteHostSecretId::new("waitagent.remote-host.130.ssh-password").unwrap();
+        let sudo_id = RemoteHostSecretId::new("waitagent.remote-host.130.sudo-password").unwrap();
+        let store = MemoryRemoteHostSecretStore::default();
+        store
+            .put_secret(&ssh_id, RemoteHostSecretValue::new("ssh-secret"))
+            .unwrap();
+        store
+            .put_secret(&sudo_id, RemoteHostSecretValue::new("sudo-secret"))
+            .unwrap();
+        let profile = RemoteHostProfile {
+            name: "130".to_string(),
+            host: "10.1.29.130".to_string(),
+            ssh_user: "kk".to_string(),
+            auth: RemoteHostAuthProfile::Password {
+                password_secret_id: Some(ssh_id),
+            },
+            sudo_password_secret_id: Some(sudo_id),
+            preferred_remote_port: RemotePortPreference::Auto,
+            last_remote_port: None,
+            last_endpoint: None,
+            last_connected_at: None,
+            use_install_proxy: true,
+        };
+        let plan = RemoteHostBootstrapPlan::from_profile(
+            &profile,
+            7476,
+            "10.1.26.84:7474",
+            "10.1.29.130#7476",
+        );
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let bootstrapper = SshRemoteHostBootstrapper::with_executor(
+            store,
+            RecordingSshExecutor {
+                calls: calls.clone(),
+                statuses: Rc::new(RefCell::new(vec![0, 0])),
             },
         );
 
@@ -512,11 +602,10 @@ mod tests {
 
         let calls = calls.borrow();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0.host, "10.1.29.130");
-        assert_eq!(calls[0].0.user, "kk");
-        assert!(calls[0].1.starts_with("sudo -S sh -lc "));
-        assert_eq!(calls[0].2.as_deref(), Some("sudo-secret\n"));
+        assert!(calls[0].1.contains("waitagent --version"));
+        assert_eq!(calls[0].2, None);
         assert!(calls[1].1.contains("__remote-daemon"));
         assert_eq!(calls[1].2, None);
+        assert!(!calls.iter().any(|(_, command, _)| command.contains("sudo")));
     }
 }

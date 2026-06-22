@@ -2389,9 +2389,9 @@ fn run_connect(
     let mut stdin_payload = None;
     args.push("--use-install-proxy".to_string());
     args.push(state.use_install_proxy.to_string());
-    if let Some(profile) = state
-        .selected_profile()
-        .filter(|_| saved_profile_can_connect_by_id(state))
+    let selected_profile = state.selected_profile();
+    if let Some(profile) =
+        selected_profile.filter(|profile| saved_profile_can_connect_by_id(state, profile))
     {
         args.push("--profile".to_string());
         args.push(profile.name.clone());
@@ -2408,7 +2408,11 @@ fn run_connect(
         ]);
         if state.remember {
             args.push("--save-profile".to_string());
-            args.push(format!("{}@{}", state.ssh_user, state.host));
+            args.push(save_profile_name_for_state(state));
+            if let Some(profile) = selected_profile {
+                args.push("--replace-profile".to_string());
+                args.push(profile.name.clone());
+            }
         }
         match state.auth {
             AuthChoice::Password => match state.password_mode {
@@ -2504,9 +2508,62 @@ fn run_connect(
     }
 }
 
-fn saved_profile_can_connect_by_id(state: &ConnectRemoteHostState) -> bool {
+fn saved_profile_can_connect_by_id(
+    state: &ConnectRemoteHostState,
+    profile: &RemoteHostProfile,
+) -> bool {
     state.password_mode == PasswordMode::Saved
         && matches!(state.sudo_mode, SudoMode::Saved | SudoMode::None)
+        && profile_matches_state(profile, state)
+}
+
+fn save_profile_name_for_state(state: &ConnectRemoteHostState) -> String {
+    let default_name = default_profile_name_for(&state.ssh_user, &state.host);
+    let Some(profile) = state.selected_profile() else {
+        return default_name;
+    };
+    let previous_default_name = default_profile_name_for(&profile.ssh_user, &profile.host);
+    if profile.name == previous_default_name {
+        default_name
+    } else {
+        profile.name.clone()
+    }
+}
+
+fn default_profile_name_for(ssh_user: &str, host: &str) -> String {
+    format!("{ssh_user}@{host}")
+}
+
+fn profile_matches_state(profile: &RemoteHostProfile, state: &ConnectRemoteHostState) -> bool {
+    profile.host == state.host
+        && profile.ssh_user == state.ssh_user
+        && normalized_port_matches_profile(&state.remote_port, profile)
+        && auth_matches_state(&profile.auth, state)
+        && profile.use_install_proxy == state.use_install_proxy
+}
+
+fn normalized_port_matches_profile(value: &str, profile: &RemoteHostProfile) -> bool {
+    normalized_port(value) == profile_display_port(profile)
+}
+
+fn profile_display_port(profile: &RemoteHostProfile) -> String {
+    match profile.last_remote_port {
+        Some(port) => port.to_string(),
+        None => match profile.preferred_remote_port {
+            RemotePortPreference::Auto => "auto".to_string(),
+            RemotePortPreference::Port(port) => port.to_string(),
+        },
+    }
+}
+
+fn auth_matches_state(auth: &RemoteHostAuthProfile, state: &ConnectRemoteHostState) -> bool {
+    match (auth, state.auth) {
+        (RemoteHostAuthProfile::Password { .. }, AuthChoice::Password) => true,
+        (RemoteHostAuthProfile::Key { key_path }, AuthChoice::Key) => {
+            key_path.to_string_lossy() == state.key_path
+        }
+        _ => false,
+    }
 }
 
 fn validate(state: &ConnectRemoteHostState) -> Result<(), String> {
@@ -2692,6 +2749,58 @@ mod tests {
         state.apply_key(KeyEvent::from(KeyCode::Char('8')));
 
         assert_eq!(state.proxy_config.https_proxy, "http://proxy.example:443");
+    }
+
+    #[test]
+    fn edited_saved_host_uses_replace_profile_and_updates_default_name() {
+        let mut state = ConnectRemoteHostState::load();
+        state.profiles = vec![RemoteHostProfile {
+            name: "k@127.0.0.1".to_string(),
+            host: "127.0.0.1".to_string(),
+            ssh_user: "k".to_string(),
+            auth: RemoteHostAuthProfile::Password {
+                password_secret_id: None,
+            },
+            sudo_password_secret_id: None,
+            preferred_remote_port: RemotePortPreference::Auto,
+            last_remote_port: Some(7575),
+            last_endpoint: None,
+            last_connected_at: None,
+            use_install_proxy: true,
+        }];
+        state.selected = 0;
+        let _ = state.sync_selected_profile();
+        state.host = "127.0.0.2".to_string();
+
+        assert!(!saved_profile_can_connect_by_id(
+            &state,
+            state.selected_profile().unwrap()
+        ));
+        assert_eq!(save_profile_name_for_state(&state), "k@127.0.0.2");
+    }
+
+    #[test]
+    fn edited_saved_host_preserves_custom_profile_name() {
+        let mut state = ConnectRemoteHostState::load();
+        state.profiles = vec![RemoteHostProfile {
+            name: "prod".to_string(),
+            host: "127.0.0.1".to_string(),
+            ssh_user: "k".to_string(),
+            auth: RemoteHostAuthProfile::Password {
+                password_secret_id: None,
+            },
+            sudo_password_secret_id: None,
+            preferred_remote_port: RemotePortPreference::Auto,
+            last_remote_port: Some(7575),
+            last_endpoint: None,
+            last_connected_at: None,
+            use_install_proxy: true,
+        }];
+        state.selected = 0;
+        let _ = state.sync_selected_profile();
+        state.host = "127.0.0.2".to_string();
+
+        assert_eq!(save_profile_name_for_state(&state), "prod");
     }
 
     #[test]
