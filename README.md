@@ -100,7 +100,44 @@ waitagent --connect <server-ip>:7474
 
 Remote sessions appear in the sidebar alongside local sessions. Input flows through the server control plane to the PTY-owning node; output synchronizes back to all attached consoles. The transport uses a single long-lived node-scoped gRPC connection with session-scoped routing, reconnect support, and replay on reconnect.
 
+From an interactive workspace, `Ctrl-W` opens **Connect Remote Host**. This can SSH into a remote host, install or update `waitagent`, start the remote daemon, and activate the default remote session once the connection signal arrives. `Ctrl-S` creates an additional session on the selected connected remote endpoint.
+
+Remote host bootstrap supports password or key authentication, optional sudo password, saved host profiles, and an install proxy configuration. The proxy configuration is available from the Connect Remote Host popup under **Proxy Configuration**; when enabled, the remote install command exports `all_proxy`, `https_proxy`, uppercase variants, and `no_proxy` so the GitHub release/API fetches inside the installer inherit the proxy.
+
 ---
+
+## Current Support Status
+
+### Systems
+
+| System | Status | Notes |
+|---|---|---|
+| Linux x86_64 | Supported release target | Published as `.tar.gz`, `.deb`, and `.rpm`. |
+| macOS Apple Silicon | Supported release target | Published as `.tar.gz` and `.dmg`. |
+| Windows via WSL2 | Supported through Linux build | Use a recent WSL2 and the networking settings below. Native Windows binaries are not currently published. |
+| Linux source builds | Supported | Dependency helper covers Debian/Ubuntu, Fedora, Arch/Manjaro, Alpine, and openSUSE/SLES. |
+| macOS source builds | Supported | Uses Homebrew dependencies. |
+| macOS Intel | Source build only | No prebuilt Intel macOS release artifact. |
+| Native Windows | Not supported | Run WaitAgent inside WSL2 instead. |
+
+### Runtime Features
+
+| Feature | Status |
+|---|---|
+| Local tmux-backed workspace with fixed sidebar, main slot, and footer | Implemented |
+| Local session create, switch, attach, detach, fullscreen, and logs | Implemented |
+| gRPC node session protocol | Implemented |
+| `--port` / `--connect` CLI remote mode | Implemented |
+| `Ctrl-W` remote host SSH bootstrap | Implemented |
+| Saved remote host profiles and credential reuse | Implemented |
+| Remote install proxy configuration | Implemented |
+| `Ctrl-S` create new session on selected remote endpoint | Implemented |
+| Session-scoped routing and authority transport | Implemented |
+| Reconnect with bounded replay | Implemented |
+| Remote terminal bootstrap and replay | Implemented |
+| Live-mirror open/close protocol | Implemented |
+| Remote exit/sidebar disappearance latency | In progress |
+| Full terminal-mode parity for every remote TUI | In progress |
 
 ## Remote Protocol Status
 
@@ -134,6 +171,51 @@ cd wait-agent
 ./scripts/install-build-deps.sh
 cargo build --release
 ```
+
+### WSL2 Setup
+
+WaitAgent works in WSL2 through the Linux build. For remote host workflows, WSL networking must allow the remote machine to dial back into the WaitAgent listener shown in the footer. Use mirrored networking with DNS tunneling, Windows firewall integration, and Windows proxy propagation.
+
+1. Update WSL from Windows PowerShell:
+
+```powershell
+wsl --update
+wsl --version
+```
+
+2. Create or edit `%UserProfile%\.wslconfig` on Windows:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+dnsTunneling=true
+firewall=true
+autoProxy=true
+```
+
+3. Restart WSL:
+
+```powershell
+wsl --shutdown
+```
+
+Then reopen your Linux distribution.
+
+4. Install WaitAgent inside WSL:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kikakkz/wait-agent/main/scripts/install.sh | bash
+```
+
+5. Start a listener workspace inside WSL:
+
+```bash
+waitagent --port 7474
+```
+
+Use the listener/connect endpoint shown in the WaitAgent footer when connecting remote hosts. If the remote machine cannot connect back, check Windows Defender Firewall and allow inbound TCP for the selected port, for example `7474`.
+
+If your WSL or Windows environment uses a corporate proxy, keep `autoProxy=true` and configure the WaitAgent remote install proxy from **Ctrl-W -> Proxy Configuration** when the remote host also needs that proxy to reach GitHub releases.
 
 ---
 
