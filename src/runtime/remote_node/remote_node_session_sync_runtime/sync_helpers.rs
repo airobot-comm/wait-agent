@@ -57,12 +57,14 @@ const SOURCE_PUBLICATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalCatalogChangeReason {
     LocalTargetExited { target_session_name: String },
+    LocalRuntimeChanged,
 }
 
 impl LocalCatalogChangeReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::LocalTargetExited { .. } => "local-target-exited",
+            Self::LocalRuntimeChanged => "local-runtime-changed",
         }
     }
 
@@ -71,6 +73,7 @@ impl LocalCatalogChangeReason {
             Self::LocalTargetExited {
                 target_session_name,
             } => format!("local-target-exited	{target_session_name}"),
+            Self::LocalRuntimeChanged => "local-runtime-changed".to_string(),
         }
     }
 
@@ -80,6 +83,7 @@ impl LocalCatalogChangeReason {
             "local-target-exited" if !detail.is_empty() => Some(Self::LocalTargetExited {
                 target_session_name: detail.to_string(),
             }),
+            "local-runtime-changed" => Some(Self::LocalRuntimeChanged),
             _ => None,
         }
     }

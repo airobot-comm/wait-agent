@@ -650,6 +650,65 @@ mod tests {
     }
 
     #[test]
+    fn local_runtime_change_triggers_catalog_diff_sync_without_poll_wait() {
+        let receiver_slot = Arc::new(Mutex::new(None));
+        let mut initial = session("wa-1", "shell-1");
+        initial.command_name = Some("bash".to_string());
+        initial.current_path = Some(PathBuf::from("/tmp/start"));
+        initial.task_state = ManagedSessionTaskState::Input;
+        let sessions = Arc::new(Mutex::new(vec![initial]));
+        let (local_catalog_tx, local_catalog_rx) = mpsc::channel();
+        let runtime = RemoteNodeSessionSyncRuntime {
+            gateway: MutableFakeGateway {
+                sessions: sessions.clone(),
+            },
+            transport: FakeTransport {
+                receiver_slot: receiver_slot.clone(),
+            },
+            local_target_exit_observer: RecordingLocalTargetExitObserver::default(),
+            network: RemoteNetworkConfig {
+                port: 7474,
+                connect: Some("127.0.0.1:7474".to_string()),
+                node_id: None,
+                public_endpoint: None,
+            },
+            reconnect_delay: Duration::from_millis(10),
+        };
+
+        let guard = runtime
+            .start_with_local_catalog_changes(local_catalog_rx)
+            .expect("runtime should start");
+        let first = wait_for_envelope(&receiver_slot);
+        let Some(Body::TargetPublished(payload)) = first.body else {
+            panic!("expected initial target_published body");
+        };
+        assert_eq!(payload.transport_session_id, "shell-1");
+        assert_eq!(payload.command_name.as_deref(), Some("bash"));
+
+        {
+            let mut sessions = sessions
+                .lock()
+                .expect("fake sessions mutex should not be poisoned");
+            sessions[0].command_name = Some("kimi".to_string());
+            sessions[0].current_path = Some(PathBuf::from("/tmp/live"));
+            sessions[0].task_state = ManagedSessionTaskState::Running;
+        }
+        local_catalog_tx
+            .send(LocalCatalogChangeReason::LocalRuntimeChanged)
+            .expect("local runtime change should send");
+
+        let second = wait_for_envelope(&receiver_slot);
+        let Some(Body::TargetPublished(payload)) = second.body else {
+            panic!("expected target_published body after runtime change");
+        };
+        assert_eq!(payload.transport_session_id, "shell-1");
+        assert_eq!(payload.command_name.as_deref(), Some("kimi"));
+        assert_eq!(payload.current_path.as_deref(), Some("/tmp/live"));
+        assert_eq!(payload.revision, 2);
+        drop(guard);
+    }
+
+    #[test]
     fn catalog_transport_event_syncs_newly_created_target_into_baseline() {
         let (handle, mut receiver) =
             RemoteNodeSessionHandle::new_for_tests("10.0.0.2", "server-session-1");

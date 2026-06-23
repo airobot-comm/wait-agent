@@ -1,6 +1,9 @@
 use crate::application::target_registry_service::TargetRegistryService;
 use crate::cli::{RemoteNetworkConfig, UiPaneCommand};
 use crate::domain::local_runtime::ChromeSurface;
+use crate::domain::session_catalog::{
+    ManagedSessionRecord, ManagedSessionTaskState, SessionTransport,
+};
 use crate::domain::workspace::WorkspaceInstanceId;
 use crate::infra::error_log::ERROR_LOG;
 use crate::infra::tmux::{TmuxChromeGateway, TmuxSessionName, TmuxSocketName, TmuxWorkspaceHandle};
@@ -9,12 +12,24 @@ use crate::runtime::event_driven_chrome_runtime::EventDrivenChromeRenderUpdate;
 use crate::runtime::event_driven_ui_pane_runtime::{
     EventDrivenSidebarInputOutcome, EventDrivenUiPaneRuntime,
 };
+use crate::runtime::remote_node_session_sync_runtime::{
+    LocalCatalogChangeReason, RemoteNodeSessionSyncRuntime,
+};
 use std::collections::HashSet;
 use std::io;
+use std::path::PathBuf;
 use std::time::Instant;
 
 const WAITAGENT_ACTIVE_TARGET_OPTION: &str = "@waitagent_active_target";
 const WAITAGENT_SIDEBAR_SELECTED_TARGET_OPTION: &str = "@waitagent_sidebar_selected_target";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalRuntimeSignature {
+    target: String,
+    command_name: Option<String>,
+    current_path: Option<PathBuf>,
+    task_state: ManagedSessionTaskState,
+}
 
 pub struct EventDrivenTmuxPaneRuntime<G, R = G> {
     gateway: G,
@@ -22,6 +37,7 @@ pub struct EventDrivenTmuxPaneRuntime<G, R = G> {
     pane_runtime: EventDrivenUiPaneRuntime,
     network: RemoteNetworkConfig,
     previous_visible_targets: HashSet<String>,
+    previous_active_runtime: Option<LocalRuntimeSignature>,
 }
 
 impl<G> EventDrivenTmuxPaneRuntime<G, G>
@@ -37,6 +53,7 @@ where
             pane_runtime: EventDrivenUiPaneRuntime::new(),
             network: RemoteNetworkConfig::default(),
             previous_visible_targets: HashSet::new(),
+            previous_active_runtime: None,
         }
     }
 }
@@ -59,6 +76,7 @@ where
             pane_runtime: EventDrivenUiPaneRuntime::new(),
             network,
             previous_visible_targets: HashSet::new(),
+            previous_active_runtime: None,
         }
     }
 
@@ -218,6 +236,11 @@ where
                 .map(|session| session.address.qualified_target())
                 .collect::<Vec<_>>()
         ));
+        self.notify_session_sync_on_active_runtime_change(
+            &command.socket_name,
+            active_target.as_deref(),
+            &visible_sessions,
+        );
         let update = self.pane_runtime.publish_session_snapshot(
             &command.socket_name,
             &command.session_name,
@@ -234,6 +257,52 @@ where
         ));
         Ok(update)
     }
+
+    fn notify_session_sync_on_active_runtime_change(
+        &mut self,
+        socket_name: &str,
+        active_target: Option<&str>,
+        visible_sessions: &[ManagedSessionRecord],
+    ) {
+        let next = active_target.and_then(|target| {
+            active_local_runtime_signature(socket_name, target, visible_sessions)
+        });
+        if self.previous_active_runtime == next {
+            return;
+        }
+        self.previous_active_runtime = next;
+        if let Err(error) = RemoteNodeSessionSyncRuntime::notify_local_catalog_changed(
+            socket_name,
+            &self.network,
+            LocalCatalogChangeReason::LocalRuntimeChanged,
+        ) {
+            ERROR_LOG.log(format!(
+                "[diag-sync] local_runtime_notify_failed socket={} error={}",
+                socket_name, error
+            ));
+        }
+    }
+}
+
+fn active_local_runtime_signature(
+    socket_name: &str,
+    active_target: &str,
+    visible_sessions: &[ManagedSessionRecord],
+) -> Option<LocalRuntimeSignature> {
+    visible_sessions
+        .iter()
+        .find(|session| {
+            session.address.transport() == &SessionTransport::LocalTmux
+                && session.address.server_id() == socket_name
+                && session.address.qualified_target() == active_target
+                && session.is_target_host()
+        })
+        .map(|session| LocalRuntimeSignature {
+            target: active_target.to_string(),
+            command_name: session.command_name.clone(),
+            current_path: session.current_path.clone(),
+            task_state: session.task_state,
+        })
 }
 
 fn workspace_handle(command: &UiPaneCommand) -> TmuxWorkspaceHandle {
@@ -274,7 +343,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        EventDrivenTmuxPaneRuntime, WAITAGENT_ACTIVE_TARGET_OPTION,
+        active_local_runtime_signature, EventDrivenTmuxPaneRuntime, WAITAGENT_ACTIVE_TARGET_OPTION,
         WAITAGENT_SIDEBAR_SELECTED_TARGET_OPTION,
     };
     use crate::cli::UiPaneCommand;
@@ -288,7 +357,7 @@ mod tests {
         TmuxChromeGateway, TmuxGateway, TmuxPaneId, TmuxSessionGateway, TmuxSocketName,
         TmuxWindowHandle, TmuxWorkspaceHandle,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Clone)]
@@ -479,6 +548,31 @@ mod tests {
                 .push((option_name.to_string(), value.to_string()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn active_runtime_signature_tracks_active_local_target_metadata() {
+        let sessions = vec![
+            session_with_role(
+                "wa-1",
+                "workspace",
+                "kimi",
+                WorkspaceSessionRole::WorkspaceChrome,
+            ),
+            session_with_role("wa-1", "target-a", "kimi", WorkspaceSessionRole::TargetHost),
+        ];
+
+        let signature = active_local_runtime_signature("wa-1", "wa-1:target-a", &sessions)
+            .expect("active local target should have a runtime signature");
+
+        assert_eq!(signature.target, "wa-1:target-a");
+        assert_eq!(signature.command_name.as_deref(), Some("kimi"));
+        assert_eq!(
+            signature.current_path.as_deref(),
+            Some(Path::new("/tmp/demo"))
+        );
+        assert_eq!(signature.task_state, ManagedSessionTaskState::Input);
+        assert!(active_local_runtime_signature("wa-1", "peer-a:target-a", &sessions).is_none());
     }
 
     #[test]
