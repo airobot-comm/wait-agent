@@ -391,7 +391,7 @@ impl ShellRuntimeHooks {
             })?;
         writeln!(
             file,
-            "__waitagent_signal_runtime() {{ if [ -n \"${{__WAITAGENT_RUNTIME_SIGNALING:-}}\" ]; then return 0; fi; local __waitagent_cmd=\"$1\"; if [ -z \"$__waitagent_cmd\" ]; then __waitagent_cmd=bash; fi; __WAITAGENT_RUNTIME_EVENT_SEQ=$(( ${{__WAITAGENT_RUNTIME_EVENT_SEQ:-0}} + 1 )); local __waitagent_seq=$__WAITAGENT_RUNTIME_EVENT_SEQ; __WAITAGENT_RUNTIME_SIGNALING=1; ({} --command-name \"$__waitagent_cmd\" --event-seq \"$__waitagent_seq\") >/dev/null 2>&1 & __WAITAGENT_RUNTIME_SIGNALING=; }}",
+            "__waitagent_signal_runtime() {{ if [ -n \"${{__WAITAGENT_RUNTIME_SIGNALING:-}}\" ]; then return 0; fi; local __waitagent_cmd=\"$1\"; if [ -z \"$__waitagent_cmd\" ]; then __waitagent_cmd=bash; fi; __WAITAGENT_RUNTIME_EVENT_SEQ=$(( ${{__WAITAGENT_RUNTIME_EVENT_SEQ:-0}} + 1 )); local __waitagent_seq=$__WAITAGENT_RUNTIME_EVENT_SEQ; __WAITAGENT_RUNTIME_SIGNALING=1; ({} --command-name \"$__waitagent_cmd\" --event-seq \"$__waitagent_seq\") >/dev/null 2>&1 & disown; __WAITAGENT_RUNTIME_SIGNALING=; }}",
             signal_command
         )
         .map_err(|error| {
@@ -539,6 +539,7 @@ mod tests {
         assert!(content.contains("__chrome-refresh-socket-signal"));
         assert!(content.contains("--target-session-name"));
         assert!(content.contains("--command-name"));
+        assert!(content.contains("& disown"));
         assert!(content.contains("__waitagent_preexec"));
         assert!(content.contains("__waitagent_prompt_command"));
         assert!(content.contains("trap '__waitagent_preexec \"$BASH_COMMAND\"' DEBUG"));
