@@ -1010,6 +1010,22 @@ fn start_workspace_registry_lifecycle_watcher(
     network: RemoteNetworkConfig,
     lifecycle_tx: mpsc::Sender<OwnerLifecycleEvent>,
 ) -> io::Result<thread::JoinHandle<()>> {
+    #[cfg(target_os = "linux")]
+    {
+        start_workspace_registry_inotify_watcher(network, lifecycle_tx)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        start_workspace_registry_polling_watcher(network, lifecycle_tx)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_workspace_registry_inotify_watcher(
+    network: RemoteNetworkConfig,
+    lifecycle_tx: mpsc::Sender<OwnerLifecycleEvent>,
+) -> io::Result<thread::JoinHandle<()>> {
     let registry_path = workspace_socket_registry_path(&network);
     let registry_dir = registry_path.parent().unwrap_or_else(|| Path::new("/tmp"));
     fs::create_dir_all(registry_dir)?;
@@ -1077,6 +1093,30 @@ fn start_workspace_registry_lifecycle_watcher(
         }
 
         unsafe { libc::close(fd) };
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_workspace_registry_polling_watcher(
+    network: RemoteNetworkConfig,
+    lifecycle_tx: mpsc::Sender<OwnerLifecycleEvent>,
+) -> io::Result<thread::JoinHandle<()>> {
+    Ok(thread::spawn(move || {
+        let mut previous = live_workspace_sockets(&network).unwrap_or_default();
+        loop {
+            thread::sleep(BRIDGE_REFRESH_INTERVAL);
+            let current = live_workspace_sockets(&network).unwrap_or_default();
+            if current == previous {
+                continue;
+            }
+            previous = current.clone();
+            if lifecycle_tx
+                .send(OwnerLifecycleEvent::WorkspaceRegistryChanged(current))
+                .is_err()
+            {
+                return;
+            }
+        }
     }))
 }
 
