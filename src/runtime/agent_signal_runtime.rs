@@ -323,20 +323,29 @@ mod tests {
 
     #[test]
     fn kimi_session_end_clears_agent_signal_metadata() {
-        let fixture = SignalRuntimeFixture::new("agent-signal-kimi-session-end");
+        assert_agent_session_end_clears_metadata("kimi", "agent-signal-kimi-session-end");
+    }
+
+    #[test]
+    fn claude_session_end_clears_agent_signal_metadata() {
+        assert_agent_session_end_clears_metadata("claude", "agent-signal-claude-session-end");
+    }
+
+    fn assert_agent_session_end_clears_metadata(agent_name: &str, fixture_name: &str) {
+        let fixture = SignalRuntimeFixture::new(fixture_name);
         let mut running = fixture.signal("UserPromptSubmit", fixture.content_pane.as_str());
-        running.agent = "kimi".to_string();
+        running.agent = agent_name.to_string();
         fixture
             .runtime
             .apply_signal(running)
-            .expect("kimi running signal should apply");
+            .expect("running signal should apply");
 
         let mut ended = fixture.signal("SessionEnd", fixture.content_pane.as_str());
-        ended.agent = "kimi".to_string();
+        ended.agent = agent_name.to_string();
         fixture
             .runtime
             .apply_signal(ended)
-            .expect("kimi session end should clear metadata");
+            .expect("session end should clear metadata");
 
         let agent = fixture
             .backend

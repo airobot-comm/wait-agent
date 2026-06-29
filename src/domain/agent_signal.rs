@@ -86,6 +86,12 @@ impl AgentSignalHandler for ClaudeSignalHandler {
                 ManagedSessionTaskState::Confirm
             }
             "Stop" => ManagedSessionTaskState::Input,
+            "SessionEnd" => {
+                return Some(AgentStateUpdate {
+                    effect: AgentStateEffect::Clear,
+                    source: AgentStateSource::Hook,
+                });
+            }
             _ => return None,
         };
         Some(AgentStateUpdate {
@@ -233,6 +239,10 @@ mod tests {
         assert_eq!(
             handler.handle(&signal("Stop")).map(|u| u.effect),
             Some(AgentStateEffect::Set(ManagedSessionTaskState::Input))
+        );
+        assert_eq!(
+            handler.handle(&signal("SessionEnd")).map(|u| u.effect),
+            Some(AgentStateEffect::Clear)
         );
     }
 

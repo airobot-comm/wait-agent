@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WAITAGENT_HOOK_TAG: &str = "waitagent-agent-signal";
-const CLAUDE_EVENTS: [&str; 7] = [
+const CLAUDE_EVENTS: [&str; 8] = [
     "UserPromptSubmit",
     "PermissionRequest",
     "PreToolUse",
@@ -13,6 +13,7 @@ const CLAUDE_EVENTS: [&str; 7] = [
     "PostToolBatch",
     "Notification",
     "Stop",
+    "SessionEnd",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,5 +208,10 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some());
         }
+        assert!(next
+            .get("hooks")
+            .and_then(|hooks| hooks.get("SessionEnd"))
+            .and_then(Value::as_array)
+            .is_some());
     }
 }
