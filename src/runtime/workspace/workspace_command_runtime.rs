@@ -1,3 +1,4 @@
+use crate::application::codex_hooks_config_service::CodexHooksConfigService;
 use crate::application::remote_session_creation_service::{
     GrpcRemoteSessionCreationTransport, RemoteSessionCreationRequest, RemoteSessionCreationService,
 };
@@ -11,7 +12,8 @@ use crate::cli::{
     ActivateTargetCommand, AttachCommand, ConnectRemoteHostCommand, DetachCommand,
     LocalTargetExitedCommand, LocalTargetHostCommand, MainPaneDiedCommand,
     NewSelectedRemoteSessionCommand, NewTargetCommand, RemoteNetworkConfig,
-    RemoteTargetExitedCommand, StopCommand, ToggleFullscreenCommand, UiPaneCommand,
+    RemoteTargetExitedCommand, RuntimeCommandSignal, StopCommand, ToggleFullscreenCommand,
+    UiPaneCommand,
 };
 use crate::domain::session_catalog::{ManagedSessionRecord, SessionAvailability, SessionTransport};
 use crate::domain::workspace::WorkspaceInstanceId;
@@ -19,9 +21,11 @@ use crate::infra::error_log::ERROR_LOG;
 use crate::infra::tmux::TmuxLayoutGateway;
 use crate::infra::tmux::{
     EmbeddedTmuxBackend, TmuxError, TmuxSessionName, TmuxSocketName, TmuxWorkspaceHandle,
-    WAITAGENT_RUNTIME_COMMAND_OVERRIDE_OPTION,
+    WAITAGENT_RUNTIME_COMMAND_OVERRIDE_OPTION, WAITAGENT_RUNTIME_RUNNING_OVERRIDE,
 };
 use crate::lifecycle::LifecycleError;
+use crate::runtime::agent_signal_runtime::AgentSignalRuntime;
+use crate::runtime::agent_signal_sender_bundle::extract_agent_signal_sender;
 use crate::runtime::current_executable::current_waitagent_executable;
 use crate::runtime::local_target_host_runtime::LocalTargetHostRuntime;
 use crate::runtime::main_slot_runtime::MainSlotRuntime;
@@ -44,11 +48,15 @@ use crate::runtime::workspace_entry_runtime::WorkspaceEntryRuntime;
 use crate::runtime::workspace_layout_runtime::WorkspaceLayoutRuntime;
 use crate::runtime::workspace_runtime::WorkspaceRuntime;
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const WAITAGENT_SIDEBAR_SELECTED_TARGET_OPTION: &str = "@waitagent_sidebar_selected_target";
 const WAITAGENT_REMOTE_SESSION_CREATE_LOCK_PREFIX: &str = "waitagent-remote-session-create-";
+const MAIN_PANE_OUTPUT_TRAILING_REFRESH_DELAY: Duration = Duration::from_millis(500);
+const MAIN_PANE_OUTPUT_SETTLED_REFRESH_DELAY: Duration = Duration::from_millis(2000);
 // This runtime owns the accepted default local command path for workspace
 // bootstrap, attach, target activation, fullscreen, and detach semantics.
 // Event-r4 keeps these user-facing entrypoints off historical polling paths.
@@ -183,6 +191,7 @@ impl WorkspaceCommandRuntime {
         let workspace = self.entry_runtime.bootstrap_workspace(&workspace_dir)?;
         let _live_workspace_registration =
             self.register_live_workspace(workspace.workspace_handle.socket_name.as_str())?;
+        self.ensure_agent_signal_runtime(workspace.workspace_handle.socket_name.as_str())?;
         self.remote_runtime_owner_runtime.ensure_owner_running()?;
         self.main_slot_runtime.ensure_initial_target_materialized(
             &workspace.workspace_handle,
@@ -223,6 +232,7 @@ impl WorkspaceCommandRuntime {
         ));
         let _live_workspace_registration =
             self.register_live_workspace(workspace.workspace_handle.socket_name.as_str())?;
+        self.ensure_agent_signal_runtime(workspace.workspace_handle.socket_name.as_str())?;
         self.remote_runtime_owner_runtime.ensure_owner_running()?;
         ERROR_LOG.log(format!(
             "[diag-newhost] workspace_entry remote_runtime_owner ready elapsed={:?}",
@@ -280,6 +290,7 @@ impl WorkspaceCommandRuntime {
             Some(target) => {
                 let session = self.attachable_session(target)?;
                 self.register_live_workspace_socket(session.address.server_id())?;
+                self.ensure_agent_signal_runtime(session.address.server_id())?;
                 self.remote_runtime_owner_runtime.ensure_owner_running()?;
                 self.start_remote_node_ingress(session.address.server_id())?;
                 self.start_remote_session_sync(session.address.server_id())?;
@@ -293,6 +304,7 @@ impl WorkspaceCommandRuntime {
                     .resolve_default_attach_session()
                     .map_err(tmux_runtime_error)?;
                 self.register_live_workspace_socket(session.address.server_id())?;
+                self.ensure_agent_signal_runtime(session.address.server_id())?;
                 self.remote_runtime_owner_runtime.ensure_owner_running()?;
                 self.start_remote_node_ingress(session.address.server_id())?;
                 self.start_remote_session_sync(session.address.server_id())?;
@@ -682,6 +694,39 @@ impl WorkspaceCommandRuntime {
         })
     }
 
+    fn ensure_agent_signal_runtime(&self, socket_name: &str) -> Result<(), LifecycleError> {
+        let sender_path = extract_agent_signal_sender()?;
+        if let Err(error) = CodexHooksConfigService::from_env(sender_path).reconcile() {
+            ERROR_LOG.log(format!(
+                "[agent-signal] Codex hook reconcile failed: {error}"
+            ));
+        }
+        let runtime = AgentSignalRuntime::new(
+            self.backend.clone(),
+            WorkspaceLayoutRuntime::from_build_env_with_network(self.network.clone())?,
+            RemoteTargetPublicationRuntime::from_build_env_with_network(self.network.clone())?,
+            socket_name.to_string(),
+        );
+        let path = runtime.socket_path().to_path_buf();
+        match runtime.start_background() {
+            Ok(_handle) => {
+                ERROR_LOG.log(format!(
+                    "[agent-signal] receiver started socket={} path={}",
+                    socket_name,
+                    path.display()
+                ));
+                Ok(())
+            }
+            Err(error) => {
+                ERROR_LOG.log(format!(
+                    "[agent-signal] receiver failed socket={} error={}",
+                    socket_name, error
+                ));
+                Ok(())
+            }
+        }
+    }
+
     fn unregister_live_workspace_socket(&self, socket_name: &str) {
         let _ =
             shutdown_remote_session_sync_owner(&remote_session_sync_owner_socket_path(socket_name));
@@ -729,6 +774,7 @@ impl WorkspaceCommandRuntime {
         socket_name: &str,
         target_session_name: Option<&str>,
         command_name: Option<&str>,
+        runtime_signal: RuntimeCommandSignal,
         event_seq: Option<u64>,
     ) -> Result<(), LifecycleError> {
         if let Some(target_session_name) = target_session_name {
@@ -737,10 +783,14 @@ impl WorkspaceCommandRuntime {
                 socket_name: TmuxSocketName::new(socket_name),
                 session_name: TmuxSessionName::new(target_session_name),
             };
-            if let Some(command_name) = command_name {
+            let command_override = match runtime_signal {
+                RuntimeCommandSignal::Running => Some(WAITAGENT_RUNTIME_RUNNING_OVERRIDE),
+                RuntimeCommandSignal::Prompt => command_name,
+            };
+            if let Some(command_override) = command_override {
                 let command_override = event_seq
-                    .map(|seq| format!("{seq}:{command_name}"))
-                    .unwrap_or_else(|| command_name.to_string());
+                    .map(|seq| format!("{seq}:{command_override}"))
+                    .unwrap_or_else(|| command_override.to_string());
                 if let Some(seq) = event_seq {
                     if let Some(current) = self
                         .backend
@@ -784,6 +834,7 @@ impl WorkspaceCommandRuntime {
         let mut stdin = stdin.lock();
         let mut buffer = [0_u8; 4096];
         let mut signaled = false;
+        let trailing_refresh_seq = Arc::new(AtomicU64::new(0));
         loop {
             match stdin.read(&mut buffer) {
                 Ok(0) => return Ok(()),
@@ -792,11 +843,23 @@ impl WorkspaceCommandRuntime {
                         &command.socket_name,
                         command.target_session_name.as_deref(),
                         None,
+                        RuntimeCommandSignal::Prompt,
                         None,
                     )?;
                     signaled = true;
+                    schedule_main_pane_output_trailing_refresh(
+                        trailing_refresh_seq.clone(),
+                        command.socket_name.clone(),
+                        self.network.clone(),
+                    );
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    schedule_main_pane_output_trailing_refresh(
+                        trailing_refresh_seq.clone(),
+                        command.socket_name.clone(),
+                        self.network.clone(),
+                    );
+                }
                 Err(error) => {
                     return Err(LifecycleError::Io(
                         "failed to read main pane output bridge stdin".to_string(),
@@ -806,6 +869,53 @@ impl WorkspaceCommandRuntime {
             }
         }
     }
+}
+
+fn schedule_main_pane_output_trailing_refresh(
+    seq: Arc<AtomicU64>,
+    socket_name: String,
+    network: RemoteNetworkConfig,
+) {
+    let current_seq = seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    schedule_main_pane_output_refresh_after(
+        seq.clone(),
+        current_seq,
+        socket_name.clone(),
+        network.clone(),
+        MAIN_PANE_OUTPUT_TRAILING_REFRESH_DELAY,
+        "trailing",
+    );
+    schedule_main_pane_output_refresh_after(
+        seq,
+        current_seq,
+        socket_name,
+        network,
+        MAIN_PANE_OUTPUT_SETTLED_REFRESH_DELAY,
+        "settled",
+    );
+}
+
+fn schedule_main_pane_output_refresh_after(
+    seq: Arc<AtomicU64>,
+    expected_seq: u64,
+    socket_name: String,
+    network: RemoteNetworkConfig,
+    delay: Duration,
+    label: &'static str,
+) {
+    thread::spawn(move || {
+        thread::sleep(delay);
+        if seq.load(Ordering::Relaxed) != expected_seq {
+            return;
+        }
+        if let Err(error) = WorkspaceLayoutRuntime::from_build_env_with_network(network)
+            .and_then(|runtime| runtime.run_chrome_refresh_signal_on_socket(&socket_name))
+        {
+            ERROR_LOG.log(format!(
+                "[diag-output-bridge] {label} refresh failed socket={socket_name}: {error}"
+            ));
+        }
+    });
 }
 
 fn workspace_handle(socket_name: &str, session_name: &str) -> TmuxWorkspaceHandle {

@@ -805,7 +805,7 @@ pub(super) fn handle_transport_event(
                 "[diag-sync] SessionClosed for node {node_id}, will reconnect"
             ));
             if let Some(publication_runtime) = publication_runtime {
-                let _ = publication_runtime.mark_discovered_remote_node_offline(node_id);
+                mark_discovered_remote_node_offline_best_effort(publication_runtime, node_id);
             }
             authority_manager.shutdown();
             *active_session = None;
@@ -824,7 +824,7 @@ pub(super) fn handle_transport_event(
                 "[diag-sync] TransportFailed node={node_id} msg={message}, will reconnect"
             ));
             if let Some(publication_runtime) = publication_runtime {
-                let _ = publication_runtime.mark_discovered_remote_node_offline(node_id);
+                mark_discovered_remote_node_offline_best_effort(publication_runtime, node_id);
             }
             authority_manager.shutdown();
             *active_session = None;
@@ -834,6 +834,21 @@ pub(super) fn handle_transport_event(
             }
         }
     }
+}
+
+fn mark_discovered_remote_node_offline_best_effort(
+    publication_runtime: &RemoteTargetPublicationRuntime,
+    node_id: &str,
+) {
+    let publication_runtime = publication_runtime.clone();
+    let node_id = node_id.to_string();
+    thread::spawn(move || {
+        if let Err(error) = publication_runtime.mark_discovered_remote_node_offline(&node_id) {
+            ERROR_LOG.log(format!(
+                "[diag-sync] failed to mark discovered remote node offline {node_id}: {error}"
+            ));
+        }
+    });
 }
 
 fn send_source_publication(
@@ -1176,7 +1191,9 @@ fn session_has_explicit_runtime(session: &ManagedSessionRecord) -> bool {
         .is_some_and(|name| !name.is_empty())
         && matches!(
             session.task_state,
-            ManagedSessionTaskState::Input | ManagedSessionTaskState::Running
+            ManagedSessionTaskState::Input
+                | ManagedSessionTaskState::Running
+                | ManagedSessionTaskState::Confirm
         )
 }
 

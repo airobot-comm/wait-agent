@@ -399,7 +399,7 @@ pub fn project_visible_targets(
     targets: &[ManagedSessionRecord],
     authority_id: &str,
     workspace_session_id: &str,
-    active_target: Option<&str>,
+    _active_target: Option<&str>,
 ) -> Vec<ManagedSessionRecord> {
     let workspace_runtime = targets
         .iter()
@@ -423,20 +423,6 @@ pub fn project_visible_targets(
 
     if visible_targets.is_empty() {
         return workspace_runtime.into_iter().collect();
-    }
-
-    if let Some(active_target) = active_target {
-        if let Some(workspace_runtime) = workspace_runtime.as_ref() {
-            if let Some(active_session) = visible_targets.iter_mut().find(|target| {
-                target.address.transport() == &SessionTransport::LocalTmux
-                    && target.address.authority_id() == authority_id
-                    && target.address.qualified_target() == active_target
-            }) {
-                active_session.command_name = workspace_runtime.command_name.clone();
-                active_session.current_path = workspace_runtime.current_path.clone();
-                active_session.task_state = workspace_runtime.task_state;
-            }
-        }
     }
 
     sort_targets_for_display(&mut visible_targets);
@@ -668,17 +654,31 @@ mod tests {
     }
 
     #[test]
-    fn visible_targets_overlay_workspace_runtime_onto_active_target() {
+    fn visible_targets_keep_active_target_runtime_owned_by_target_session() {
         let targets = project_visible_targets(
             &[
-                session(
-                    "wa-1",
-                    "workspace",
-                    "codex",
-                    WorkspaceSessionRole::WorkspaceChrome,
-                ),
-                session("wa-1", "target-1", "bash", WorkspaceSessionRole::TargetHost),
-                session("wa-1", "target-2", "bash", WorkspaceSessionRole::TargetHost),
+                ManagedSessionRecord {
+                    task_state: ManagedSessionTaskState::Running,
+                    ..session(
+                        "wa-1",
+                        "workspace",
+                        "codex",
+                        WorkspaceSessionRole::WorkspaceChrome,
+                    )
+                },
+                ManagedSessionRecord {
+                    task_state: ManagedSessionTaskState::Confirm,
+                    ..session("wa-1", "target-1", "bash", WorkspaceSessionRole::TargetHost)
+                },
+                ManagedSessionRecord {
+                    task_state: ManagedSessionTaskState::Input,
+                    ..session(
+                        "wa-1",
+                        "target-2",
+                        "codex",
+                        WorkspaceSessionRole::TargetHost,
+                    )
+                },
             ],
             "wa-1",
             "workspace",
@@ -688,6 +688,96 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[1].address.session_id(), "target-2");
         assert_eq!(targets[1].command_name.as_deref(), Some("codex"));
+        assert_eq!(targets[1].task_state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn visible_targets_preserve_confirm_state_when_workspace_is_running() {
+        let targets = project_visible_targets(
+            &[
+                ManagedSessionRecord {
+                    task_state: ManagedSessionTaskState::Running,
+                    ..session(
+                        "wa-1",
+                        "workspace",
+                        "codex",
+                        WorkspaceSessionRole::WorkspaceChrome,
+                    )
+                },
+                ManagedSessionRecord {
+                    task_state: ManagedSessionTaskState::Confirm,
+                    ..session(
+                        "wa-1",
+                        "target-1",
+                        "codex",
+                        WorkspaceSessionRole::TargetHost,
+                    )
+                },
+                session("wa-1", "target-2", "bash", WorkspaceSessionRole::TargetHost),
+            ],
+            "wa-1",
+            "workspace",
+            Some("wa-1:target-1"),
+        );
+
+        let active = targets
+            .iter()
+            .find(|target| target.address.session_id() == "target-1")
+            .expect("active target should remain visible");
+        assert_eq!(active.command_name.as_deref(), Some("codex"));
+        assert_eq!(active.task_state, ManagedSessionTaskState::Confirm);
+    }
+
+    #[test]
+    fn visible_targets_preserve_input_state_when_workspace_is_running() {
+        let targets = project_visible_targets(
+            &[
+                ManagedSessionRecord {
+                    task_state: ManagedSessionTaskState::Running,
+                    ..session(
+                        "wa-1",
+                        "workspace",
+                        "codex",
+                        WorkspaceSessionRole::WorkspaceChrome,
+                    )
+                },
+                ManagedSessionRecord {
+                    task_state: ManagedSessionTaskState::Input,
+                    ..session(
+                        "wa-1",
+                        "target-1",
+                        "codex",
+                        WorkspaceSessionRole::TargetHost,
+                    )
+                },
+            ],
+            "wa-1",
+            "workspace",
+            Some("wa-1:target-1"),
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].command_name.as_deref(), Some("codex"));
+        assert_eq!(targets[0].task_state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn visible_targets_use_workspace_runtime_only_when_no_target_hosts_exist() {
+        let targets = project_visible_targets(
+            &[session(
+                "wa-1",
+                "workspace",
+                "codex",
+                WorkspaceSessionRole::WorkspaceChrome,
+            )],
+            "wa-1",
+            "workspace",
+            None,
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].address.session_id(), "workspace");
+        assert_eq!(targets[0].command_name.as_deref(), Some("codex"));
     }
 
     #[test]

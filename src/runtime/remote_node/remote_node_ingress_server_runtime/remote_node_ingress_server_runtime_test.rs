@@ -730,6 +730,108 @@ mod tests {
     }
 
     #[test]
+    fn closed_session_instance_drops_late_envelopes() {
+        let _guard = crate::test_support::integration_test_lock();
+        use super::super::run_node_ingress_server_loop;
+        use crate::infra::remote_grpc_transport::{
+            RemoteNodeSessionHandle, RemoteNodeTransportEvent,
+        };
+        use std::sync::mpsc;
+        use std::thread;
+
+        let node_id = unique_node_id("peer-closed-late");
+        let socket_path = authority_transport_socket_path(
+            "test-socket-closed",
+            "test-session-closed",
+            &format!("remote-peer:{node_id}:shell-closed"),
+        );
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("socket should bind");
+        let accept = thread::spawn(move || collect_authority_connections(listener));
+
+        let publication_runtime = RemoteTargetPublicationRuntime::from_build_env()
+            .expect("publication runtime should build");
+        let (transport_tx, transport_rx) = mpsc::channel();
+        let (internal_tx, internal_rx) = mpsc::channel();
+        let worker_internal_tx = internal_tx.clone();
+        let worker = thread::spawn(move || {
+            run_node_ingress_server_loop(
+                publication_runtime,
+                transport_rx,
+                internal_rx,
+                worker_internal_tx,
+                false,
+            );
+        });
+
+        let (session, _outbound_rx) =
+            RemoteNodeSessionHandle::new_for_tests(node_id.clone(), "session-old");
+        transport_tx
+            .send(RemoteNodeTransportEvent::SessionOpened {
+                session: session.clone(),
+            })
+            .expect("session should open");
+        internal_tx
+            .send(InternalEvent::SocketDirChanged)
+            .expect("authority socket event should send");
+        let mut writers = accept.join().expect("accept should join");
+        assert!(
+            !writers.is_empty(),
+            "session should establish authority bridge"
+        );
+
+        transport_tx
+            .send(RemoteNodeTransportEvent::SessionClosed {
+                node_id: node_id.clone(),
+                session_instance_id: "session-old".to_string(),
+            })
+            .expect("session should close");
+        transport_tx
+            .send(RemoteNodeTransportEvent::EnvelopeReceived {
+                node_id: node_id.clone(),
+                session_instance_id: "session-old".to_string(),
+                envelope: NodeSessionEnvelope {
+                    message_id: "late-target-output".to_string(),
+                    sent_at: None,
+                    session_instance_id: "session-old".to_string(),
+                    correlation_id: None,
+                    route: Some(RouteContext {
+                        authority_node_id: Some(node_id.clone()),
+                        target_id: Some(format!("remote-peer:{node_id}:shell-closed")),
+                        attachment_id: None,
+                        console_id: None,
+                        console_host_id: None,
+                        session_id: Some("shell-closed".to_string()),
+                    }),
+                    body: Some(Body::TargetOutput(TargetOutput {
+                        target_id: format!("remote-peer:{node_id}:shell-closed"),
+                        output_seq: 10,
+                        stream: "pty".to_string(),
+                        session_id: "shell-closed".to_string(),
+                        output_bytes: b"late".to_vec(),
+                    })),
+                },
+            })
+            .expect("late envelope should send");
+
+        assert!(
+            read_target_output_from_any(&mut writers).is_none(),
+            "late envelope from closed session instance must be dropped"
+        );
+
+        for writer in &writers {
+            let _ = writer.shutdown(Shutdown::Both);
+        }
+        internal_tx
+            .send(InternalEvent::Shutdown)
+            .expect("shutdown event should send");
+        drop(transport_tx);
+        drop(internal_tx);
+        let _ = worker.join();
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[test]
     fn node_cleanup_waits_until_last_ingress_session_is_gone() {
         let node_id = "peer-last-close";
         let other_node_id = "peer-other";

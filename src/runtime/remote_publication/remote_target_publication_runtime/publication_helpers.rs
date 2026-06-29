@@ -110,6 +110,7 @@ pub(super) struct PublicationOwnerSnapshot {
     pub(super) window_count: usize,
     pub(super) command_name: Option<String>,
     pub(super) current_path: Option<PathBuf>,
+    pub(super) task_state: ManagedSessionTaskState,
 }
 
 pub(super) struct DiscoveredRemoteSessionEnvelopeEffect {
@@ -794,6 +795,7 @@ pub(super) fn publication_owner_snapshot(
         window_count: local_target.window_count,
         command_name: local_target.command_name.clone(),
         current_path: local_target.current_path.clone(),
+        task_state: local_target.task_state,
     }
 }
 

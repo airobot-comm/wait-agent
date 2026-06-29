@@ -34,34 +34,70 @@ fn strip_ansi(text: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == 0x1b {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-                // CSI sequence: \x1b[...<final>
-                i += 2;
-                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() && bytes[i] != b'~' {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    i += 1;
-                }
-            } else if i + 1 < bytes.len() {
-                // Non-CSI escape: \x1b<intermediates...><final>
-                i += 1; // skip \x1b
-                i += 1; // skip first byte after \x1b (intermediate or final)
-                while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] <= 0x2F {
-                    i += 1; // remaining intermediate bytes
-                }
-                if i < bytes.len() {
-                    i += 1; // final byte
-                }
-            } else {
-                i += 1; // trailing bare \x1b
-            }
+            i = skip_ansi_escape(bytes, i);
         } else {
             out.push(bytes[i]);
             i += 1;
         }
     }
-    String::from_utf8(out).unwrap_or_default()
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn skip_ansi_escape(bytes: &[u8], esc_index: usize) -> usize {
+    let mut i = esc_index + 1;
+    if i >= bytes.len() {
+        return i;
+    }
+
+    match bytes[i] {
+        b'[' => skip_csi_sequence(bytes, i + 1),
+        b']' => skip_until_string_terminator(bytes, i + 1),
+        b'P' | b'^' | b'_' => skip_until_st(bytes, i + 1),
+        _ => {
+            i += 1;
+            while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] <= 0x2f {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i + 1
+            } else {
+                i
+            }
+        }
+    }
+}
+
+fn skip_csi_sequence(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        if (0x40..=0x7e).contains(&bytes[i]) {
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn skip_until_string_terminator(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        if bytes[i] == 0x07 {
+            return i + 1;
+        }
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+            return i + 2;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn skip_until_st(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+            return i + 2;
+        }
+        i += 1;
+    }
+    i
 }
 
 /// Like `pane_content_signature_with_boundary` using the default heuristic
@@ -96,8 +132,16 @@ fn runtime_command_override_is_prompt(value: &str) -> bool {
     command_name == "bash"
 }
 
+fn runtime_command_override_is_running(value: &str) -> bool {
+    let command_name = value
+        .split_once(':')
+        .map(|(_, command_name)| command_name)
+        .unwrap_or(value);
+    command_name == super::WAITAGENT_RUNTIME_RUNNING_OVERRIDE
+}
+
 fn has_stable_agent_input_prompt(command_name: &str, pane_text: &str) -> bool {
-    if command_name != "codex" && command_name != "claude" {
+    if command_name != "claude" {
         return false;
     }
     let lines = pane_text
@@ -107,11 +151,94 @@ fn has_stable_agent_input_prompt(command_name: &str, pane_text: &str) -> bool {
         .collect::<Vec<_>>();
     let recent_start = lines.len().saturating_sub(3);
     lines.iter().skip(recent_start).any(|line| {
-        let after_codex_prompt = line.trim_start_matches('›').trim_start();
         let after_claude_prompt = line.trim_start_matches('❯').trim_start();
-        (line.starts_with('›') && !after_codex_prompt.starts_with("1."))
-            || (line.starts_with('❯') && !after_claude_prompt.starts_with("1."))
+        line.starts_with('❯') && !after_claude_prompt.starts_with("1.")
     })
+}
+
+fn apply_temporal_input_hysteresis(
+    session_key: &str,
+    command_name: &str,
+    pane_text: &str,
+    mut state: ManagedSessionTaskState,
+) -> ManagedSessionTaskState {
+    if state != ManagedSessionTaskState::Input {
+        return state;
+    }
+    if command_name == "codex" {
+        return state;
+    }
+    if has_stable_agent_input_prompt(command_name, pane_text) {
+        return state;
+    }
+
+    let plain_lines: Vec<&str> = pane_text.lines().map(|l| l.trim_end()).collect();
+    let content_end = pane_content_boundary(&plain_lines);
+    let current_sig = pane_content_signature_with_boundary(pane_text, content_end);
+
+    PREVIOUS_PANE_SIGNATURE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(prev) = cache.get(session_key) {
+            if prev.hash == current_sig {
+                // Content stable — count consecutive stable polls.
+                // Only transition to Input after the content has
+                // been stable for STABLE_THRESHOLD polls, so brief
+                // pauses during streaming don't cause I/R flicker.
+                let new_count = prev.stable_count.saturating_add(1);
+                if new_count < STABLE_THRESHOLD {
+                    state = ManagedSessionTaskState::Running;
+                }
+                cache.insert(
+                    session_key.to_string(),
+                    CacheEntry {
+                        hash: current_sig,
+                        stable_count: new_count,
+                    },
+                );
+            } else {
+                // Content still changing — override to Running.
+                state = ManagedSessionTaskState::Running;
+                cache.insert(
+                    session_key.to_string(),
+                    CacheEntry {
+                        hash: current_sig,
+                        stable_count: 0,
+                    },
+                );
+            }
+        } else {
+            // First poll for this session — seed the cache but
+            // keep the detector's original Input state. This
+            // means the first poll after a transition always
+            // shows a brief I flash, which the hysteresis on
+            // subsequent polls smooths out.
+            cache.insert(
+                session_key.to_string(),
+                CacheEntry {
+                    hash: current_sig,
+                    stable_count: 0,
+                },
+            );
+        }
+    });
+
+    state
+}
+
+fn apply_running_override(
+    running_override: bool,
+    state: ManagedSessionTaskState,
+) -> ManagedSessionTaskState {
+    if running_override && matches!(state, ManagedSessionTaskState::Unknown) {
+        ManagedSessionTaskState::Running
+    } else {
+        state
+    }
+}
+
+#[cfg(test)]
+fn clear_temporal_input_hysteresis_cache() {
+    PREVIOUS_PANE_SIGNATURE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Like `pane_content_signature` but with an explicit content boundary line
@@ -200,84 +327,38 @@ impl EmbeddedTmuxBackend {
         let prompt_override = runtime_override
             .as_deref()
             .is_some_and(runtime_command_override_is_prompt);
+        let running_override = runtime_override
+            .as_deref()
+            .is_some_and(runtime_command_override_is_running);
         let command_name = runtime_override
+            .as_ref()
+            .filter(|override_value| !runtime_command_override_is_running(override_value))
             .map(|override_value| runtime_command_override_name(&override_value))
             .unwrap_or(detected_command_name);
         let task_state = if main_pane.in_mode {
             ManagedSessionTaskState::Running
         } else if prompt_override {
             ManagedSessionTaskState::Input
+        } else if let Some(hook_state) =
+            self.agent_signal_task_state(&workspace, &main_pane.pane_id, &command_name)
+        {
+            hook_state
         } else {
             let mut state = self
                 .registry
                 .infer_task_state(Some(&command_name), &pane_text);
+
+            state = apply_running_override(running_override, state);
 
             // Temporal content-change check: when the detector reports Input
             // but the pane content above the prompt area is actively changing
             // between polls, the agent is actually Running (output streaming).
             // This distinguishes the "awaiting user input" Input state from the
             // "prompt visible during active execution" false positive.
-            if state == ManagedSessionTaskState::Input {
-                if has_stable_agent_input_prompt(&command_name, &pane_text) {
-                    return Ok(TmuxSessionRuntimeMetadata {
-                        command_name: Some(command_name.clone()),
-                        current_path: main_pane.current_path.clone(),
-                        task_state: state,
-                        is_dead: main_pane.is_dead,
-                    });
-                }
+            if state == ManagedSessionTaskState::Input && command_name != "codex" {
                 let session_key = format!("{}:{}", socket_name.as_str(), session_name);
-                let plain_lines: Vec<&str> = pane_text.lines().map(|l| l.trim_end()).collect();
-                let content_end = pane_content_boundary(&plain_lines);
-                let current_sig = pane_content_signature_with_boundary(&pane_text, content_end);
-
-                PREVIOUS_PANE_SIGNATURE.with(|cache| {
-                    let mut cache = cache.borrow_mut();
-                    if let Some(prev) = cache.get(&session_key) {
-                        if prev.hash == current_sig {
-                            // Content stable — count consecutive stable polls.
-                            // Only transition to Input after the content has
-                            // been stable for STABLE_THRESHOLD polls, so brief
-                            // pauses during streaming don't cause I/R flicker.
-                            let new_count = prev.stable_count.saturating_add(1);
-                            if new_count >= STABLE_THRESHOLD {
-                                // genuinely awaiting input
-                            } else {
-                                state = ManagedSessionTaskState::Running;
-                            }
-                            cache.insert(
-                                session_key,
-                                CacheEntry {
-                                    hash: current_sig,
-                                    stable_count: new_count,
-                                },
-                            );
-                        } else {
-                            // Content still changing — override to Running
-                            state = ManagedSessionTaskState::Running;
-                            cache.insert(
-                                session_key,
-                                CacheEntry {
-                                    hash: current_sig,
-                                    stable_count: 0,
-                                },
-                            );
-                        }
-                    } else {
-                        // First poll for this session — seed the cache but
-                        // keep the detector's original Input state. This
-                        // means the first poll after a transition always
-                        // shows a brief I flash, which the hysteresis on
-                        // subsequent polls smooths out.
-                        cache.insert(
-                            session_key,
-                            CacheEntry {
-                                hash: current_sig,
-                                stable_count: 0,
-                            },
-                        );
-                    }
-                });
+                state =
+                    apply_temporal_input_hysteresis(&session_key, &command_name, &pane_text, state);
             }
 
             state
@@ -288,6 +369,32 @@ impl EmbeddedTmuxBackend {
             task_state,
             is_dead: main_pane.is_dead,
         })
+    }
+
+    fn agent_signal_task_state(
+        &self,
+        workspace: &crate::infra::tmux_types::TmuxWorkspaceHandle,
+        pane_id: &TmuxPaneId,
+        command_name: &str,
+    ) -> Option<ManagedSessionTaskState> {
+        let agent = self
+            .show_session_option(workspace, super::WAITAGENT_AGENT_SIGNAL_AGENT_OPTION)
+            .ok()
+            .flatten()?;
+        if agent != command_name {
+            return None;
+        }
+        let signal_pane = self
+            .show_session_option(workspace, super::WAITAGENT_AGENT_SIGNAL_PANE_OPTION)
+            .ok()
+            .flatten()?;
+        if signal_pane != pane_id.as_str() {
+            return None;
+        }
+        self.show_session_option(workspace, super::WAITAGENT_AGENT_SIGNAL_STATE_OPTION)
+            .ok()
+            .flatten()
+            .and_then(|state| ManagedSessionTaskState::parse(&state))
     }
 
     fn session_presentation_pane_info(
@@ -327,7 +434,7 @@ impl EmbeddedTmuxBackend {
             .cloned())
     }
 
-    pub(super) fn list_panes_on_target(
+    pub(crate) fn list_panes_on_target(
         &self,
         socket_name: &TmuxSocketName,
         target: &str,
@@ -392,6 +499,7 @@ impl EmbeddedTmuxBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::agent_detector::DetectorRegistry;
 
     #[test]
     fn content_changed_detects_claude_execution_output() {
@@ -479,7 +587,133 @@ mod tests {
                     \n\
                       gpt-5.5 high · ~";
 
-        assert!(has_stable_agent_input_prompt("codex", pane));
+        assert!(!has_stable_agent_input_prompt("codex", pane));
+    }
+
+    #[test]
+    fn running_override_marker_is_not_a_display_command_name() {
+        let marker = format!("42:{}", super::super::WAITAGENT_RUNTIME_RUNNING_OVERRIDE);
+
+        assert!(runtime_command_override_is_running(&marker));
+        assert!(!runtime_command_override_is_prompt(&marker));
+    }
+
+    #[test]
+    fn running_override_does_not_mask_confirm() {
+        assert_eq!(
+            apply_running_override(true, ManagedSessionTaskState::Confirm),
+            ManagedSessionTaskState::Confirm
+        );
+    }
+
+    #[test]
+    fn running_override_does_not_mask_input() {
+        assert_eq!(
+            apply_running_override(true, ManagedSessionTaskState::Input),
+            ManagedSessionTaskState::Input
+        );
+    }
+
+    #[test]
+    fn running_override_fills_unknown() {
+        assert_eq!(
+            apply_running_override(true, ManagedSessionTaskState::Unknown),
+            ManagedSessionTaskState::Running
+        );
+    }
+
+    #[test]
+    fn codex_input_skips_temporal_running_override() {
+        clear_temporal_input_hysteresis_cache();
+        let session_key = "test:codex-input";
+        let pane_t1 = "• Working\n\
+                       └ Searching files\n\
+                       \n\
+                       › \n\
+                       esc to interrupt";
+        let pane_t2 = "• Working\n\
+                       └ Reading src/main.rs\n\
+                       \n\
+                       › \n\
+                       esc to interrupt";
+
+        assert_eq!(
+            apply_temporal_input_hysteresis(
+                session_key,
+                "codex",
+                pane_t1,
+                ManagedSessionTaskState::Input,
+            ),
+            ManagedSessionTaskState::Input
+        );
+        assert_eq!(
+            apply_temporal_input_hysteresis(
+                session_key,
+                "codex",
+                pane_t2,
+                ManagedSessionTaskState::Input,
+            ),
+            ManagedSessionTaskState::Input
+        );
+    }
+
+    #[test]
+    fn codex_input_does_not_wait_for_stable_polls() {
+        clear_temporal_input_hysteresis_cache();
+        let session_key = "test:codex-idle";
+        let pane = "Codex: Done.\n\
+                    \n\
+                    › \n\
+                    esc to interrupt";
+
+        assert_eq!(
+            apply_temporal_input_hysteresis(
+                session_key,
+                "codex",
+                pane,
+                ManagedSessionTaskState::Input,
+            ),
+            ManagedSessionTaskState::Input
+        );
+        assert_eq!(
+            apply_temporal_input_hysteresis(
+                session_key,
+                "codex",
+                pane,
+                ManagedSessionTaskState::Input,
+            ),
+            ManagedSessionTaskState::Input
+        );
+        assert_eq!(
+            apply_temporal_input_hysteresis(
+                session_key,
+                "codex",
+                pane,
+                ManagedSessionTaskState::Input,
+            ),
+            ManagedSessionTaskState::Input
+        );
+        assert_eq!(
+            apply_temporal_input_hysteresis(
+                session_key,
+                "codex",
+                pane,
+                ManagedSessionTaskState::Input,
+            ),
+            ManagedSessionTaskState::Input
+        );
+    }
+
+    #[test]
+    fn claude_still_uses_stable_prompt_shortcut() {
+        let pane = "● Bash(echo hello)\n\
+                    \n\
+                    ─────────────────────\n\
+                    ❯ \n\
+                    ─────────────────────\n\
+                    esc to interrupt";
+
+        assert!(has_stable_agent_input_prompt("claude", pane));
     }
 
     #[test]
@@ -542,6 +776,54 @@ mod tests {
         let input = "\x1b(BHello\x1b(BWorld";
         let result = strip_ansi(input);
         assert_eq!(result, "HelloWorld");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc8_hyperlink_sequences() {
+        let input = "See \x1b]8;;https://example.test\x1b\\example\x1b]8;;\x1b\\ now";
+        let result = strip_ansi(input);
+        assert_eq!(result, "See example now");
+    }
+
+    #[test]
+    fn codex_update_notice_with_osc8_link_infers_input_after_ansi_strip() {
+        let pane = "\x1b[2m╭─────────────────────────────────────────────────╮\x1b[0m\n\
+                    \x1b[2m│ \x1b[0m✨ Update available! \x1b[1m0.142.2 -> 0.142.3\x1b[0;2m         │\x1b[0m\n\
+                    \x1b[2m│ \x1b[0mRun npm install -g @openai/codex to update.\x1b[2m     │\x1b[0m\n\
+                    \x1b[2m│                                                 │\x1b[0m\n\
+                    \x1b[2m│ \x1b[0mSee full release notes:\x1b[2m                         │\x1b[0m\n\
+                    \x1b[2m│ \x1b[0m\x1b]8;;https://github.com/openai/codex/releases/latest\x1b\\https://github.com/openai/codex/releases/latest\x1b]8;;\x1b\\ │\n\
+                    \x1b[2m╰─────────────────────────────────────────────────╯\x1b[0m\n\
+                    \n\
+                    ⚠ Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites:\n\
+                    https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.\n\
+                    \n\
+                    \x1b[2m╭────────────────────────────────────────────╮\x1b[0m\n\
+                    \x1b[2m│ >_ \x1b[0;1mOpenAI Codex\x1b[0;2m (v0.142.2)                 │\x1b[0m\n\
+                    \x1b[2m│                                            │\x1b[0m\n\
+                    \x1b[2m│ model:     \x1b[0mgpt-5.5 high\x1b[2m   \x1b[0m/model to change │\n\
+                    \x1b[2m│ directory: \x1b[0m~\x1b[2m                               │\x1b[0m\n\
+                    \x1b[2m╰────────────────────────────────────────────╯\x1b[0m\n\
+                    \n\
+                      \x1b[1mTip:\x1b[0m See the Codex keymap documentation for supported actions and examples.\n\
+                    \n\
+                    \n\
+                    \x1b[1m›\x1b[0m \x1b[2mWrite tests for @filename\x1b[0m\n\
+                    \n\
+                      gpt-5.5 high · ~";
+        let stripped = strip_ansi(pane);
+        let registry = DetectorRegistry::default();
+
+        assert!(stripped.contains("OpenAI Codex"));
+        assert!(stripped.contains("› Write tests for @filename"));
+        assert_eq!(
+            registry.detect_command_name("node", None, &stripped),
+            "codex"
+        );
+        assert_eq!(
+            registry.infer_task_state(Some("codex"), &stripped),
+            ManagedSessionTaskState::Input
+        );
     }
 
     #[test]

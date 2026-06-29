@@ -226,6 +226,10 @@ pub struct ManagedSessionRecord {
 }
 
 impl ManagedSessionRecord {
+    pub fn session_instance_id(&self) -> &str {
+        self.address.session_id()
+    }
+
     pub fn is_workspace_chrome(&self) -> bool {
         self.session_role == Some(WorkspaceSessionRole::WorkspaceChrome)
     }
@@ -677,6 +681,154 @@ mod tests {
     }
 
     #[test]
+    fn task_state_infers_confirm_from_codex_directory_trust_screen() {
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "> You are in /tmp/waitagent-repro-codex-hooks\n\
+             \n\
+             Note: You're in a subdirectory of a Git\n\
+             project. Trusting will apply to the\n\
+             repository root: /tmp\n\
+             \n\
+             Do you trust the contents of this directory?\n\
+             Working with untrusted contents comes with\n\
+             higher risk of prompt injection. Trusting the\n\
+             directory allows project-local config, hooks,\n\
+             and exec policies to load.\n\
+             \n\
+             › 1. Yes, continue\n\
+             2. No, quit\n\
+             \n\
+             Press enter to continue",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Confirm);
+    }
+
+    #[test]
+    fn task_state_infers_confirm_from_codex_hooks_review_screen() {
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "Hooks need review\n\
+             5 hooks are new or changed.\n\
+             Hooks can run outside the sandbox after you\n\
+             \n\
+             › 1. Review hooks\n\
+             2. Trust all and continue\n\
+             3. Continue without trusting (hooks won't\n\
+             run)\n\
+             \n\
+             Press enter to confirm or esc to go back",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Confirm);
+    }
+
+    #[test]
+    fn task_state_infers_confirm_from_codex_update_menu_with_wrapped_option() {
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "Update available! 0.125.0 -> 0.128.0\n\
+             Release notes: https://github.com/openai/codex\n\
+             \n\
+             › 1. Update now (runs `npm install -g\n\
+             @openai/codex`)\n\
+             2. Skip\n\
+             3. Skip until next version\n\
+             \n\
+             Press enter to continue",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Confirm);
+    }
+
+    #[test]
+    fn task_state_infers_input_from_codex_startup_input_screen() {
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "╭─────────────────────────────────────────────╮\n\
+             │ >_ OpenAI Codex (v0.142.2)                  │\n\
+             │                                             │\n\
+             │ model:     gpt-5.5   /model to change       │\n\
+             │ directory: /tmp/waitagent-repro-codex-hooks │\n\
+             ╰─────────────────────────────────────────────╯\n\
+             \n\
+             Tip: GPT-5.5 is now available in Codex. It's\n\
+             our strongest agentic coding model yet, built\n\
+             to reason through large codebases, check\n\
+             assumptions with tools, and keep going until\n\
+             the work is done.\n\
+             \n\
+             Learn more:\n\
+             https://openai.com/index/introducing-gpt-5-5/\n\
+             \n\
+             \n\
+             › Find and fix a bug in @filename\n\
+             \n\
+             gpt-5.5 default · /tmp/waitagent-repro-codex…",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn task_state_infers_input_from_codex_startup_prompt_with_footer() {
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "⚠ Codex could not find bubblewrap on PATH.\n\
+             Install bubblewrap with your OS package\n\
+             manager. See the sandbox prerequisites:\n\
+             https://developers.openai.com/codex/concepts/\n\
+             sandboxing#prerequisites.\n\
+             Codex will use the bundled bubblewrap in the\n\
+             meantime.\n\
+             \n\
+             ╭─────────────────────────────────────────────╮\n\
+             │ >_ OpenAI Codex (v0.142.2)                  │\n\
+             │                                             │\n\
+             │ model:     gpt-5.5 high   /model to change  │\n\
+             │ directory: /tmp/…t-repro-fix-workspace-auth │\n\
+             ╰─────────────────────────────────────────────╯\n\
+             \n\
+             Tip: New Build faster with Codex.\n\
+             \n\
+             \n\
+             › Use /skills to list available skills\n\
+             \n\
+             gpt-5.5 high · /tmp/waitagent-repro-fix-work…",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
+    fn task_state_infers_input_from_codex_update_notice_with_long_tip() {
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "╭─────────────────────────────────────────────────╮\n\
+             │ ✨ Update available! 0.142.2 -> 0.142.3         │\n\
+             │ Run npm install -g @openai/codex to update.     │\n\
+             │                                                 │\n\
+             │ See full release notes:                         │\n\
+             │ https://github.com/openai/codex/releases/latest │\n\
+             ╰─────────────────────────────────────────────────╯\n\
+             \n\
+             ⚠ Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites:\n\
+             https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.\n\
+             \n\
+             ╭─────────────────────────────────────────────────╮\n\
+             │ >_ OpenAI Codex (v0.142.2)                      │\n\
+             │                                                 │\n\
+             │ model:     gpt-5.5 high   /model to change      │\n\
+             │ directory: /tmp/waitagent-repro-update-notice-r │\n\
+             ╰─────────────────────────────────────────────────╯\n\
+             \n\
+             Tip: Use the OpenAI docs MCP for API questions; enable it with codex mcp add openaiDeveloperDocs --url https://developers.openai.com/mcp.\n\
+             \n\
+             \n\
+             › Improve documentation in @filename\n\
+             \n\
+             gpt-5.5 high · /tmp/waitagent-repro-update-notice-r",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Input);
+    }
+
+    #[test]
     fn task_state_infers_confirm_from_claude_tui_numbered_menu() {
         // Claude Code's TUI confirmation uses a numbered menu with ❯ for selection.
         let state = DetectorRegistry::default().infer_task_state(
@@ -797,6 +949,19 @@ mod tests {
             "Searching files...\n\
              Running analysis\n\
              Done.",
+        );
+        assert_eq!(state, ManagedSessionTaskState::Running);
+    }
+
+    #[test]
+    fn task_state_remains_running_when_codex_working_with_visible_prompt() {
+        let state = DetectorRegistry::default().infer_task_state(
+            Some("codex"),
+            "• Working\n\
+             └ Reading src/main.rs\n\
+             \n\
+             › \n\
+             esc to interrupt",
         );
         assert_eq!(state, ManagedSessionTaskState::Running);
     }

@@ -350,6 +350,66 @@ mod tests {
     }
 
     #[test]
+    fn target_presentation_pane_falls_back_to_owned_live_content_pane() {
+        let backend = EmbeddedTmuxBackend::from_build_env()
+            .expect("vendored tmux backend should discover build env");
+        let workspace = backend
+            .ensure_workspace(&unique_workspace_config("presentation-owner"))
+            .expect("workspace bootstrap should succeed");
+        let target_config = WorkspaceInstanceConfig {
+            workspace_dir: workspace_config().workspace_dir,
+            workspace_key: "target-key".to_string(),
+            socket_name: workspace.socket_name.as_str().to_string(),
+            session_name: "target-session".to_string(),
+            session_role: WorkspaceSessionRole::TargetHost,
+            initial_rows: None,
+            initial_cols: None,
+            initial_program: None,
+        };
+        let target = backend
+            .ensure_workspace(&target_config)
+            .expect("target session should be created");
+        let workspace_main = backend
+            .current_pane(&workspace)
+            .expect("workspace main pane should resolve");
+
+        backend
+            .run_on_socket(
+                &workspace.socket_name,
+                &[
+                    "set-option".to_string(),
+                    "-pt".to_string(),
+                    workspace_main.as_str().to_string(),
+                    "@waitagent_pane_role".to_string(),
+                    "content".to_string(),
+                ],
+            )
+            .expect("pane role should be set");
+        backend
+            .run_on_socket(
+                &workspace.socket_name,
+                &[
+                    "set-option".to_string(),
+                    "-pt".to_string(),
+                    workspace_main.as_str().to_string(),
+                    "@waitagent_session_instance_id".to_string(),
+                    target.session_name.as_str().to_string(),
+                ],
+            )
+            .expect("pane owner should be set");
+
+        let resolved = backend
+            .target_presentation_pane_on_socket(
+                workspace.socket_name.as_str(),
+                target.session_name.as_str(),
+            )
+            .expect("owned content pane should resolve");
+        kill_server(&backend, &workspace);
+
+        assert_eq!(resolved, workspace_main);
+    }
+
+    #[test]
     fn target_presentation_pane_rejects_identity_mismatch() {
         let backend = EmbeddedTmuxBackend::from_build_env()
             .expect("vendored tmux backend should discover build env");

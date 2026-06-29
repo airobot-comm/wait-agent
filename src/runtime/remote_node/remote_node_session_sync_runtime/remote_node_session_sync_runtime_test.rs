@@ -523,6 +523,7 @@ mod tests {
             .expect("fake sessions mutex should not be poisoned")
             .push(session("wa-1", "shell-2"));
         transport.close_session(0, "node-a", "server-session-1");
+        wait_for_controlled_receiver_count(&transport.receivers, 2);
 
         let second = wait_for_controlled_envelope(&transport.receivers, 1);
         let third = wait_for_controlled_envelope(&transport.receivers, 1);
@@ -893,6 +894,39 @@ mod tests {
     }
 
     #[test]
+    fn overlay_workspace_runtime_does_not_override_confirm_target_runtime() {
+        let sessions = overlay_workspace_runtime_onto_active_local_target_hosts(
+            vec![
+                ManagedSessionRecord {
+                    command_name: Some("codex".to_string()),
+                    current_path: Some(PathBuf::from("/tmp/workspace")),
+                    task_state: ManagedSessionTaskState::Running,
+                    ..session_with_role("wa-1", "workspace", WorkspaceSessionRole::WorkspaceChrome)
+                },
+                ManagedSessionRecord {
+                    command_name: Some("codex".to_string()),
+                    current_path: Some(PathBuf::from("/tmp/host")),
+                    task_state: ManagedSessionTaskState::Confirm,
+                    ..session("wa-1", "shell-1")
+                },
+            ],
+            "wa-1",
+            &HashMap::from([("workspace".to_string(), "wa-1:shell-1".to_string())]),
+        );
+
+        let projected = sessions
+            .into_iter()
+            .find(|session| session.address.session_id() == "shell-1")
+            .expect("target-host session should exist");
+        assert_eq!(projected.command_name.as_deref(), Some("codex"));
+        assert_eq!(
+            projected.current_path.as_deref(),
+            Some(Path::new("/tmp/host"))
+        );
+        assert_eq!(projected.task_state, ManagedSessionTaskState::Confirm);
+    }
+
+    #[test]
     fn overlay_workspace_runtime_does_not_project_internal_waitagent_runtime() {
         let sessions = overlay_workspace_runtime_onto_active_local_target_hosts(
             vec![
@@ -1216,6 +1250,36 @@ mod tests {
                 .and_then(|receiver| receiver.try_recv().ok());
             if let Some(envelope) = envelope {
                 return envelope;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_controlled_receiver_count(
+        receivers: &Arc<
+            Mutex<
+                Vec<
+                    tokio::sync::mpsc::UnboundedReceiver<
+                        crate::infra::remote_grpc_proto::v1::NodeSessionEnvelope,
+                    >,
+                >,
+            >,
+        >,
+        expected: usize,
+    ) {
+        let start = std::time::Instant::now();
+        loop {
+            let count = receivers
+                .lock()
+                .expect("controlled transport receiver mutex should not be poisoned")
+                .len();
+            if count >= expected {
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(1) {
+                panic!(
+                    "timed out waiting for controlled transport receiver count {expected}, saw {count}"
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }

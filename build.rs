@@ -5,8 +5,32 @@ mod tmux_glue_contract;
 
 fn main() {
     tmux_glue_build_script::run();
+    compile_agent_signal_sender();
     compile_remote_grpc_proto();
     emit_version_info();
+}
+
+fn compile_agent_signal_sender() {
+    let out_dir =
+        std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR should be set by cargo"));
+    let object = out_dir.join("waitagent-agent-signal-send");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = std::process::Command::new(cc)
+        .args([
+            "-O2",
+            "-std=c99",
+            "-Wall",
+            "-Wextra",
+            "-o",
+            object.to_str().expect("OUT_DIR path should be UTF-8"),
+            "src/runtime/agent_signal_sender_bundle.c",
+        ])
+        .status()
+        .expect("failed to invoke C compiler for agent signal sender");
+    assert!(
+        status.success(),
+        "failed to compile bundled agent signal sender"
+    );
 }
 
 fn emit_version_info() {

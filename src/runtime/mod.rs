@@ -43,6 +43,8 @@ pub use workspace::workspace_layout_runtime;
 pub use workspace::workspace_runtime;
 
 // Standalone modules remaining in runtime root
+pub mod agent_signal_runtime;
+pub mod agent_signal_sender_bundle;
 pub mod remote_observer_runtime;
 pub mod remote_server_console_runtime;
 

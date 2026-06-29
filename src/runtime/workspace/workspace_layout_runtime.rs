@@ -247,7 +247,17 @@ impl WorkspaceLayoutRuntime {
                 WAITAGENT_MAIN_PANE_OUTPUT_BRIDGE_OPTION,
                 MAIN_PANE_OUTPUT_BRIDGE_ENABLED,
             )
-            .map_err(tmux_layout_error)
+            .map_err(tmux_layout_error)?;
+        let Some(main_pane) = self
+            .backend
+            .show_session_option(workspace, WAITAGENT_MAIN_PANE_OPTION)
+            .map_err(tmux_layout_error)?
+            .map(TmuxPaneId::new)
+        else {
+            return Ok(());
+        };
+        let command = self.main_pane_output_bridge_shell_command(workspace, Path::new(""));
+        self.ensure_main_pane_output_bridge(workspace, &main_pane, &command)
     }
 
     pub fn run_reconcile(&self, command: LayoutReconcileCommand) -> Result<(), LifecycleError> {

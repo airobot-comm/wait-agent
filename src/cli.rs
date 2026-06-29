@@ -202,7 +202,15 @@ pub struct SocketNameCommand {
     pub socket_name: String,
     pub target_session_name: Option<String>,
     pub command_name: Option<String>,
+    pub runtime_signal: RuntimeCommandSignal,
     pub event_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeCommandSignal {
+    #[default]
+    Prompt,
+    Running,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -796,6 +804,7 @@ fn parse_socket_name_command(args: Vec<String>) -> Result<SocketNameCommand, Cli
     let mut socket_name = None;
     let mut target_session_name = None;
     let mut command_name = None;
+    let mut runtime_signal = RuntimeCommandSignal::Prompt;
     let mut event_seq = None;
 
     while let Some(arg) = iter.next() {
@@ -805,6 +814,7 @@ fn parse_socket_name_command(args: Vec<String>) -> Result<SocketNameCommand, Cli
                 target_session_name = Some(expect_value("--target-session-name", &mut iter)?)
             }
             "--command-name" => command_name = Some(expect_value("--command-name", &mut iter)?),
+            "--running" => runtime_signal = RuntimeCommandSignal::Running,
             "--event-seq" => {
                 let value = expect_value("--event-seq", &mut iter)?;
                 event_seq = Some(
@@ -823,6 +833,7 @@ fn parse_socket_name_command(args: Vec<String>) -> Result<SocketNameCommand, Cli
             .ok_or_else(|| CliError::MissingValue("--socket-name".to_string()))?,
         target_session_name,
         command_name,
+        runtime_signal,
         event_seq,
     })
 }
@@ -1707,7 +1718,7 @@ impl Error for CliError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, DEFAULT_REMOTE_NODE_PORT};
+    use super::{Cli, Command, RuntimeCommandSignal, DEFAULT_REMOTE_NODE_PORT};
 
     fn parse(args: &[&str]) -> Cli {
         let argv = args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>();
@@ -2220,6 +2231,33 @@ mod tests {
                 assert_eq!(command.socket_name, "wa-1");
                 assert_eq!(command.target_session_name.as_deref(), Some("target-1"));
                 assert_eq!(command.command_name.as_deref(), Some("codex"));
+                assert_eq!(command.runtime_signal, RuntimeCommandSignal::Prompt);
+                assert_eq!(command.event_seq, Some(7));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_hidden_chrome_refresh_socket_signal_running_command() {
+        match parse(&[
+            "waitagent",
+            "__chrome-refresh-socket-signal",
+            "--socket-name",
+            "wa-1",
+            "--target-session-name",
+            "target-1",
+            "--running",
+            "--event-seq",
+            "7",
+        ])
+        .command
+        {
+            Command::ChromeRefreshSocketSignal(command) => {
+                assert_eq!(command.socket_name, "wa-1");
+                assert_eq!(command.target_session_name.as_deref(), Some("target-1"));
+                assert_eq!(command.command_name, None);
+                assert_eq!(command.runtime_signal, RuntimeCommandSignal::Running);
                 assert_eq!(command.event_seq, Some(7));
             }
             other => panic!("unexpected command: {other:?}"),

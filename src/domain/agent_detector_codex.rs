@@ -96,18 +96,18 @@ impl AgentDetector for CodexDetector {
             if lc.contains("run this command")
                 || lc.contains("allow this")
                 || lc.contains("allow codex")
+                || lc.contains("do you trust the contents of this directory")
+                || lc.contains("hooks need review")
                 || lc.ends_with("[y/n]")
                 || lc.ends_with("(y/n)")
             {
                 return Some(ManagedSessionTaskState::Confirm);
             }
-            // TUI numbered menu: › 1. ..., next non-empty line starts with "2."
-            if line.starts_with('›') && line.contains(" 1.") {
-                if let Some(next) = normalized_lines.get(i + 1) {
-                    if next.starts_with("2.") || next.starts_with("2 ") {
-                        return Some(ManagedSessionTaskState::Confirm);
-                    }
-                }
+            // TUI numbered menu: the selected line starts with `› N.` and
+            // another numbered option appears nearby. Options may wrap across
+            // lines, so the next option is not always the immediate next line.
+            if codex_numbered_menu_selection(&normalized_lines, i) {
+                return Some(ManagedSessionTaskState::Confirm);
             }
             // Dialog question starting with `?` (ratatui dialog marker).
             // On the initial confirmation screen, the numbered menu hasn't
@@ -126,23 +126,27 @@ impl AgentDetector for CodexDetector {
             }
         }
 
-        // Input — find › in the LAST 5 non-empty lines. The actual prompt › is
+        if codex_has_active_work_marker(&normalized_lines) {
+            return Some(ManagedSessionTaskState::Running);
+        }
+
+        // Input — find › near the pane tail. The actual prompt › is
         // always near the bottom of the pane. Conversation › lines (user's
-        // echoed input) scroll up during execution and won't be in the last 5
+        // echoed input) scroll up during execution and won't be near the tail
         // lines after the agent has started producing output.
         //
         // Only count a › line as Input if:
         //   - The line contains ONLY "›" (empty prompt, no user text)
-        //   - OR the › is in the last 3 lines and the next line is not a
+        //   - OR the › is near the pane tail and the next line is not a
         //     numbered option (numbered menus are caught by Confirm above)
         for (i, line) in normalized_lines.iter().enumerate() {
-            if line.starts_with('›') && i >= normalized_lines.len().saturating_sub(5) {
+            if line.starts_with('›') && i >= normalized_lines.len().saturating_sub(12) {
                 // Empty prompt (just "›") — definitely Input
                 if line.trim_start_matches('›').trim().is_empty() {
                     return Some(ManagedSessionTaskState::Input);
                 }
-                // User has typed text at the prompt — must be in last 3 lines
-                if i >= normalized_lines.len().saturating_sub(3) {
+                // User has typed text at the prompt.
+                if i >= normalized_lines.len().saturating_sub(12) {
                     return Some(ManagedSessionTaskState::Input);
                 }
             }
@@ -187,4 +191,50 @@ fn detect_active_codex_from_shell_pane(pane_text: &str) -> Option<&'static str> 
     }
 
     None
+}
+
+fn codex_has_active_work_marker(lines: &[&str]) -> bool {
+    lines.iter().any(|line| {
+        let lc = line.to_ascii_lowercase();
+        lc == "working"
+            || lc.starts_with("working ")
+            || lc.starts_with("working...")
+            || lc.starts_with("• working")
+            || lc.starts_with("codex is working")
+            || lc.contains("esc to interrupt")
+            || lc.contains("ctrl-c to interrupt")
+    })
+}
+
+fn codex_numbered_menu_selection(lines: &[&str], selected_index: usize) -> bool {
+    let selected_number = lines
+        .get(selected_index)
+        .and_then(|line| line.strip_prefix('›'))
+        .and_then(parse_numbered_option);
+    let Some(selected_number) = selected_number else {
+        return false;
+    };
+
+    let start = selected_index.saturating_sub(4);
+    let end = (selected_index + 5).min(lines.len());
+    lines[start..end].iter().enumerate().any(|(offset, line)| {
+        start + offset != selected_index
+            && parse_numbered_option(line).is_some_and(|number| number != selected_number)
+    })
+}
+
+fn parse_numbered_option(line: &str) -> Option<u32> {
+    let trimmed = line.trim_start();
+    let digit_end = trimmed
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .last()
+        .map(|(index, ch)| index + ch.len_utf8())?;
+    let number = trimmed[..digit_end].parse::<u32>().ok()?;
+    let rest = trimmed[digit_end..].trim_start();
+    if rest.starts_with('.') || rest.starts_with(')') {
+        Some(number)
+    } else {
+        None
+    }
 }

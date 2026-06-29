@@ -5,10 +5,11 @@ use crate::cli::{
 use crate::infra::error_log::ERROR_LOG;
 use crate::infra::tmux::TmuxProgram;
 use crate::infra::tmux::{
-    EmbeddedTmuxBackend, TmuxPaneId, TmuxSessionGateway, TmuxSessionName, TmuxSocketName,
-    TmuxWorkspaceHandle,
+    EmbeddedTmuxBackend, TmuxLayoutGateway, TmuxPaneId, TmuxSessionGateway, TmuxSessionName,
+    TmuxSocketName, TmuxWorkspaceHandle, WAITAGENT_AGENT_SIGNAL_TOKEN_OPTION,
 };
 use crate::lifecycle::LifecycleError;
+use crate::runtime::agent_signal_runtime::{agent_signal_socket_path, generate_agent_signal_token};
 use crate::runtime::remote_node_ingress_server_runtime::RemoteNodeIngressServerRuntime;
 use crate::runtime::remote_node_session_sync_runtime::{
     shutdown_remote_session_sync_owner, LocalCatalogChangeReason, RemoteNodeSessionSyncRuntime,
@@ -56,6 +57,20 @@ impl LocalTargetHostRuntime {
             None,
             &self.network,
         )?;
+        let workspace = TmuxWorkspaceHandle {
+            workspace_id: crate::domain::workspace::WorkspaceInstanceId::new(
+                command.target_session_name.clone(),
+            ),
+            socket_name: TmuxSocketName::new(&command.socket_name),
+            session_name: TmuxSessionName::new(command.target_session_name.clone()),
+        };
+        self.backend
+            .set_session_option(
+                &workspace,
+                WAITAGENT_AGENT_SIGNAL_TOKEN_OPTION,
+                shell_program.agent_signal_token(),
+            )
+            .map_err(local_target_host_error)?;
         let program = shell_program.program();
         let mut child_command = Command::new(&program.program);
         child_command
@@ -356,6 +371,7 @@ impl LocalTargetHostRuntime {
 
 pub(crate) struct RuntimeEventShellProgram {
     program: TmuxProgram,
+    agent_signal_token: String,
     _hooks: ShellRuntimeHooks,
 }
 
@@ -363,14 +379,29 @@ impl RuntimeEventShellProgram {
     pub(crate) fn program(&self) -> &TmuxProgram {
         &self.program
     }
+
+    pub(crate) fn agent_signal_token(&self) -> &str {
+        &self.agent_signal_token
+    }
 }
 
 struct ShellRuntimeHooks {
     rcfile: Option<std::path::PathBuf>,
 }
 
+struct AgentSignalShellEnv {
+    signal_socket: String,
+    socket_name: String,
+    target_session_name: String,
+    token: String,
+}
+
 impl ShellRuntimeHooks {
-    fn for_shell(shell: &str, signal_command: &str) -> Result<Self, LifecycleError> {
+    fn for_shell(
+        shell: &str,
+        signal_command: &str,
+        agent_signal_env: &AgentSignalShellEnv,
+    ) -> Result<Self, LifecycleError> {
         let shell_name = std::path::Path::new(shell)
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
@@ -398,32 +429,38 @@ impl ShellRuntimeHooks {
             })?;
         writeln!(
             file,
-            "__waitagent_signal_runtime() {{ if [ -n \"${{__WAITAGENT_RUNTIME_SIGNALING:-}}\" ]; then return 0; fi; local __waitagent_cmd=\"$1\"; if [ -z \"$__waitagent_cmd\" ]; then __waitagent_cmd=bash; fi; __WAITAGENT_RUNTIME_EVENT_SEQ=$(( ${{__WAITAGENT_RUNTIME_EVENT_SEQ:-0}} + 1 )); local __waitagent_seq=$__WAITAGENT_RUNTIME_EVENT_SEQ; __WAITAGENT_RUNTIME_SIGNALING=1; ({} --command-name \"$__waitagent_cmd\" --event-seq \"$__waitagent_seq\") >/dev/null 2>&1 & disown; __WAITAGENT_RUNTIME_SIGNALING=; }}",
+            "export WAITAGENT_SIGNAL_SOCKET={}\nexport WAITAGENT_SOCKET_NAME={}\nexport WAITAGENT_TARGET_SESSION_NAME={}\nexport WAITAGENT_AGENT_SIGNAL_TOKEN={}\nexport WAITAGENT_PANE_ID=\"${{TMUX_PANE:-}}\"",
+            shell_escape(agent_signal_env.signal_socket.as_str()),
+            shell_escape(agent_signal_env.socket_name.as_str()),
+            shell_escape(agent_signal_env.target_session_name.as_str()),
+            shell_escape(agent_signal_env.token.as_str())
+        )
+        .map_err(|error| {
+            LifecycleError::Io("failed to write waitagent bash runtime hook".to_string(), error)
+        })?;
+        writeln!(
+            file,
+            "__waitagent_signal_runtime() {{ if [ -n \"${{__WAITAGENT_RUNTIME_SIGNALING:-}}\" ]; then return 0; fi; local __waitagent_mode=\"${{1:-prompt}}\"; __WAITAGENT_RUNTIME_EVENT_SEQ=$(( ${{__WAITAGENT_RUNTIME_EVENT_SEQ:-0}} + 1 )); local __waitagent_seq=$__WAITAGENT_RUNTIME_EVENT_SEQ; __WAITAGENT_RUNTIME_SIGNALING=1; if [ \"$__waitagent_mode\" = running ]; then ({} --running --event-seq \"$__waitagent_seq\") >/dev/null 2>&1 & disown; else ({} --event-seq \"$__waitagent_seq\") >/dev/null 2>&1 & disown; fi; __WAITAGENT_RUNTIME_SIGNALING=; }}",
+            signal_command,
             signal_command
         )
         .map_err(|error| {
             LifecycleError::Io("failed to write waitagent bash runtime hook".to_string(), error)
         })?;
         file.write_all(
-            b"__waitagent_command_name() { local __waitagent_line=\"$1\"; __waitagent_line=${__waitagent_line#${__waitagent_line%%[![:space:]]*}}; local __waitagent_cmd=${__waitagent_line%%[[:space:];|&<>]*}; __waitagent_cmd=${__waitagent_cmd##*/}; printf '%s' \"$__waitagent_cmd\"; }\n",
+            b"__waitagent_preexec() { local __waitagent_command_line=\"$1\"; case \"$__waitagent_command_line\" in ''|__waitagent_*|*__chrome-refresh*|*__remote-session-sync-owner*|*__remote-node-ingress-server*) return 0;; esac; local __waitagent_trap; __waitagent_trap=$(trap -p DEBUG); trap - DEBUG; __WAITAGENT_COMMAND_RUNNING=1; __waitagent_signal_runtime running; eval \"$__waitagent_trap\"; }\n",
         )
         .map_err(|error| {
             LifecycleError::Io("failed to write waitagent bash runtime hook".to_string(), error)
         })?;
         file.write_all(
-            b"__waitagent_preexec() { local __waitagent_command_line=\"$1\"; case \"$__waitagent_command_line\" in ''|__waitagent_*|*__chrome-refresh*|*__remote-session-sync-owner*|*__remote-node-ingress-server*) return 0;; esac; local __waitagent_trap; __waitagent_trap=$(trap -p DEBUG); trap - DEBUG; local __waitagent_cmd; __waitagent_cmd=$(__waitagent_command_name \"$__waitagent_command_line\"); if [ -n \"$__waitagent_cmd\" ]; then __WAITAGENT_COMMAND_RUNNING=1; __waitagent_signal_runtime \"$__waitagent_cmd\"; fi; eval \"$__waitagent_trap\"; }\n",
+            b"__WAITAGENT_ORIGINAL_PROMPT_COMMAND=${PROMPT_COMMAND-}\n__waitagent_prompt_command() { local __waitagent_trap; __waitagent_trap=$(trap -p DEBUG); trap - DEBUG; if [ \"${__WAITAGENT_COMMAND_RUNNING:-}\" = 1 ]; then __WAITAGENT_COMMAND_RUNNING=; __waitagent_signal_runtime prompt; fi; if [ -n \"${__WAITAGENT_ORIGINAL_PROMPT_COMMAND:-}\" ]; then eval \"$__WAITAGENT_ORIGINAL_PROMPT_COMMAND\"; fi; eval \"$__waitagent_trap\"; }\n",
         )
         .map_err(|error| {
             LifecycleError::Io("failed to write waitagent bash runtime hook".to_string(), error)
         })?;
         file.write_all(
-            b"__WAITAGENT_ORIGINAL_PROMPT_COMMAND=${PROMPT_COMMAND-}\n__waitagent_prompt_command() { local __waitagent_trap; __waitagent_trap=$(trap -p DEBUG); trap - DEBUG; if [ \"${__WAITAGENT_COMMAND_RUNNING:-}\" = 1 ]; then __WAITAGENT_COMMAND_RUNNING=; __waitagent_signal_runtime bash; fi; if [ -n \"${__WAITAGENT_ORIGINAL_PROMPT_COMMAND:-}\" ]; then eval \"$__WAITAGENT_ORIGINAL_PROMPT_COMMAND\"; fi; eval \"$__waitagent_trap\"; }\n",
-        )
-        .map_err(|error| {
-            LifecycleError::Io("failed to write waitagent bash runtime hook".to_string(), error)
-        })?;
-        file.write_all(
-            b"PROMPT_COMMAND=__waitagent_prompt_command\ntrap '__waitagent_preexec \"$BASH_COMMAND\"' DEBUG\n__waitagent_signal_runtime bash\n",
+            b"PROMPT_COMMAND=__waitagent_prompt_command\ntrap '__waitagent_preexec \"$BASH_COMMAND\"' DEBUG\n__waitagent_signal_runtime prompt\n",
         )
         .map_err(|error| {
             LifecycleError::Io(
@@ -509,13 +546,41 @@ pub(crate) fn runtime_event_shell_program(
             network,
         ),
     );
-    let shell_hooks = ShellRuntimeHooks::for_shell(&shell, &signal_command)?;
-    let mut program = TmuxProgram::new(shell).with_args(shell_hooks.shell_args());
+    let agent_signal_env = AgentSignalShellEnv {
+        signal_socket: agent_signal_socket_path(socket_name)
+            .to_string_lossy()
+            .into_owned(),
+        socket_name: socket_name.to_string(),
+        target_session_name: target_session_name.to_string(),
+        token: generate_agent_signal_token(),
+    };
+    let shell_hooks = ShellRuntimeHooks::for_shell(&shell, &signal_command, &agent_signal_env)?;
+    let mut program = TmuxProgram::new(shell)
+        .with_args(shell_hooks.shell_args())
+        .with_environment([
+            (
+                "WAITAGENT_SIGNAL_SOCKET".to_string(),
+                agent_signal_env.signal_socket.clone(),
+            ),
+            (
+                "WAITAGENT_SOCKET_NAME".to_string(),
+                agent_signal_env.socket_name.clone(),
+            ),
+            (
+                "WAITAGENT_TARGET_SESSION_NAME".to_string(),
+                agent_signal_env.target_session_name.clone(),
+            ),
+            (
+                "WAITAGENT_AGENT_SIGNAL_TOKEN".to_string(),
+                agent_signal_env.token.clone(),
+            ),
+        ]);
     if let Some(workspace_dir) = workspace_dir {
         program = program.with_start_directory(workspace_dir);
     }
     Ok(RuntimeEventShellProgram {
         program,
+        agent_signal_token: agent_signal_env.token,
         _hooks: shell_hooks,
     })
 }
@@ -529,7 +594,7 @@ fn local_target_host_error(error: crate::infra::tmux::TmuxError) -> LifecycleErr
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_command, LocalTargetHostRuntime, ShellRuntimeHooks};
+    use super::{shell_command, AgentSignalShellEnv, LocalTargetHostRuntime, ShellRuntimeHooks};
     use crate::application::workspace_service::WorkspaceService;
     use crate::cli::{LocalTargetExitedCommand, RemoteNetworkConfig};
     use crate::domain::workspace::WorkspaceInstanceConfig;
@@ -554,7 +619,13 @@ mod tests {
                 "target-1".to_string(),
             ],
         );
-        let hooks = ShellRuntimeHooks::for_shell("/bin/bash", &command)
+        let env = AgentSignalShellEnv {
+            signal_socket: "/tmp/waitagent-agent-signal-wa-1.sock".to_string(),
+            socket_name: "wa-1".to_string(),
+            target_session_name: "target-1".to_string(),
+            token: "secret".to_string(),
+        };
+        let hooks = ShellRuntimeHooks::for_shell("/bin/bash", &command, &env)
             .expect("bash runtime hooks should be created");
         let args = hooks.shell_args();
         assert_eq!(args.first().map(String::as_str), Some("--rcfile"));
@@ -563,10 +634,14 @@ mod tests {
         let content = std::fs::read_to_string(rcfile).expect("rcfile should be readable");
         assert!(content.contains("__chrome-refresh-socket-signal"));
         assert!(content.contains("--target-session-name"));
-        assert!(content.contains("--command-name"));
+        assert!(content.contains("--running"));
+        assert!(!content.contains("--command-name"));
+        assert!(!content.contains("__waitagent_command_name"));
         assert!(content.contains("& disown"));
         assert!(content.contains("__waitagent_preexec"));
         assert!(content.contains("__waitagent_prompt_command"));
+        assert!(content.contains("WAITAGENT_SIGNAL_SOCKET"));
+        assert!(content.contains("WAITAGENT_PANE_ID=\"${TMUX_PANE:-}\""));
         assert!(content.contains("trap '__waitagent_preexec \"$BASH_COMMAND\"' DEBUG"));
         assert!(content.contains("PROMPT_COMMAND"));
     }
@@ -862,7 +937,7 @@ mod tests {
             .run_activate_target(crate::cli::ActivateTargetCommand {
                 current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
                 current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
-                target: first_target_name,
+                target: first_target_name.clone(),
             })
             .expect("local target activation should succeed");
 
@@ -907,16 +982,21 @@ mod tests {
             )),
             "workspace socket should remain live after the local exit sidecar defers"
         );
-        let sessions_after_sidecar = backend
-            .list_sessions_on_socket(&TmuxSocketName::new(
-                workspace.workspace_handle.socket_name.as_str(),
-            ))
-            .expect("sessions should list after sidecar defer");
-        assert!(
-            sessions_after_sidecar
-                .iter()
-                .any(|session| session.address.session_id() == first_target.session_name.as_str()),
-            "active main pane target session is removed by main-pane-died, not local-target-exited"
+        assert_eq!(
+            backend
+                .show_session_option(&workspace.workspace_handle, "@waitagent_active_target")
+                .expect("active target should read after sidecar defer")
+                .as_deref(),
+            Some(first_target_name.as_str()),
+            "local-target-exited should defer active main pane ownership to main-pane-died"
+        );
+        assert_eq!(
+            backend
+                .show_session_option(&workspace.workspace_handle, "@waitagent_main_pane_id")
+                .expect("main pane option should read after sidecar defer")
+                .as_deref(),
+            Some(main_pane.as_str()),
+            "local-target-exited should not clear the active main pane"
         );
 
         main_slot_runtime
@@ -944,11 +1024,18 @@ mod tests {
                 == workspace.workspace_handle.session_name.as_str()),
             "workspace session should still exist"
         );
-        assert!(
-            sessions
-                .iter()
-                .any(|session| session.address.session_id() == second_target.session_name.as_str()),
-            "other local target sessions should remain"
+        let second_target_name = format!(
+            "{}:{}",
+            workspace.workspace_handle.socket_name.as_str(),
+            second_target.session_name.as_str()
+        );
+        assert_eq!(
+            backend
+                .show_session_option(&workspace.workspace_handle, "@waitagent_active_target")
+                .expect("active target should read after main-pane-died recovery")
+                .as_deref(),
+            Some(second_target_name.as_str()),
+            "main-pane-died should recover to another local target"
         );
         assert!(
             !sessions

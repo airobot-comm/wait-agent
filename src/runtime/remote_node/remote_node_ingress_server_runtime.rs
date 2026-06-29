@@ -35,7 +35,7 @@ use crate::runtime::remote_workspace_socket_registry_runtime::{
     workspace_socket_registry_path, RemoteWorkspaceSocketRegistryRuntime,
 };
 use crate::runtime::sidecar_process_runtime::spawn_waitagent_sidecar_child;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
@@ -1293,6 +1293,7 @@ fn run_node_ingress_server_loop(
     let mut low_priority_events = VecDeque::<IngressServerEvent>::new();
     let mut publication_revisions = ReceiverPublicationRevisionTable::default();
     let mut socket_discovery_retry_scheduled = false;
+    let mut closed_session_instances = HashSet::<String>::new();
 
     loop {
         drain_ingress_events(
@@ -1333,6 +1334,7 @@ fn run_node_ingress_server_loop(
                 &mut publication_revisions,
                 internal_tx.clone(),
                 &mut socket_discovery_retry_scheduled,
+                &mut closed_session_instances,
                 event,
             ),
             IngressServerEvent::Internal(InternalEvent::Shutdown) => break,
@@ -1429,12 +1431,14 @@ fn handle_transport_event(
     publication_revisions: &mut ReceiverPublicationRevisionTable,
     internal_tx: mpsc::Sender<InternalEvent>,
     socket_discovery_retry_scheduled: &mut bool,
+    closed_session_instances: &mut HashSet<String>,
     event: RemoteNodeTransportEvent,
 ) {
     match event {
         RemoteNodeTransportEvent::SessionOpened { session } => {
             let node_id = session.node_id().to_string();
             let session_instance_id = session.session_instance_id().to_string();
+            closed_session_instances.remove(&session_instance_id);
             let mut active = ActiveNodeIngressSession {
                 session,
                 bridges: HashMap::new(),
@@ -1455,6 +1459,12 @@ fn handle_transport_event(
             session_instance_id,
             envelope,
         } => {
+            if closed_session_instances.contains(&session_instance_id) {
+                ERROR_LOG.log(format!(
+                    "[diag-ingress] dropping event for closed session_instance_id={session_instance_id} node={node_id}"
+                ));
+                return;
+            }
             if let Some(request_id) = grpc_create_session_reply_request_id(&envelope) {
                 if let Some(reply_tx) = pending_create_sessions.remove(&request_id) {
                     let _ = reply_tx.send(envelope);
@@ -1509,6 +1519,7 @@ fn handle_transport_event(
             ..
         } => {
             sessions.remove(&session_instance_id);
+            closed_session_instances.insert(session_instance_id);
             mark_discovered_node_offline_if_last_ingress_session(
                 publication_runtime,
                 sessions,
@@ -1522,6 +1533,7 @@ fn handle_transport_event(
         } => {
             if let Some(session_instance_id) = session_instance_id {
                 sessions.remove(&session_instance_id);
+                closed_session_instances.insert(session_instance_id);
             }
             if let Some(node_id) = node_id {
                 mark_discovered_node_offline_if_last_ingress_session(

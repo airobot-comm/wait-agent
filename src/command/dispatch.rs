@@ -54,6 +54,7 @@ impl CommandDispatcher {
                     &command.socket_name,
                     command.target_session_name.as_deref(),
                     command.command_name.as_deref(),
+                    command.runtime_signal,
                     command.event_seq,
                 )
                 .map_err(AppError::from),

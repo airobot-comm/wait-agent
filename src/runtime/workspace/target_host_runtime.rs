@@ -5,7 +5,10 @@ use crate::application::workspace_service::{BootstrappedWorkspace, WorkspaceServ
 use crate::domain::session_catalog::{ManagedSessionRecord, SessionTransport};
 use crate::domain::workspace::WorkspaceInstanceConfig;
 use crate::infra::error_log::ERROR_LOG;
-use crate::infra::tmux::{EmbeddedTmuxBackend, TmuxError, TmuxLayoutGateway, TmuxSocketName};
+use crate::infra::tmux::{
+    EmbeddedTmuxBackend, TmuxError, TmuxLayoutGateway, TmuxSocketName,
+    WAITAGENT_AGENT_SIGNAL_TOKEN_OPTION,
+};
 use crate::lifecycle::LifecycleError;
 #[cfg(test)]
 use crate::runtime::current_executable::current_waitagent_executable;
@@ -142,6 +145,11 @@ impl TargetHostRuntime {
             &workspace.workspace_handle,
             WAITAGENT_MAIN_PANE_OPTION,
             pane.as_str(),
+        )?;
+        self.backend.set_session_option(
+            &workspace.workspace_handle,
+            WAITAGENT_AGENT_SIGNAL_TOKEN_OPTION,
+            shell_program.agent_signal_token(),
         )?;
         ERROR_LOG.log(format!(
             "[diag-newhost] target_host write_metadata socket={} session={} pane={} elapsed={:?} total={:?}",

@@ -43,6 +43,13 @@ const WAITAGENT_TRANSPORT_LOCAL_TMUX: &str = "local-tmux";
 pub(crate) const WAITAGENT_PANE_PIPE_OWNER_OPTION: &str = "@waitagent_pane_pipe_owner";
 pub(crate) const WAITAGENT_RUNTIME_COMMAND_OVERRIDE_OPTION: &str =
     "@waitagent_runtime_command_override";
+pub(crate) const WAITAGENT_RUNTIME_RUNNING_OVERRIDE: &str = "__waitagent_running__";
+pub(crate) const WAITAGENT_AGENT_SIGNAL_AGENT_OPTION: &str = "@waitagent_agent_signal_agent";
+pub(crate) const WAITAGENT_AGENT_SIGNAL_PANE_OPTION: &str = "@waitagent_agent_signal_pane";
+pub(crate) const WAITAGENT_AGENT_SIGNAL_STATE_OPTION: &str = "@waitagent_agent_signal_state";
+pub(crate) const WAITAGENT_AGENT_SIGNAL_TOKEN_OPTION: &str = "@waitagent_agent_signal_token";
+pub(crate) const WAITAGENT_AGENT_SIGNAL_UPDATED_AT_OPTION: &str =
+    "@waitagent_agent_signal_updated_at";
 pub(crate) const WAITAGENT_REMOTE_PUBLICATION_AUTHORITY_ID_ENV: &str =
     "WAITAGENT_REMOTE_PUBLICATION_AUTHORITY_ID";
 pub(crate) const WAITAGENT_REMOTE_PUBLICATION_TRANSPORT_SESSION_ID_ENV: &str =

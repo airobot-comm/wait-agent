@@ -1085,13 +1085,27 @@ mod tests {
             "exited first target session should be gone"
         );
 
-        let exited_session = target_hosts[0].session_name.as_str();
-        let stale_identity = all_pane_target_identities(&backend, &workspace.workspace_handle)
-            .into_iter()
-            .find(|(_, identity)| identity.as_deref() == Some(exited_session));
+        let active_target = backend
+            .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+            .expect("active target should read after recovery")
+            .expect("active target should remain after recovery");
+        let active_session = split_qualified_target(&active_target)
+            .map(|(_, session)| session)
+            .expect("active target should be qualified");
+        let current_main_pane = backend
+            .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
+            .expect("main pane option should read after recovery")
+            .expect("main pane option should remain populated after recovery");
         assert_eq!(
-            stale_identity, None,
-            "exited target identity must not remain on a parking pane"
+            pane_option(
+                &backend,
+                &workspace.workspace_handle,
+                &current_main_pane,
+                "@waitagent_target_session_name",
+            )
+            .as_deref(),
+            Some(active_session),
+            "workspace main pane must belong to the recovered active target"
         );
 
         kill_server(&backend, &workspace.workspace_handle);
@@ -2285,7 +2299,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_main_pane_exit_prefers_another_remote_target_before_local_target_host() {
+    fn remote_main_pane_exit_activates_next_remote_target_own_pane() {
         let _guard = crate::test_support::integration_test_lock();
         let backend = EmbeddedTmuxBackend::from_build_env()
             .expect("vendored tmux backend should discover build env");
@@ -2397,6 +2411,39 @@ mod tests {
             .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
             .expect("main pane option should read")
             .expect("main pane option should be populated");
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: remote_target_2.address.qualified_target(),
+            })
+            .expect("second remote target activation should succeed");
+        wait_for_condition(|| {
+            backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read")
+                .as_deref()
+                == Some(remote_target_2.address.qualified_target().as_str())
+        });
+        let next_remote_pane_id = backend
+            .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
+            .expect("next remote main pane option should read")
+            .expect("next remote main pane option should be populated");
+        assert_ne!(next_remote_pane_id, main_pane_id);
+        runtime
+            .run_activate_target(ActivateTargetCommand {
+                current_socket_name: workspace.workspace_handle.socket_name.as_str().to_string(),
+                current_session_name: workspace.workspace_handle.session_name.as_str().to_string(),
+                target: remote_target.address.qualified_target(),
+            })
+            .expect("first remote target reactivation should succeed");
+        wait_for_condition(|| {
+            backend
+                .show_session_option(&workspace.workspace_handle, WAITAGENT_ACTIVE_TARGET_OPTION)
+                .expect("active target should read")
+                .as_deref()
+                == Some(remote_target.address.qualified_target().as_str())
+        });
         let main_pane = crate::infra::tmux::TmuxPaneId::new(main_pane_id.clone());
         backend
             .set_pane_option(
@@ -2466,7 +2513,7 @@ mod tests {
             .show_session_option(&workspace.workspace_handle, WAITAGENT_MAIN_PANE_OPTION)
             .expect("main pane option should read after recovery")
             .expect("main pane option should remain populated after recovery");
-        assert_eq!(recovered_main_pane, main_pane_id);
+        assert_eq!(recovered_main_pane, next_remote_pane_id);
         let pane_died_hook = pane_hook_command(
             &backend,
             &workspace.workspace_handle,
@@ -2670,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_target_exit_recovery_rejects_sidebar_as_signaled_pane() {
+    fn session_pane_lookup_ignores_corrupted_cache_and_chrome_panes() {
         let _guard = crate::test_support::integration_test_lock();
         let backend = EmbeddedTmuxBackend::from_build_env()
             .expect("vendored tmux backend should discover build env");
@@ -2790,24 +2837,40 @@ mod tests {
                 sidebar_pane.as_str(),
             )
             .expect("session pane option should accept corrupted sidebar owner");
-        let invalid_recovery = runtime.exited_remote_content_pane(
-            &workspace.workspace_handle,
-            remote_target_a.address.qualified_target().as_str(),
-            Some(sidebar_pane.as_str()),
-            Some(&sidebar_pane),
-        );
-        assert!(invalid_recovery.is_err());
-        let recovery_pane = runtime
-            .exited_remote_content_pane(
+        let recovered_pane = runtime
+            .find_session_pane(
                 &workspace.workspace_handle,
                 remote_target_a.address.qualified_target().as_str(),
-                Some(sidebar_pane.as_str()),
-                Some(&crate::infra::tmux::TmuxPaneId::new(
-                    remote_session_pane.clone(),
-                )),
             )
-            .expect("valid session pane should win over invalid signal pane");
-        assert_eq!(recovery_pane.as_str(), remote_session_pane.as_str());
+            .expect("session pane lookup should tolerate corrupted cache")
+            .expect("owned remote content pane should still be discoverable");
+        assert_eq!(recovered_pane.as_str(), remote_session_pane.as_str());
+        assert_eq!(
+            backend
+                .show_session_option(&workspace.workspace_handle, &option_name)
+                .expect("session pane option should read")
+                .as_deref(),
+            None
+        );
+
+        backend
+            .set_pane_option(
+                &workspace.workspace_handle,
+                &crate::infra::tmux::TmuxPaneId::new(remote_session_pane.clone()),
+                "@waitagent_session_instance_id",
+                "different-session",
+            )
+            .expect("session owner metadata should be corruptible for test");
+        let missing_pane = runtime
+            .find_session_pane(
+                &workspace.workspace_handle,
+                remote_target_a.address.qualified_target().as_str(),
+            )
+            .expect("session pane lookup should tolerate stale owner metadata");
+        assert!(
+            missing_pane.is_none(),
+            "session pane lookup must not borrow another session's content pane"
+        );
 
         kill_server(&backend, &workspace.workspace_handle);
         let _ = fs::remove_dir_all(workspace_dir);
@@ -3375,36 +3438,6 @@ mod tests {
                 .and_then(|rest| rest.split_once(']'))
                 .map(|(_, command)| command.trim().to_string())
         })
-    }
-
-    fn all_pane_target_identities(
-        backend: &EmbeddedTmuxBackend,
-        workspace: &TmuxWorkspaceHandle,
-    ) -> Vec<(String, Option<String>)> {
-        let output = backend
-            .run_on_socket(
-                &workspace.socket_name,
-                &[
-                    "list-panes".to_string(),
-                    "-a".to_string(),
-                    "-F".to_string(),
-                    "#{pane_id}\t#{@waitagent_target_session_name}".to_string(),
-                ],
-            )
-            .expect("pane identities should list");
-        output
-            .stdout
-            .lines()
-            .map(|line| {
-                let mut parts = line.split('\t');
-                let pane_id = parts.next().unwrap_or_default().to_string();
-                let identity = parts
-                    .next()
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string);
-                (pane_id, identity)
-            })
-            .collect()
     }
 
     fn wait_for_condition(predicate: impl Fn() -> bool) {

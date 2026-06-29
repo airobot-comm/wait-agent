@@ -3,6 +3,7 @@ pub mod agent_detector_claude;
 pub mod agent_detector_codex;
 pub mod agent_detector_kimi;
 pub mod agent_detector_shell;
+pub mod agent_signal;
 pub mod chrome;
 pub mod local_runtime;
 pub mod session_catalog;

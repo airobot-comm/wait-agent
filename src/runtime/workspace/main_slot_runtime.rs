@@ -32,7 +32,11 @@ use std::time::Instant;
 const WAITAGENT_MAIN_PANE_OPTION: &str = "@waitagent_main_pane_id";
 const WAITAGENT_ACTIVE_TARGET_OPTION: &str = "@waitagent_active_target";
 const WAITAGENT_SESSION_PANE_PREFIX: &str = "@waitagent_session_pane_";
+const WAITAGENT_PANE_ROLE_OPTION: &str = "@waitagent_pane_role";
+const WAITAGENT_PANE_ROLE_CONTENT: &str = "content";
+const WAITAGENT_PANE_SESSION_INSTANCE_OPTION: &str = "@waitagent_session_instance_id";
 const WAITAGENT_PANE_TARGET_SESSION_OPTION: &str = "@waitagent_target_session_name";
+const WAITAGENT_PANE_TARGET_ID_OPTION: &str = "@waitagent_target_id";
 const WAITAGENT_MAIN_PANE_STATE_LOCK_PREFIX: &str = "waitagent-main-pane-state-";
 const WAITAGENT_MAIN_PANE_GENERATION_OPTION: &str = "@waitagent_main_pane_generation";
 const WAITAGENT_MAIN_PANE_TRANSITION_OPTION: &str = "@waitagent_main_pane_transition";
@@ -245,6 +249,19 @@ impl MainSlotRuntime {
                 t_activate.elapsed(),
                 t_total.elapsed()
             ));
+            let t_bridge = Instant::now();
+            self.configure_main_pane_output_bridge_for_active_target(
+                workspace,
+                Some(existing_target.address.qualified_target().as_str()),
+            )?;
+            ERROR_LOG.log(format!(
+                "[diag-newhost] materialize existing_bridge socket={} session={} target={} elapsed={:?} total={:?}",
+                workspace.socket_name.as_str(),
+                workspace.session_name.as_str(),
+                existing_target.address.qualified_target(),
+                t_bridge.elapsed(),
+                t_total.elapsed()
+            ));
             let t_chrome = Instant::now();
             self.layout_runtime
                 .refresh_workspace_chrome(workspace, workspace_dir)?;
@@ -311,7 +328,21 @@ impl MainSlotRuntime {
             t_activate.elapsed(),
             t_total.elapsed()
         ));
-        result
+        result?;
+        let t_bridge = Instant::now();
+        self.configure_main_pane_output_bridge_for_active_target(
+            workspace,
+            Some(target.address.qualified_target().as_str()),
+        )?;
+        ERROR_LOG.log(format!(
+            "[diag-newhost] materialize new_bridge socket={} session={} target={} elapsed={:?} total={:?}",
+            workspace.socket_name.as_str(),
+            workspace.session_name.as_str(),
+            target.address.qualified_target(),
+            t_bridge.elapsed(),
+            t_total.elapsed()
+        ));
+        Ok(())
     }
 
     pub fn run_main_pane_died(&self, command: MainPaneDiedCommand) -> Result<(), LifecycleError> {
@@ -705,35 +736,14 @@ impl MainSlotRuntime {
             t_total.elapsed()
         ));
 
-        if let Some(active_target) = active_target.as_deref() {
-            if let Some((_, target_session)) = split_qualified_target(active_target)
-                .filter(|(sock, _)| *sock == workspace.socket_name.as_str())
-            {
-                let target_workspace = self.target_workspace_on_socket(&workspace, target_session);
-                let parking_pane =
-                    self.local_target_parking_pane(&target_workspace, active_target)?;
-                if parking_pane != workspace_main_pane {
-                    self.backend
-                        .swap_panes(&workspace, &parking_pane, &workspace_main_pane)
-                        .map_err(main_slot_error)?;
-                    self.set_local_target_pane_identity(
-                        &workspace,
-                        &workspace_main_pane,
-                        target_session,
-                    )?;
-                    self.set_workspace_main_pane(&target_workspace, &workspace_main_pane)?;
-                    workspace_main_pane = parking_pane;
-                    self.clear_local_target_pane_identity(&workspace, &workspace_main_pane)?;
-                }
-            } else if switching_from_remote {
-                workspace_main_pane = self.prepare_remote_main_pane_for_local_switch(
-                    current_workspace,
-                    &workspace,
-                    &workspace_main_pane,
-                    previous_remote_main_pane.as_ref(),
-                )?;
-                self.cleanup_stale_isolation_pane(&workspace, &workspace_main_pane)?;
-            }
+        if active_target.is_some() && switching_from_remote {
+            workspace_main_pane = self.prepare_remote_main_pane_for_local_switch(
+                current_workspace,
+                &workspace,
+                &workspace_main_pane,
+                previous_remote_main_pane.as_ref(),
+            )?;
+            self.cleanup_stale_isolation_pane(&workspace, &workspace_main_pane)?;
         }
 
         let t_target_pane = Instant::now();
@@ -761,16 +771,7 @@ impl MainSlotRuntime {
                 t_swap.elapsed(),
                 t_total.elapsed()
             ));
-            let t_clear = Instant::now();
-            self.clear_local_target_pane_identity(&workspace, &workspace_main_pane)?;
-            ERROR_LOG.log(format!(
-                "[diag-newhost] activate_local clear_workspace_pane_identity socket={} session={} pane={} elapsed={:?} total={:?}",
-                current_workspace.socket_name,
-                current_workspace.session_name,
-                workspace_main_pane.as_str(),
-                t_clear.elapsed(),
-                t_total.elapsed()
-            ));
+            self.break_pane_to_orphan_window(&workspace, &workspace_main_pane);
         }
         let t_identity = Instant::now();
         self.set_local_target_pane_identity(
@@ -789,7 +790,7 @@ impl MainSlotRuntime {
         let target_workspace =
             self.target_workspace_on_socket(&workspace, target.address.session_id());
         let t_set_target_main = Instant::now();
-        self.set_workspace_main_pane(&target_workspace, &target_main_pane)?;
+        self.set_workspace_main_pane_if_session_exists(&target_workspace, &target_main_pane)?;
         ERROR_LOG.log(format!(
             "[diag-newhost] activate_local set_target_workspace_main socket={} session={} target_workspace={} pane={} elapsed={:?} total={:?}",
             current_workspace.socket_name,
@@ -873,34 +874,11 @@ impl MainSlotRuntime {
             return Ok(());
         }
 
-        let mut workspace_main_pane = self.workspace_main_pane(&workspace)?;
+        let workspace_main_pane = self.workspace_main_pane(&workspace)?;
         let active_target = self.active_target(&workspace)?;
         let previous_remote_main_pane =
             self.active_remote_session_pane(&workspace, active_target.as_deref())?;
         self.begin_main_pane_transition(&workspace, &workspace_main_pane)?;
-
-        if let Some(active_target) = active_target.as_deref() {
-            if let Some((_, target_session)) = split_qualified_target(active_target)
-                .filter(|(sock, _)| *sock == workspace.socket_name.as_str())
-            {
-                let target_workspace = self.target_workspace_on_socket(&workspace, target_session);
-                let parking_pane =
-                    self.local_target_parking_pane(&target_workspace, active_target)?;
-                if parking_pane != workspace_main_pane {
-                    self.backend
-                        .swap_panes(&workspace, &parking_pane, &workspace_main_pane)
-                        .map_err(main_slot_error)?;
-                    self.set_local_target_pane_identity(
-                        &workspace,
-                        &workspace_main_pane,
-                        target_session,
-                    )?;
-                    self.set_workspace_main_pane(&target_workspace, &workspace_main_pane)?;
-                    workspace_main_pane = parking_pane;
-                    self.clear_local_target_pane_identity(&workspace, &workspace_main_pane)?;
-                }
-            }
-        }
 
         self.cleanup_stale_isolation_pane(&workspace, &workspace_main_pane)?;
 
@@ -988,6 +966,12 @@ impl MainSlotRuntime {
             workspace_main_pane,
             current_workspace,
             target,
+        )?;
+        self.set_content_pane_owner(
+            workspace,
+            &new_pane,
+            target.session_instance_id(),
+            &qualified_target,
         )?;
         self.set_session_pane(workspace, &qualified_target, &new_pane)?;
         Ok(new_pane)
@@ -1158,6 +1142,12 @@ impl MainSlotRuntime {
             t_total.elapsed()
         ));
         if active_target.as_deref() != Some(command.target.as_str()) {
+            let inactive_pane = self.read_session_pane(&workspace, &command.target)?;
+            self.cleanup_exited_remote_session_pane(
+                &workspace,
+                &command.target,
+                inactive_pane.as_ref(),
+            )?;
             ERROR_LOG.log_exit_latency(format!(
                 "[diag-exit] workspace_remote_exit_skip_inactive target={} total={:?} stage=workspace_exit",
                 command.target,
@@ -1189,68 +1179,27 @@ impl MainSlotRuntime {
             t_transition.elapsed(),
             t_total.elapsed()
         ));
-        let mut cleanup_pane = session_pane.clone();
+        let cleanup_pane = session_pane.clone();
 
         match transition {
             RemoteTargetExitTransition::ActivateRemote(target) => {
                 let t_activate = Instant::now();
-                match self.next_remote_target_pane_after_exit(
-                    &workspace,
-                    &command,
-                    cleanup_pane.as_ref(),
-                    &target,
-                )? {
-                    RemoteTargetExitPanePlan::ActivateTargetSessionPane => {
-                        self.activate_remote_target_in_workspace(&current_workspace, &target)?;
-                        ERROR_LOG.log_exit_latency(format!(
-                            "[diag-exit] workspace_remote_exit_activate_remote target={} next={} elapsed={:?} total={:?} stage=workspace_exit",
-                            command.target,
-                            target.address.qualified_target(),
-                            t_activate.elapsed(),
-                            t_total.elapsed()
-                        ));
-                    }
-                    RemoteTargetExitPanePlan::AssignExitedPaneToNextTarget(pane) => {
-                        self.assign_remote_target_to_content_pane(
-                            &current_workspace,
-                            &workspace,
-                            &pane,
-                            &target,
-                        )?;
-                        cleanup_pane = None;
-                        ERROR_LOG.log_exit_latency(format!(
-                            "[diag-exit] workspace_remote_exit_assign_pane target={} next={} pane={} elapsed={:?} total={:?} stage=workspace_exit",
-                            command.target,
-                            target.address.qualified_target(),
-                            pane.as_str(),
-                            t_activate.elapsed(),
-                            t_total.elapsed()
-                        ));
-                    }
-                }
+                self.activate_remote_target_in_workspace(&current_workspace, &target)?;
+                ERROR_LOG.log_exit_latency(format!(
+                    "[diag-exit] workspace_remote_exit_activate_remote target={} next={} elapsed={:?} total={:?} stage=workspace_exit",
+                    command.target,
+                    target.address.qualified_target(),
+                    t_activate.elapsed(),
+                    t_total.elapsed()
+                ));
             }
             RemoteTargetExitTransition::ActivateLocal(target) => {
                 let t_activate = Instant::now();
-                let recovery_pane = self.exited_remote_content_pane(
-                    &workspace,
-                    &command.target,
-                    command.pane_id.as_deref(),
-                    cleanup_pane.as_ref(),
-                )?;
-                self.clear_remote_recovery_pane_state(&workspace, &recovery_pane);
-                self.backend
-                    .respawn_pane(
-                        &workspace,
-                        &recovery_pane,
-                        &workspace_shell_program(&current_workspace.workspace_dir),
-                    )
-                    .map_err(main_slot_error)?;
                 self.activate_target_in_workspace(&current_workspace, &target)?;
                 ERROR_LOG.log_exit_latency(format!(
-                    "[diag-exit] workspace_remote_exit_activate_local target={} next={} recovery_pane={} elapsed={:?} total={:?} stage=workspace_exit",
+                    "[diag-exit] workspace_remote_exit_activate_local target={} next={} elapsed={:?} total={:?} stage=workspace_exit",
                     command.target,
                     target.address.qualified_target(),
-                    recovery_pane.as_str(),
                     t_activate.elapsed(),
                     t_total.elapsed()
                 ));
@@ -1315,29 +1264,6 @@ impl MainSlotRuntime {
         Ok(RemoteTargetExitTransition::CloseWorkspace)
     }
 
-    fn exited_remote_content_pane(
-        &self,
-        workspace: &TmuxWorkspaceHandle,
-        target: &str,
-        signaled_pane_id: Option<&str>,
-        session_pane: Option<&TmuxPaneId>,
-    ) -> Result<TmuxPaneId, LifecycleError> {
-        if let Some(pane_id) = signaled_pane_id.filter(|pane_id| !pane_id.is_empty()) {
-            let pane = TmuxPaneId::new(pane_id);
-            if self.pane_is_recoverable_content_pane(workspace, pane.as_str())? {
-                return Ok(pane);
-            }
-        }
-        if let Some(pane) = session_pane {
-            if self.pane_is_recoverable_content_pane(workspace, pane.as_str())? {
-                return Ok(pane.clone());
-            }
-        }
-        Err(LifecycleError::Protocol(format!(
-            "remote target `{target}` exit has no retained content pane to recover"
-        )))
-    }
-
     fn clear_remote_recovery_pane_state(
         &self,
         workspace: &TmuxWorkspaceHandle,
@@ -1362,18 +1288,8 @@ impl MainSlotRuntime {
             return Ok(workspace_main_pane.clone());
         }
 
-        let (parking_pane, break_remote_after_swap) =
-            match self.find_workspace_orphan_parking_pane(workspace, workspace_main_pane)? {
-                Some(pane) => (pane, false),
-                None => (
-                    self.create_workspace_parking_pane(
-                        current_workspace,
-                        workspace,
-                        workspace_main_pane,
-                    )?,
-                    true,
-                ),
-            };
+        let parking_pane =
+            self.create_workspace_parking_pane(current_workspace, workspace, workspace_main_pane)?;
 
         if parking_pane == *workspace_main_pane {
             return Ok(workspace_main_pane.clone());
@@ -1382,54 +1298,8 @@ impl MainSlotRuntime {
         self.backend
             .swap_panes(workspace, &parking_pane, workspace_main_pane)
             .map_err(main_slot_error)?;
-        if break_remote_after_swap {
-            self.break_pane_to_orphan_window(workspace, workspace_main_pane);
-        }
+        self.break_pane_to_orphan_window(workspace, workspace_main_pane);
         Ok(parking_pane)
-    }
-
-    fn find_workspace_orphan_parking_pane(
-        &self,
-        workspace: &TmuxWorkspaceHandle,
-        excluded_pane: &TmuxPaneId,
-    ) -> Result<Option<TmuxPaneId>, LifecycleError> {
-        let output = self
-            .backend
-            .run_on_socket(
-                &workspace.socket_name,
-                &[
-                    "list-panes".to_string(),
-                    "-a".to_string(),
-                    "-F".to_string(),
-                    format!(
-                        "#{{session_name}}\t#{{window_name}}\t#{{pane_id}}\t#{{pane_dead}}\t#{{pane_title}}\t#{{pane_current_command}}\t#{{{WAITAGENT_PANE_TARGET_SESSION_OPTION}}}"
-                    ),
-                ],
-            )
-            .map_err(main_slot_error)?;
-        for line in output.stdout.lines() {
-            let mut parts = line.split('\t');
-            let session_name = parts.next().unwrap_or_default();
-            let window_name = parts.next().unwrap_or_default();
-            let pane_id = parts.next().unwrap_or_default();
-            let pane_dead = parts.next().unwrap_or_default();
-            let title = parts.next().unwrap_or_default();
-            let current_command = parts.next().unwrap_or_default();
-            let identity = parts.next().unwrap_or_default();
-            if session_name == workspace.session_name.as_str()
-                && window_name.starts_with("wa-orphan-")
-                && pane_dead == "0"
-                && !pane_id.is_empty()
-                && pane_id != excluded_pane.as_str()
-                && title != SIDEBAR_PANE_TITLE
-                && title != FOOTER_PANE_TITLE
-                && current_command != "waitagent"
-                && identity.is_empty()
-            {
-                return Ok(Some(TmuxPaneId::new(pane_id)));
-            }
-        }
-        Ok(None)
     }
 
     fn create_workspace_parking_pane(
@@ -1559,31 +1429,6 @@ impl MainSlotRuntime {
         result
     }
 
-    fn next_remote_target_pane_after_exit(
-        &self,
-        workspace: &TmuxWorkspaceHandle,
-        command: &RemoteTargetExitedCommand,
-        exited_pane: Option<&TmuxPaneId>,
-        target: &ManagedSessionRecord,
-    ) -> Result<RemoteTargetExitPanePlan, LifecycleError> {
-        let qualified_target = target.address.qualified_target();
-        if self
-            .live_session_pane(workspace, qualified_target.as_str())?
-            .filter(|pane| Some(pane) != exited_pane)
-            .is_some()
-        {
-            return Ok(RemoteTargetExitPanePlan::ActivateTargetSessionPane);
-        }
-
-        let pane = self.exited_remote_content_pane(
-            workspace,
-            &command.target,
-            command.pane_id.as_deref(),
-            exited_pane,
-        )?;
-        Ok(RemoteTargetExitPanePlan::AssignExitedPaneToNextTarget(pane))
-    }
-
     fn recover_remote_target_in_workspace(
         &self,
         current_workspace: &CurrentWorkspace,
@@ -1703,6 +1548,12 @@ impl MainSlotRuntime {
                 ),
             )
             .map_err(main_slot_error)?;
+        self.set_content_pane_owner(
+            workspace,
+            pane,
+            target.session_instance_id(),
+            target.address.qualified_target().as_str(),
+        )?;
         self.set_session_pane(workspace, target.address.qualified_target().as_str(), pane)?;
         self.restore_workspace_main_pane(
             current_workspace,
@@ -1759,7 +1610,7 @@ impl MainSlotRuntime {
             self.signal_local_target_presentation_refresh(workspace, target_session_name);
             return Ok(pane);
         }
-        let pane = self.local_target_parking_pane(workspace, qualified_target)?;
+        let pane = self.create_or_adopt_local_target_content_pane(workspace, qualified_target)?;
         self.set_local_target_pane_identity(workspace, &pane, target_session_name)?;
         self.set_workspace_main_pane(workspace, &pane)?;
         self.signal_local_target_presentation_refresh(workspace, target_session_name);
@@ -1777,7 +1628,7 @@ impl MainSlotRuntime {
         );
     }
 
-    fn local_target_parking_pane(
+    fn create_or_adopt_local_target_content_pane(
         &self,
         workspace: &TmuxWorkspaceHandle,
         qualified_target: &str,
@@ -1796,7 +1647,7 @@ impl MainSlotRuntime {
             .map_err(main_slot_error)
             .map_err(|error| {
                 LifecycleError::Protocol(format!(
-                    "target `{}` has no available parking pane: {error}",
+                    "target `{}` has no available content pane: {error}",
                     qualified_target
                 ))
             })
@@ -1808,34 +1659,79 @@ impl MainSlotRuntime {
         pane: &TmuxPaneId,
         target_session_name: &str,
     ) -> Result<(), LifecycleError> {
+        self.set_content_pane_owner(
+            workspace,
+            pane,
+            target_session_name,
+            &format!("{}:{}", workspace.socket_name.as_str(), target_session_name),
+        )?;
+        Ok(())
+    }
+
+    fn set_content_pane_owner(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        pane: &TmuxPaneId,
+        session_instance_id: &str,
+        target_id: &str,
+    ) -> Result<(), LifecycleError> {
+        self.backend
+            .set_pane_option(
+                workspace,
+                pane,
+                WAITAGENT_PANE_ROLE_OPTION,
+                WAITAGENT_PANE_ROLE_CONTENT,
+            )
+            .map_err(main_slot_error)?;
+        self.backend
+            .set_pane_option(
+                workspace,
+                pane,
+                WAITAGENT_PANE_SESSION_INSTANCE_OPTION,
+                session_instance_id,
+            )
+            .map_err(main_slot_error)?;
         self.backend
             .set_pane_option(
                 workspace,
                 pane,
                 WAITAGENT_PANE_TARGET_SESSION_OPTION,
-                target_session_name,
+                session_instance_id,
             )
+            .map_err(main_slot_error)?;
+        self.backend
+            .set_pane_option(workspace, pane, WAITAGENT_PANE_TARGET_ID_OPTION, target_id)
             .map_err(main_slot_error)
     }
 
-    fn clear_local_target_pane_identity(
+    fn pane_matches_session_instance(
         &self,
         workspace: &TmuxWorkspaceHandle,
         pane: &TmuxPaneId,
-    ) -> Result<(), LifecycleError> {
-        if !self.pane_exists_on_socket(workspace, pane.as_str())? {
-            return Ok(());
-        }
-        self.backend
-            .set_pane_option(workspace, pane, WAITAGENT_PANE_TARGET_SESSION_OPTION, "")
-            .map_err(main_slot_error)
+        session_instance_id: &str,
+    ) -> Result<bool, LifecycleError> {
+        let role = self
+            .backend
+            .show_pane_option_on_socket(&workspace.socket_name, pane, WAITAGENT_PANE_ROLE_OPTION)
+            .map_err(main_slot_error)?
+            .unwrap_or_default();
+        let owner = self
+            .backend
+            .show_pane_option_on_socket(
+                &workspace.socket_name,
+                pane,
+                WAITAGENT_PANE_SESSION_INSTANCE_OPTION,
+            )
+            .map_err(main_slot_error)?
+            .unwrap_or_default();
+        Ok(role == WAITAGENT_PANE_ROLE_CONTENT && owner == session_instance_id)
     }
 
     fn read_live_session_pane_option_for_target(
         &self,
         workspace: &TmuxWorkspaceHandle,
         option_name: &str,
-        target_session_name: &str,
+        session_instance_id: &str,
     ) -> Result<Option<TmuxPaneId>, LifecycleError> {
         let pane_id = self
             .backend
@@ -1848,7 +1744,7 @@ impl MainSlotRuntime {
         let pane = TmuxPaneId::new(pane_id);
         if self.pane_exists_on_socket(workspace, pane.as_str())?
             && self.pane_is_live_on_socket(workspace, pane.as_str())?
-            && self.pane_target_identity(workspace, &pane)?.as_deref() == Some(target_session_name)
+            && self.pane_matches_session_instance(workspace, &pane, session_instance_id)?
         {
             return Ok(Some(pane));
         }
@@ -1861,7 +1757,15 @@ impl MainSlotRuntime {
     fn find_local_target_pane_by_identity(
         &self,
         workspace: &TmuxWorkspaceHandle,
-        target_session_name: &str,
+        session_instance_id: &str,
+    ) -> Result<Option<TmuxPaneId>, LifecycleError> {
+        self.find_content_pane_by_session_instance(workspace, session_instance_id)
+    }
+
+    fn find_content_pane_by_session_instance(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        session_instance_id: &str,
     ) -> Result<Option<TmuxPaneId>, LifecycleError> {
         let output = self
             .backend
@@ -1872,56 +1776,37 @@ impl MainSlotRuntime {
                     "-a".to_string(),
                     "-F".to_string(),
                     format!(
-                        "#{{session_name}}\t#{{pane_id}}\t#{{pane_dead}}\t#{{pane_title}}\t#{{{WAITAGENT_PANE_TARGET_SESSION_OPTION}}}"
+                        "#{{pane_id}}\t#{{pane_dead}}\t#{{pane_title}}\t#{{{WAITAGENT_PANE_ROLE_OPTION}}}\t#{{{WAITAGENT_PANE_SESSION_INSTANCE_OPTION}}}"
                     ),
                 ],
             )
             .map_err(main_slot_error)?;
-        let mut fallback = None;
+        let mut matches = Vec::new();
         for line in output.stdout.lines() {
             let mut parts = line.split('\t');
-            let session_name = parts.next().unwrap_or_default();
             let pane_id = parts.next().unwrap_or_default();
             let pane_dead = parts.next().unwrap_or_default();
             let title = parts.next().unwrap_or_default();
-            let identity = parts.next().unwrap_or_default();
+            let role = parts.next().unwrap_or_default();
+            let owner = parts.next().unwrap_or_default();
             if pane_dead != "0"
                 || pane_id.is_empty()
                 || title == SIDEBAR_PANE_TITLE
                 || title == FOOTER_PANE_TITLE
-                || identity != target_session_name
+                || role != WAITAGENT_PANE_ROLE_CONTENT
+                || owner != session_instance_id
             {
                 continue;
             }
-            let pane = TmuxPaneId::new(pane_id);
-            if session_name == target_session_name {
-                return Ok(Some(pane));
-            }
-            fallback.get_or_insert(pane);
+            matches.push(TmuxPaneId::new(pane_id));
         }
-        Ok(fallback)
-    }
-
-    fn pane_target_identity(
-        &self,
-        workspace: &TmuxWorkspaceHandle,
-        pane: &TmuxPaneId,
-    ) -> Result<Option<String>, LifecycleError> {
-        let output = self
-            .backend
-            .run_on_socket(
-                &workspace.socket_name,
-                &[
-                    "show-options".to_string(),
-                    "-pqv".to_string(),
-                    "-t".to_string(),
-                    pane.as_str().to_string(),
-                    WAITAGENT_PANE_TARGET_SESSION_OPTION.to_string(),
-                ],
-            )
-            .map_err(main_slot_error)?;
-        let value = output.stdout.trim();
-        Ok((!value.is_empty()).then(|| value.to_string()))
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => Err(LifecycleError::Protocol(format!(
+                "session instance `{session_instance_id}` owns multiple content panes"
+            ))),
+        }
     }
 
     fn workspace_main_pane(
@@ -1997,6 +1882,48 @@ impl MainSlotRuntime {
         self.backend
             .set_session_option(workspace, WAITAGENT_MAIN_PANE_OPTION, pane.as_str())
             .map_err(main_slot_error)
+    }
+
+    fn set_workspace_main_pane_if_session_exists(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+        pane: &TmuxPaneId,
+    ) -> Result<(), LifecycleError> {
+        if !self.workspace_session_exists(workspace)? {
+            return Ok(());
+        }
+        match self
+            .backend
+            .set_session_option(workspace, WAITAGENT_MAIN_PANE_OPTION, pane.as_str())
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_command_failure() => {
+                if self.workspace_session_exists(workspace)? {
+                    Err(main_slot_error(error))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(main_slot_error(error)),
+        }
+    }
+
+    fn workspace_session_exists(
+        &self,
+        workspace: &TmuxWorkspaceHandle,
+    ) -> Result<bool, LifecycleError> {
+        match self.backend.run_on_socket(
+            &workspace.socket_name,
+            &[
+                "has-session".to_string(),
+                "-t".to_string(),
+                workspace.session_name.as_str().to_string(),
+            ],
+        ) {
+            Ok(_) => Ok(true),
+            Err(error) if error.is_command_failure() => Ok(false),
+            Err(error) => Err(main_slot_error(error)),
+        }
     }
 
     fn resolve_session_on_socket(
@@ -2283,23 +2210,8 @@ impl MainSlotRuntime {
         workspace: &TmuxWorkspaceHandle,
         qualified_target: &str,
     ) -> Result<Option<TmuxPaneId>, LifecycleError> {
-        let option_name = self.session_pane_option_name(qualified_target);
-        Ok(self
-            .backend
-            .show_session_option(workspace, &option_name)
-            .map_err(main_slot_error)?
-            .filter(|pane| !pane.is_empty())
-            .map(TmuxPaneId::new))
-    }
-
-    fn live_session_pane(
-        &self,
-        workspace: &TmuxWorkspaceHandle,
-        qualified_target: &str,
-    ) -> Result<Option<TmuxPaneId>, LifecycleError> {
-        Ok(self
-            .read_session_pane(workspace, qualified_target)?
-            .filter(|pane| self.pane_is_live(workspace, pane.as_str())))
+        let session_instance_id = target_session_name(qualified_target).unwrap_or(qualified_target);
+        self.find_content_pane_by_session_instance(workspace, session_instance_id)
     }
 
     fn find_session_pane(
@@ -2307,26 +2219,25 @@ impl MainSlotRuntime {
         workspace: &TmuxWorkspaceHandle,
         qualified_target: &str,
     ) -> Result<Option<TmuxPaneId>, LifecycleError> {
+        let session_instance_id = target_session_name(qualified_target).unwrap_or(qualified_target);
         let option_name = self.session_pane_option_name(qualified_target);
-        let pane_id_str = self
+        if let Some(pane_id_str) = self
             .backend
             .show_session_option(workspace, &option_name)
-            .map_err(main_slot_error)?;
-        let Some(pane_id_str) = pane_id_str else {
-            return Ok(None);
-        };
-        let pane_id = TmuxPaneId::new(pane_id_str);
-        if self.pane_liveness_on_socket(workspace, pane_id.as_str())? == Some(true) {
-            Ok(Some(pane_id))
-        } else {
-            // Pane died -- kill it to prevent dead-pane accumulation,
-            // then clean up the stale option so a new one is created.
-            let _ = self.backend.kill_pane(workspace, &pane_id);
+            .map_err(main_slot_error)?
+            .filter(|pane| !pane.is_empty())
+        {
+            let pane_id = TmuxPaneId::new(pane_id_str);
+            if self.pane_liveness_on_socket(workspace, pane_id.as_str())? == Some(true)
+                && self.pane_matches_session_instance(workspace, &pane_id, session_instance_id)?
+            {
+                return Ok(Some(pane_id));
+            }
             self.backend
                 .set_session_option(workspace, &option_name, "")
                 .map_err(main_slot_error)?;
-            Ok(None)
         }
+        self.find_content_pane_by_session_instance(workspace, session_instance_id)
     }
 
     fn set_session_pane(
@@ -2671,11 +2582,6 @@ enum RemoteTargetExitTransition {
     CloseWorkspace,
 }
 
-enum RemoteTargetExitPanePlan {
-    ActivateTargetSessionPane,
-    AssignExitedPaneToNextTarget(TmuxPaneId),
-}
-
 struct CurrentWorkspace {
     socket_name: String,
     session_name: String,
@@ -2711,6 +2617,10 @@ fn workspace_handle(socket_name: &str, session_name: &str) -> TmuxWorkspaceHandl
 
 fn target_socket_name(target: &str) -> Option<&str> {
     split_qualified_target(target).map(|(socket_name, _)| socket_name)
+}
+
+fn target_session_name(target: &str) -> Option<&str> {
+    split_qualified_target(target).map(|(_, session_name)| session_name)
 }
 
 fn split_qualified_target(target: &str) -> Option<(&str, &str)> {
