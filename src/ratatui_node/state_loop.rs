@@ -2022,13 +2022,23 @@ fn perform_remote_host_connect(
 
     let outcome = runtime
         .connect(request, |request: OutboundNodeSessionRequest| {
-            let guard = shared
-                .ingress_internal_tx
-                .lock()
-                .map_err(|_| "remote node ingress lock is poisoned".to_string())?;
-            let tx = guard
-                .as_ref()
-                .ok_or_else(|| "remote node ingress is not ready".to_string())?;
+            // Wait briefly for the ingress internal sender: during node
+            // startup it is installed right before the client accept loop,
+            // and dialing before that used to fall back to an SSH bootstrap
+            // that spawned a redundant node-server on the remote host.
+            let tx = {
+                let mut tx = None;
+                for _ in 0..40 {
+                    if let Ok(guard) = shared.ingress_internal_tx.lock() {
+                        if guard.is_some() {
+                            tx = guard.clone();
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                tx.ok_or_else(|| "remote node ingress is not ready".to_string())?
+            };
             // A stale ingress session from a previous disconnect may still be
             // registered for this node.  Evict it before queuing the new dial
             // so the duplicate-dial guard does not reject the reuse attempt.

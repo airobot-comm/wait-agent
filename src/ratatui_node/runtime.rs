@@ -1090,12 +1090,6 @@ impl RatatuiNodeRuntime {
             ERROR_LOG.log(format!("[ratatui-node] operator key setup failed: {error}"));
         }
 
-        // Reconnect to outbound-dial hosts that were active when the control
-        // plane last shut down, or retry them once the network recovers.
-        let _ = state_event_loop
-            .sender()
-            .send(StateEvent::ReconnectSnapshotHosts);
-
         // Peer node servers host a default authority-host session for remote
         // viewers. Create it now that the IO loops are running; it will be
         // published through the local catalog to the remote authority.
@@ -1272,6 +1266,17 @@ impl RatatuiNodeRuntime {
                 None
             }
         };
+
+        // Reconnect to outbound-dial hosts that were active when the control
+        // plane last shut down, or retry them once the network recovers.
+        // This must be signaled only after the ingress internal sender is
+        // installed above: reconnect dials are queued through it, and firing
+        // earlier makes every reuse dial fail with "remote node ingress is
+        // not ready" and fall back to an SSH bootstrap that spawns a new
+        // node-server (and a new port) on the remote host.
+        let _ = state_event_loop
+            .sender()
+            .send(StateEvent::ReconnectSnapshotHosts);
 
         let clients = self.shared.clients.clients.clone();
         let client_writer_for_accept = client_writer.clone();
