@@ -122,6 +122,11 @@ fn run_state_event_loop(
     // user-initiated connect for the same profile, and the second dial's
     // CloseNodeIngressSession kills the first dial's freshly opened session.
     let mut connecting_profiles: HashSet<String> = HashSet::new();
+    // Clients waiting on a connect that is already in flight for the same
+    // profile.  Instead of rejecting a duplicate Ctrl+W connect with an error,
+    // the client is queued here and receives the in-flight connect's result
+    // (with activation, since the user explicitly asked to connect).
+    let mut connect_waiters: HashMap<String, Vec<u64>> = HashMap::new();
     // Nodes already known to be offline. `RemoteNodeOffline` can be re-signaled
     // by the ingress close path or by transport failures; without this dedup
     // the handler and the ingress server ping-pong the same event forever and
@@ -208,6 +213,7 @@ fn run_state_event_loop(
                     &connected_clients,
                     &mut reconnect_handles,
                     &mut connecting_profiles,
+                    &mut connect_waiters,
                     client_id,
                     command,
                     &settings_store,
@@ -223,6 +229,7 @@ fn run_state_event_loop(
                 activate,
             } => {
                 connecting_profiles.remove(&profile_name);
+                let waiters = connect_waiters.remove(&profile_name).unwrap_or_default();
                 if let Ok(outcome) = result.as_ref() {
                     offline_nodes.remove(&outcome.authority_node_id);
                 }
@@ -235,6 +242,7 @@ fn run_state_event_loop(
                     profile_name,
                     *result,
                     activate,
+                    waiters,
                 );
             }
 
@@ -463,21 +471,43 @@ fn run_state_event_loop(
                 result,
             } => {
                 connecting_profiles.remove(&profile_name);
+                let waiters = connect_waiters.remove(&profile_name).unwrap_or_default();
                 match *result {
                     Ok(outcome) => {
                         offline_nodes.remove(&authority_node_id);
-                        apply_remote_host_connect_outcome(
+                        // A queued client explicitly asked to connect: activate
+                        // the recovered session for them.
+                        let outcome = apply_remote_host_connect_outcome(
                             &shared,
                             &snapshot_store,
                             &profile_name,
-                            false,
+                            !waiters.is_empty(),
                             outcome,
                         );
+                        let response: ControlResponse = outcome.into();
+                        let payload = response_json(&response);
+                        for waiter in waiters {
+                            client_writer.send(ClientWriterRequest::Write {
+                                client_id: waiter,
+                                payload: payload.clone(),
+                            });
+                        }
                     }
                     Err(error) => {
                         ERROR_LOG.log(format!(
                         "[ratatui-state-loop] snapshot reconnect failed for profile `{profile_name}` node={authority_node_id}: {error}"
                     ));
+                        if !waiters.is_empty() {
+                            let response: ControlResponse =
+                                CommandOutcome::Error(error.clone()).into();
+                            let payload = response_json(&response);
+                            for waiter in waiters {
+                                client_writer.send(ClientWriterRequest::Write {
+                                    client_id: waiter,
+                                    payload: payload.clone(),
+                                });
+                            }
+                        }
                         if network_online {
                             if let Err(remove_error) = snapshot_store.remove(&authority_node_id) {
                                 ERROR_LOG.log(format!(
@@ -611,6 +641,7 @@ fn handle_client_command_event(
     connected_clients: &HashSet<u64>,
     reconnect_handles: &mut HashMap<String, mpsc::Sender<()>>,
     connecting_profiles: &mut HashSet<String>,
+    connect_waiters: &mut HashMap<String, Vec<u64>>,
     client_id: u64,
     command: ClientCommand,
     settings_store: &SettingsStore,
@@ -631,6 +662,7 @@ fn handle_client_command_event(
             client_id,
             profile_name,
             connecting_profiles,
+            connect_waiters,
             state_event_tx,
         );
         if let CommandOutcome::Error(message) = &outcome {
@@ -671,6 +703,7 @@ fn handle_client_command_event(
             settings_store,
             snapshot_store,
             connecting_profiles,
+            connect_waiters,
             state_event_tx.clone(),
         )
     };
@@ -1243,6 +1276,7 @@ fn handle_client_command(
     settings_store: &SettingsStore,
     _snapshot_store: &OutboundConnectionSnapshotStore,
     connecting_profiles: &mut HashSet<String>,
+    connect_waiters: &mut HashMap<String, Vec<u64>>,
     state_event_tx: mpsc::Sender<StateEvent>,
 ) -> CommandOutcome {
     match command {
@@ -1320,6 +1354,7 @@ fn handle_client_command(
                 0, // client_id is filled in by the event-loop dispatcher above
                 &profile_name,
                 connecting_profiles,
+                connect_waiters,
                 state_event_tx,
             )
         }
@@ -1913,9 +1948,26 @@ fn connect_remote_host_target(
     client_id: u64,
     profile_name: &str,
     connecting_profiles: &mut HashSet<String>,
+    connect_waiters: &mut HashMap<String, Vec<u64>>,
     state_event_tx: mpsc::Sender<StateEvent>,
 ) -> CommandOutcome {
     if !connecting_profiles.insert(profile_name.to_string()) {
+        if client_id != 0 {
+            // A connect for this profile is already running (often the startup
+            // snapshot reconnect the user is now explicitly asking for via
+            // Ctrl+W).  Queue this client for the in-flight connect's result
+            // instead of failing: rejecting leaves the user with an error and
+            // no session even though the exact work they asked for completes
+            // moments later.
+            connect_waiters
+                .entry(profile_name.to_string())
+                .or_default()
+                .push(client_id);
+            ERROR_LOG.log(format!(
+                "[ratatui-state-loop] connect queued for `{profile_name}`: already in progress (client {client_id} waits)"
+            ));
+            return CommandOutcome::Ok;
+        }
         return CommandOutcome::Error(format!(
             "connect already in progress for profile `{profile_name}`"
         ));
@@ -2105,6 +2157,7 @@ fn handle_remote_host_connect_result(
     profile_name: String,
     result: Result<RemoteHostConnectedOutcome, String>,
     activate: bool,
+    waiters: Vec<u64>,
 ) {
     let outcome = match result {
         Ok(outcome) => apply_remote_host_connect_outcome(
@@ -2118,7 +2171,14 @@ fn handle_remote_host_connect_result(
     };
     let response: ControlResponse = outcome.into();
     let payload = response_json(&response);
-    client_writer.send(ClientWriterRequest::Write { client_id, payload });
+    // Clients that queued a duplicate connect while this one was in flight
+    // receive the same result; the outcome is applied once, above.
+    for recipient in std::iter::once(client_id).chain(waiters) {
+        client_writer.send(ClientWriterRequest::Write {
+            client_id: recipient,
+            payload: payload.clone(),
+        });
+    }
 }
 
 fn reconnect_snapshot_hosts(
@@ -3162,5 +3222,107 @@ mod state_loop_tests {
             wrapped, b"\x1b[200~line1\nline2\x1b[201~",
             "expected bracketed-paste start/end markers"
         );
+    }
+
+    fn drain_available(stream: &mut UnixStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .ok();
+        let mut buf = [0u8; 256];
+        loop {
+            match std::io::Read::read(stream, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    fn read_line_until(stream: &mut UnixStream, deadline: std::time::Instant) -> Option<String> {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .ok();
+        let mut line = String::new();
+        let mut byte = [0u8; 1];
+        while std::time::Instant::now() < deadline {
+            match std::io::Read::read(stream, &mut byte) {
+                Ok(0) => return None,
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        return Some(line);
+                    }
+                    line.push(byte[0] as char);
+                }
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn duplicate_connect_waits_for_in_flight_result() {
+        let _guard = STATE_LOOP_TEST_LOCK.lock().unwrap();
+        let (_shared, tx, client_writer, handle) = start_test_loop();
+
+        let (mut server1, client1) = UnixStream::pair().expect("stream pair 1");
+        let (mut server2, client2) = UnixStream::pair().expect("stream pair 2");
+        for (client_id, stream) in [(1u64, client1), (2u64, client2)] {
+            client_writer.send(ClientWriterRequest::Register {
+                client_id,
+                stream: crate::platform::local_ipc::unix::LocalStream::from_unix(stream),
+                broadcast: true,
+            });
+            let _ = tx.send(StateEvent::ClientConnected { client_id });
+        }
+        // Let the ClientConnected broadcasts settle so they are not mistaken
+        // for connect responses.
+        std::thread::sleep(Duration::from_millis(100));
+        drain_available(&mut server1);
+        drain_available(&mut server2);
+
+        // Queue both connects back-to-back: the first spawns the connect
+        // thread, whose result is dropped (the test loop uses a dangling
+        // self-event channel), so `connecting_profiles` stays populated and
+        // the second connect must queue as a waiter instead of being
+        // rejected with an immediate error.
+        let _ = tx.send(StateEvent::ClientCommand {
+            client_id: 1,
+            command: ClientCommand::ConnectRemoteHost {
+                profile_name: "dup-profile".to_string(),
+            },
+        });
+        let _ = tx.send(StateEvent::ClientCommand {
+            client_id: 2,
+            command: ClientCommand::ConnectRemoteHost {
+                profile_name: "dup-profile".to_string(),
+            },
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        // The queued waiter receives the in-flight connect's result when it
+        // arrives: inject the result the way the connect thread would report
+        // it, and both clients must see the same response.
+        let _ = tx.send(StateEvent::RemoteHostConnectResult {
+            client_id: 1,
+            profile_name: "dup-profile".to_string(),
+            result: Box::new(Err("connect failed in test".to_string())),
+            activate: true,
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let response1 =
+            read_line_until(&mut server1, deadline).expect("client 1 must receive a response");
+        let response2 =
+            read_line_until(&mut server2, deadline).expect("client 2 must receive a response");
+        assert_eq!(
+            response1, response2,
+            "a queued duplicate connect must receive the in-flight connect's result"
+        );
+        assert!(
+            response1.contains("connect failed in test"),
+            "clients must receive the connect failure, got: {response1}"
+        );
+
+        drop(tx);
+        handle.join().expect("state loop should exit cleanly");
     }
 }
