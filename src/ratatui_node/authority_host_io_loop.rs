@@ -378,6 +378,7 @@ fn run_io_loop(
         // Drain pending requests before/after each poll so the loop stays
         // responsive even when PTY traffic is steady.
         drain_requests(
+            &mut None,
             &rx,
             &shared,
             &mut poller,
@@ -471,7 +472,7 @@ fn run_io_loop(
     let mut sessions: HashMap<String, SessionState> = HashMap::new();
     let mut buf = [0u8; 64];
     loop {
-        drain_requests(&rx, &shared, &request_tx, &mut sessions)?;
+        drain_requests(&mut None, &rx, &shared, &request_tx, &mut sessions)?;
 
         // The wake pipes are non-blocking TCP streams on Windows. Drain any
         // wake bytes and stop when shutdown was requested; requests themselves
@@ -483,8 +484,14 @@ fn run_io_loop(
         drain_request_wake(&mut request_read);
 
         match rx.recv_timeout(CHILD_EXIT_POLL_INTERVAL) {
-            // Requests are drained at the top of the next iteration.
-            Ok(_) => {}
+            // The request that woke us must be processed, not discarded:
+            // dropping `RegisterSession` here tears down the ConPTY and kills
+            // the hosted shell, and dropping `PtyOutput` loses terminal
+            // output. Hand it to the next drain iteration instead.
+            Ok(request) => {
+                let mut pending = Some(request);
+                drain_requests(&mut pending, &rx, &shared, &request_tx, &mut sessions)?;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => check_child_exits(&mut sessions, &shared),
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -542,6 +549,7 @@ fn spawn_conpty_reader(
 }
 
 fn drain_requests(
+    pending: &mut Option<AuthorityHostIoRequest>,
     rx: &mpsc::Receiver<AuthorityHostIoRequest>,
     shared: &Arc<SharedState>,
     #[cfg(unix)] poller: &mut polling::Poller,
@@ -550,7 +558,16 @@ fn drain_requests(
     #[cfg(unix)] token_to_session: &mut HashMap<usize, String>,
     #[cfg(unix)] next_token: &mut usize,
 ) -> Result<(), LifecycleError> {
-    while let Ok(request) = rx.try_recv() {
+    loop {
+        // A request already received by `recv_timeout` (Windows) takes
+        // priority over the try-recv batch; it must not be discarded.
+        let request = match pending.take() {
+            Some(request) => request,
+            None => match rx.try_recv() {
+                Ok(request) => request,
+                Err(_) => break,
+            },
+        };
         match request {
             AuthorityHostIoRequest::WriteInput { session_id, bytes } => {
                 if let Some(state) = sessions.get_mut(&session_id) {
@@ -1158,6 +1175,7 @@ mod tests {
             })
             .unwrap();
         drain_requests(
+            &mut None,
             &req_rx,
             &shared,
             &mut poller,
@@ -1187,6 +1205,7 @@ mod tests {
             })
             .unwrap();
         drain_requests(
+            &mut None,
             &req_rx,
             &shared,
             &mut poller,
@@ -1211,6 +1230,7 @@ mod tests {
             })
             .unwrap();
         drain_requests(
+            &mut None,
             &req_rx,
             &shared,
             &mut poller,
