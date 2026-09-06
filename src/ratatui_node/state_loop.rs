@@ -37,7 +37,8 @@ use crate::host::ssh::outbound_connection_snapshot_store::OutboundConnectionSnap
 use crate::host::ssh::remote_host_connect_runtime::{
     RemoteHostConnectRequest, RemoteHostConnectRuntime, SshRemotePortProbeFactory,
 };
-use crate::host::ssh::remote_host_history_store::RemoteHostHistoryStore;
+use crate::host::ssh::remote_host_history_store::{RemoteHostHistoryStore, RemoteHostProfile};
+use crate::host::ssh::remote_sibling_nodes::list_sibling_node_ports;
 use crate::host::ssh::ssh_remote_host_bootstrapper::SshRemoteHostBootstrapper;
 use crate::infra::remote_grpc_transport::OutboundNodeSessionRequest;
 use crate::remote::node::remote_node_ingress_server_runtime::InternalEvent;
@@ -2080,7 +2081,7 @@ fn perform_remote_host_connect(
             .find(|profile| profile.name == profile_name)
     });
 
-    let connection_info = profile.map(|profile| RemoteNodeConnectionInfo {
+    let connection_info = profile.as_ref().map(|profile| RemoteNodeConnectionInfo {
         mode: RemoteNodeConnectionMode::OutboundDial,
         host: profile.host.clone(),
         port: outcome
@@ -2097,12 +2098,113 @@ fn perform_remote_host_connect(
         .upsert_session(&outcome.authority_node_id, &record)
         .map_err(|error| format!("failed to register remote session: {error}"))?;
 
+    // Enumerate sibling node servers on the same host and dial each one so
+    // every local session on the remote host shows up in the sidebar. Best
+    // effort: failures are logged and never fail the primary connect.
+    if let Some(profile) = profile {
+        let authority_node_id = outcome.authority_node_id.clone();
+        let tls_pin_sha256 = profile.tls_pin_sha256.clone().unwrap_or_default();
+        let shared = shared.clone();
+        std::thread::spawn(move || {
+            dial_sibling_nodes(&shared, &profile, &authority_node_id, tls_pin_sha256);
+        });
+    }
+
     Ok(RemoteHostConnectedOutcome {
         target_id: target,
         authority_node_id: outcome.authority_node_id,
         created_target: record,
         connection_info,
     })
+}
+
+/// Dials every sibling ratatui node server on the remote host (same TLS pin,
+/// different port) so all of the host's local sessions appear in the sidebar.
+/// Best effort: enumeration and dial failures are logged and never surface to
+/// the user.
+fn dial_sibling_nodes(
+    shared: &Arc<SharedState>,
+    profile: &RemoteHostProfile,
+    authority_node_id: &str,
+    tls_pin_sha256: String,
+) {
+    let primary_port = authority_node_id
+        .rsplit_once('#')
+        .and_then(|(_, port)| port.parse::<u16>().ok());
+    let ports = match list_sibling_node_ports(profile) {
+        Ok(ports) => ports,
+        Err(error) => {
+            ERROR_LOG.log(format!(
+                "[ratatui-state-loop] sibling node enumeration failed for `{}`: {error}",
+                profile.host
+            ));
+            return;
+        }
+    };
+    if ports.is_empty() {
+        return;
+    }
+    // Wait briefly for the ingress internal sender (same constraint as the
+    // primary dial closure above).
+    let ingress_tx = {
+        let mut tx = None;
+        for _ in 0..40 {
+            if let Ok(guard) = shared.ingress_internal_tx.lock() {
+                if guard.is_some() {
+                    tx = guard.clone();
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        tx
+    };
+    let Some(ingress_tx) = ingress_tx else {
+        ERROR_LOG.log(format!(
+            "[ratatui-state-loop] sibling node dial skipped for `{}`: remote node ingress is not ready",
+            profile.host
+        ));
+        return;
+    };
+    for port in ports {
+        if Some(port) == primary_port {
+            continue;
+        }
+        let node_id = format!("{}#{}", profile.host, port);
+        let has_online_session = {
+            let sessions = shared
+                .sessions
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            sessions.values().any(|record| {
+                *record.address.transport() == SessionTransport::RemotePeer
+                    && record.address.authority_id() == node_id
+                    && record.availability == SessionAvailability::Online
+            })
+        };
+        if has_online_session {
+            continue;
+        }
+        ERROR_LOG.log(format!(
+            "[ratatui-state-loop] dialing sibling node {node_id}"
+        ));
+        let request = OutboundNodeSessionRequest {
+            node_id,
+            endpoint_uri: format!("tls://{}:{}", profile.host, port),
+            tls_pin_sha256: Some(tls_pin_sha256.clone()).filter(|pin| !pin.is_empty()),
+        };
+        if ingress_tx
+            .send(InternalEvent::InitiateOutboundConnection { request })
+            .is_err()
+        {
+            ERROR_LOG.log(format!(
+                "[ratatui-state-loop] sibling node dial failed for `{}`: remote node ingress is not ready",
+                profile.host
+            ));
+            return;
+        }
+    }
 }
 
 fn apply_remote_host_connect_outcome(
