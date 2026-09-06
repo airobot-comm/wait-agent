@@ -67,9 +67,19 @@ impl CommandDispatcher {
                 .ratatui_workspace()?
                 .list_sessions(command.target)
                 .map_err(AppError::from),
-            Command::RatatuiNodeServer(command) => self
-                .ratatui_node_server(command)
-                .and_then(|runtime| runtime.run().map_err(AppError::from)),
+            Command::RatatuiNodeServer(command) => {
+                #[cfg(windows)]
+                crate::platform::process::daemonize_self_if_needed(self.network.port).map_err(
+                    |error| {
+                        AppError::Lifecycle(crate::lifecycle::LifecycleError::Io(
+                            "daemonize node server".to_string(),
+                            error,
+                        ))
+                    },
+                )?;
+                self.ratatui_node_server(command)
+                    .and_then(|runtime| runtime.run().map_err(AppError::from))
+            }
             Command::RatatuiClient(command) => self
                 .ratatui_client(command)
                 .and_then(|runtime| runtime.run().map_err(AppError::from)),

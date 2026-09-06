@@ -1,5 +1,6 @@
 use crate::host::ssh::remote_host_home::waitagent_home;
 use crate::host::ssh::remote_host_secret_store::RemoteHostSecretId;
+use crate::host::ssh::remote_shell::RemoteShellKind;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -65,6 +66,10 @@ pub struct RemoteHostProfile {
     pub use_install_proxy: bool,
     pub tls_pin_sha256: Option<String>,
     pub host_kind: RemoteHostKind,
+    /// Detected remote shell family. `None` means the host has not been
+    /// probed yet (profiles written before shell detection existed); the
+    /// connect flow detects and caches it on the first SSH bootstrap.
+    pub remote_shell: Option<RemoteShellKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +242,9 @@ fn serialize_history(history: &RemoteHostHistory) -> String {
         }
         out.push_str(&format!("use_install_proxy = {}\n", host.use_install_proxy));
         out.push_str(&format!("host_kind = \"{}\"\n", host.host_kind.as_str()));
+        if let Some(remote_shell) = &host.remote_shell {
+            push_string(&mut out, "remote_shell", remote_shell.as_str());
+        }
         out.push('\n');
     }
     out
@@ -308,6 +316,7 @@ struct RawProfile {
     tls_pin_sha256: Option<String>,
     use_install_proxy: Option<String>,
     host_kind: Option<String>,
+    remote_shell: Option<String>,
 }
 
 impl RawProfile {
@@ -327,6 +336,7 @@ impl RawProfile {
             "tls_pin_sha256" => self.tls_pin_sha256 = Some(value),
             "use_install_proxy" => self.use_install_proxy = Some(value),
             "host_kind" => self.host_kind = Some(value),
+            "remote_shell" => self.remote_shell = Some(value),
             other => {
                 return Err(RemoteHostHistoryStoreError::new(format!(
                     "unknown remote host history field `{other}`"
@@ -367,6 +377,7 @@ impl RawProfile {
             use_install_proxy: optional_bool(self.use_install_proxy, "use_install_proxy")?
                 .unwrap_or(true),
             host_kind: parse_host_kind(self.host_kind)?,
+            remote_shell: parse_remote_shell(self.remote_shell)?,
         })
     }
 }
@@ -457,6 +468,18 @@ fn parse_host_kind(value: Option<String>) -> Result<RemoteHostKind, RemoteHostHi
             "unknown remote host kind `{other}`"
         ))),
     }
+}
+
+fn parse_remote_shell(
+    value: Option<String>,
+) -> Result<Option<RemoteShellKind>, RemoteHostHistoryStoreError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    value
+        .parse::<RemoteShellKind>()
+        .map(Some)
+        .map_err(RemoteHostHistoryStoreError::new)
 }
 
 fn parse_port_preference(
@@ -643,6 +666,7 @@ mod tests {
                 use_install_proxy: true,
                 tls_pin_sha256: None,
                 host_kind: RemoteHostKind::Cloud,
+                remote_shell: None,
             })
             .unwrap();
         store
@@ -661,6 +685,7 @@ mod tests {
                 use_install_proxy: true,
                 tls_pin_sha256: None,
                 host_kind: RemoteHostKind::Lan,
+                remote_shell: None,
             })
             .unwrap();
 
@@ -673,6 +698,58 @@ mod tests {
         let lan = loaded.hosts.iter().find(|h| h.name == "lan").unwrap();
         assert_eq!(cloud.host_kind, RemoteHostKind::Cloud);
         assert_eq!(lan.host_kind, RemoteHostKind::Lan);
+
+        crate::infra::best_effort::remove_file(path);
+    }
+
+    #[test]
+    fn remote_host_history_persists_and_loads_remote_shell() {
+        use crate::host::ssh::remote_shell::RemoteShellKind;
+        let path = unique_path("remote-hosts-remote-shell.toml");
+        let store = RemoteHostHistoryStore::new(&path);
+
+        let mut posix = profile("posix", "10.1.29.130");
+        posix.remote_shell = Some(RemoteShellKind::Posix);
+        let mut windows = profile("windows", "10.1.29.131");
+        windows.remote_shell = Some(RemoteShellKind::Windows);
+        store.upsert_profile(posix).unwrap();
+        store.upsert_profile(windows).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("remote_shell = \"posix\""));
+        assert!(content.contains("remote_shell = \"windows\""));
+
+        let loaded = store.load().unwrap();
+        let posix = loaded.hosts.iter().find(|h| h.name == "posix").unwrap();
+        let windows = loaded.hosts.iter().find(|h| h.name == "windows").unwrap();
+        assert_eq!(posix.remote_shell, Some(RemoteShellKind::Posix));
+        assert_eq!(windows.remote_shell, Some(RemoteShellKind::Windows));
+
+        crate::infra::best_effort::remove_file(path);
+    }
+
+    #[test]
+    fn remote_host_history_without_remote_shell_field_loads_as_unprobed() {
+        let path = unique_path("remote-hosts-legacy-no-remote-shell.toml");
+        fs::write(
+            &path,
+            r#"[[hosts]]
+name = "legacy"
+host = "10.1.29.130"
+ssh_user = "kk"
+auth_kind = "password"
+preferred_remote_port = "auto"
+use_install_proxy = true
+host_kind = "lan"
+"#,
+        )
+        .unwrap();
+
+        let loaded = RemoteHostHistoryStore::new(&path).load().unwrap();
+
+        assert_eq!(loaded.hosts.len(), 1);
+        assert_eq!(loaded.hosts[0].name, "legacy");
+        assert_eq!(loaded.hosts[0].remote_shell, None);
 
         crate::infra::best_effort::remove_file(path);
     }

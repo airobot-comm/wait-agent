@@ -13,8 +13,13 @@ use crate::host::ssh::remote_install_proxy_store::{
 use crate::host::ssh::remote_port_probe::{
     RemotePortProbe, RemotePortProbePreference, SshRemotePortProbe,
 };
+use crate::host::ssh::remote_shell::{
+    RemoteShellDetector, RemoteShellKind, SshRemoteShellDetector,
+};
 use crate::host::ssh::ssh_remote_host_bootstrapper::{
-    install_reachability_preflight_command, RemoteHostBootstrapPlan, RemoteHostBootstrapper,
+    install_reachability_preflight_command, windows_install_or_update_command,
+    windows_install_reachability_preflight_command, RemoteHostBootstrapPlan,
+    RemoteHostBootstrapper,
 };
 use crate::infra::error_log::ERROR_LOG;
 use crate::infra::operator_auth::{self, OperatorKeyStore};
@@ -40,7 +45,7 @@ use std::time::{Duration, Instant};
 pub trait RemotePortProbeFactory {
     type Probe;
 
-    fn create(&self, profile: &RemoteHostProfile) -> Self::Probe;
+    fn create(&self, profile: &RemoteHostProfile, remote_shell: RemoteShellKind) -> Self::Probe;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,8 +54,8 @@ pub struct SshRemotePortProbeFactory;
 impl RemotePortProbeFactory for SshRemotePortProbeFactory {
     type Probe = SshRemotePortProbe;
 
-    fn create(&self, profile: &RemoteHostProfile) -> Self::Probe {
-        SshRemotePortProbe::new(profile.clone())
+    fn create(&self, profile: &RemoteHostProfile, remote_shell: RemoteShellKind) -> Self::Probe {
+        SshRemotePortProbe::new(profile.clone(), remote_shell)
     }
 }
 
@@ -76,6 +81,7 @@ pub struct RemoteHostConnectRuntime<H, P, B> {
     history_store: H,
     port_probe_factory: P,
     bootstrapper: B,
+    shell_detector: Arc<dyn RemoteShellDetector>,
     target_registry: Arc<dyn TargetRegistryPort>,
     #[allow(dead_code)]
     session_creation_service: Arc<dyn SessionCreationPort>,
@@ -108,10 +114,31 @@ impl<H, P, B> RemoteHostConnectRuntime<H, P, B> {
         session_creation_service: Arc<dyn SessionCreationPort>,
         operator_key_store: Arc<dyn OperatorKeyStore>,
     ) -> Self {
+        Self::new_with_shell_detector(
+            history_store,
+            port_probe_factory,
+            bootstrapper,
+            target_registry,
+            session_creation_service,
+            operator_key_store,
+            Arc::new(SshRemoteShellDetector::new()),
+        )
+    }
+
+    pub fn new_with_shell_detector(
+        history_store: H,
+        port_probe_factory: P,
+        bootstrapper: B,
+        target_registry: Arc<dyn TargetRegistryPort>,
+        session_creation_service: Arc<dyn SessionCreationPort>,
+        operator_key_store: Arc<dyn OperatorKeyStore>,
+        shell_detector: Arc<dyn RemoteShellDetector>,
+    ) -> Self {
         Self {
             history_store,
             port_probe_factory,
             bootstrapper,
+            shell_detector,
             target_registry,
             session_creation_service,
             operator_key_store,
@@ -156,6 +183,31 @@ where
             ));
         }
 
+        // Detect the remote shell family once per profile and cache it so
+        // later connects skip the extra SSH exec
+        // (`docs/windows-ssh-target-design.md` §1). Detection runs before the
+        // reuse fast path so the cache is populated even for hosts that are
+        // already up and only ever reused.
+        if profile.remote_shell.is_none() {
+            let remote_shell = self
+                .shell_detector
+                .detect_remote_shell(&profile)
+                .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+            profile.remote_shell = Some(remote_shell);
+            if request.profile_name.is_some() {
+                // Store-backed profile: persist the detection result the same
+                // way save_connected_profile does (upsert by name reloads the
+                // history and replaces only this profile), so a concurrent
+                // update to other profiles or fields is not clobbered. Direct
+                // (unsaved) profiles carry the result only in memory and are
+                // persisted by save_connected_profile on success.
+                self.history_store
+                    .upsert_profile(profile.clone())
+                    .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+            }
+        }
+        let remote_shell = profile.remote_shell.unwrap_or_default();
+
         // Fast path: if the remote waitagent is still running from a previous
         // connection, dial it directly using the stored TLS pin and operator key
         // without re-bootstrapping over SSH.
@@ -166,7 +218,7 @@ where
         }
 
         let preference = port_preference(&profile.preferred_remote_port);
-        let port_probe = self.port_probe_factory.create(&profile);
+        let port_probe = self.port_probe_factory.create(&profile, remote_shell);
         let port = port_probe
             .choose_remote_port(&preference, &request.local_connect_endpoint)
             .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
@@ -177,34 +229,54 @@ where
             port.port,
             request.local_connect_endpoint.clone(),
             authority_node_id.clone(),
+            remote_shell,
         );
         plan.install_reachability_preflight_command =
-            Some(install_reachability_preflight_command(&[]));
+            Some(default_install_reachability_preflight_command(remote_shell));
         if request.use_install_proxy {
             let proxy_config = RemoteInstallProxyStore::default()
                 .load_active_config()
                 .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
             if proxy_config.has_proxy() {
-                let proxy_env_prefixes = proxy_candidates(&proxy_config)
-                    .map_err(|error| LifecycleError::Protocol(error.to_string()))?
-                    .iter()
-                    .map(|candidate| {
-                        candidate.env_prefix(&profile.host, &request.local_connect_endpoint)
-                    })
-                    .collect::<Vec<_>>();
-                plan.install_reachability_preflight_command =
-                    Some(install_reachability_preflight_command(&proxy_env_prefixes));
+                if remote_shell == RemoteShellKind::Windows {
+                    // POSIX proxy wrapping (`export … sh -lc …`) cannot run on
+                    // a Windows target; the PowerShell install commands take
+                    // the proxies as `$env:` assignments instead
+                    // (`docs/windows-ssh-target-design.md` §2).
+                    plan.install_reachability_preflight_command =
+                        Some(windows_install_reachability_preflight_command(
+                            optional_proxy_value(&proxy_config.all_proxy),
+                            optional_proxy_value(&proxy_config.https_proxy),
+                        ));
+                } else {
+                    let proxy_env_prefixes = proxy_candidates(&proxy_config)
+                        .map_err(|error| LifecycleError::Protocol(error.to_string()))?
+                        .iter()
+                        .map(|candidate| {
+                            candidate.env_prefix(&profile.host, &request.local_connect_endpoint)
+                        })
+                        .collect::<Vec<_>>();
+                    plan.install_reachability_preflight_command =
+                        Some(install_reachability_preflight_command(&proxy_env_prefixes));
+                }
             } else {
                 plan.install_reachability_preflight_command =
-                    Some(install_reachability_preflight_command(&[]));
+                    Some(default_install_reachability_preflight_command(remote_shell));
             }
-            plan.install_or_update_command = wrap_install_command_with_proxy(
-                &plan.install_or_update_command,
-                &proxy_config,
-                &profile.host,
-                &request.local_connect_endpoint,
-            )
-            .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+            plan.install_or_update_command = if remote_shell == RemoteShellKind::Windows {
+                windows_install_or_update_command(
+                    optional_proxy_value(&proxy_config.all_proxy),
+                    optional_proxy_value(&proxy_config.https_proxy),
+                )
+            } else {
+                wrap_install_command_with_proxy(
+                    &plan.install_or_update_command,
+                    &proxy_config,
+                    &profile.host,
+                    &request.local_connect_endpoint,
+                )
+                .map_err(|error| LifecycleError::Protocol(error.to_string()))?
+            };
         }
         plan.operator_public_key = operator_public_key_for_profile(&self.operator_key_store)?;
         let bootstrap_result = self
@@ -377,7 +449,7 @@ where
             }
             if Instant::now() >= deadline {
                 return Err(LifecycleError::Protocol(format!(
-                    "timed out after {}s waiting for remote WaitAgent `{expected}` to publish a target; check `/tmp/waitagent-*.log` on the remote host",
+                    "timed out after {}s waiting for remote WaitAgent `{expected}` to publish a target; check the `waitagent-*.log` in the remote host's temp directory (`/tmp` on POSIX, `%TEMP%` on Windows)",
                     timeout.as_secs()
                 )));
             }
@@ -515,6 +587,7 @@ fn profile_from_direct_args(
         use_install_proxy: command.use_install_proxy.unwrap_or(true),
         tls_pin_sha256: None,
         host_kind: host_kind.unwrap_or_default(),
+        remote_shell: None,
     })
 }
 
@@ -620,6 +693,24 @@ fn port_preference(value: &HistoryRemotePortPreference) -> RemotePortProbePrefer
     match value {
         HistoryRemotePortPreference::Auto => RemotePortProbePreference::Auto,
         HistoryRemotePortPreference::Port(port) => RemotePortProbePreference::Port(*port),
+    }
+}
+
+fn default_install_reachability_preflight_command(
+    remote_shell: RemoteShellKind,
+) -> std::string::String {
+    match remote_shell {
+        RemoteShellKind::Posix => install_reachability_preflight_command(&[]),
+        RemoteShellKind::Windows => windows_install_reachability_preflight_command(None, None),
+    }
+}
+
+fn optional_proxy_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
     }
 }
 
@@ -734,7 +825,11 @@ mod tests {
     impl RemotePortProbeFactory for FakeProbe {
         type Probe = FakeProbe;
 
-        fn create(&self, _profile: &RemoteHostProfile) -> Self::Probe {
+        fn create(
+            &self,
+            _profile: &RemoteHostProfile,
+            _remote_shell: RemoteShellKind,
+        ) -> Self::Probe {
             self.clone()
         }
     }
@@ -753,6 +848,22 @@ mod tests {
                 port: self.port,
                 reused_existing_waitagent: false,
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeShellDetector {
+        calls: Arc<Mutex<usize>>,
+        result: RemoteShellKind,
+    }
+
+    impl RemoteShellDetector for FakeShellDetector {
+        fn detect_remote_shell(
+            &self,
+            _profile: &RemoteHostProfile,
+        ) -> Result<RemoteShellKind, String> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self.result)
         }
     }
 
@@ -1241,6 +1352,184 @@ mod tests {
         assert!(!plans[0].start_plan.command.contains("all_proxy"));
     }
 
+    #[test]
+    fn remote_host_connect_uses_powershell_preflight_and_install_for_windows_shell() {
+        let catalog_targets = Arc::new(Mutex::new(Vec::new()));
+        let bootstrap_plans = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(FakeRegistry::shared(catalog_targets.clone()));
+        let runtime = RemoteHostConnectRuntime::new_with_shell_detector(
+            RemoteHostHistoryStore::new(unique_path("remote-host-connect-win-install.toml")),
+            FakeProbe {
+                calls: Arc::new(Mutex::new(0)),
+                port: 7476,
+            },
+            FakeBootstrapper {
+                plans: bootstrap_plans.clone(),
+                catalog_targets: Some(catalog_targets.clone()),
+            },
+            registry,
+            unused_session_creation(),
+            test_operator_key_store(),
+            Arc::new(FakeShellDetector {
+                calls: Arc::new(Mutex::new(0)),
+                result: RemoteShellKind::Windows,
+            }),
+        );
+
+        runtime
+            .connect(
+                RemoteHostConnectRequest {
+                    profile_name: None,
+                    direct_profile: Some({
+                        let mut profile = profile();
+                        profile.remote_shell = None;
+                        profile
+                    }),
+                    save_profile_name: None,
+                    replace_profile_name: None,
+                    local_connect_endpoint: "10.1.26.84:7474".to_string(),
+                    cwd_hint: None,
+                    use_install_proxy: true,
+                },
+                |_request| Ok(()),
+            )
+            .unwrap();
+
+        let plans = bootstrap_plans.lock().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].remote_shell, RemoteShellKind::Windows);
+        let preflight = plans[0]
+            .install_reachability_preflight_command
+            .as_deref()
+            .expect("windows connect must still preflight install reachability");
+        assert!(preflight.contains("curl.exe"));
+        assert!(preflight.contains("-o NUL"));
+        assert!(!preflight.contains("sh -lc"));
+        assert!(plans[0].install_or_update_command.contains("curl.exe"));
+        assert!(plans[0].install_or_update_command.contains("tar.exe"));
+        assert!(!plans[0].install_or_update_command.contains("sh -lc"));
+        assert!(plans[0]
+            .start_plan
+            .command
+            .starts_with("powershell -NoProfile -NonInteractive -Command \""));
+    }
+
+    #[test]
+    fn remote_host_connect_skips_shell_detection_when_profile_has_cached_shell() {
+        let path = unique_path("remote-host-connect-cached-shell.toml");
+        let history = RemoteHostHistoryStore::new(&path);
+        let mut stored = profile();
+        stored.remote_shell = Some(RemoteShellKind::Posix);
+        history.upsert_profile(stored).unwrap();
+        let detector_calls = Arc::new(Mutex::new(0));
+        let bootstrap_plans = Arc::new(Mutex::new(Vec::new()));
+        let catalog_targets = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(FakeRegistry::shared(catalog_targets.clone()));
+        let runtime = RemoteHostConnectRuntime::new_with_shell_detector(
+            history,
+            FakeProbe {
+                calls: Arc::new(Mutex::new(0)),
+                port: 7476,
+            },
+            FakeBootstrapper {
+                plans: bootstrap_plans.clone(),
+                catalog_targets: Some(catalog_targets.clone()),
+            },
+            registry,
+            unused_session_creation(),
+            test_operator_key_store(),
+            Arc::new(FakeShellDetector {
+                calls: detector_calls.clone(),
+                result: RemoteShellKind::Windows,
+            }),
+        );
+
+        runtime
+            .connect(
+                RemoteHostConnectRequest {
+                    profile_name: Some("130".to_string()),
+                    direct_profile: None,
+                    save_profile_name: None,
+                    replace_profile_name: None,
+                    local_connect_endpoint: "10.1.26.84:7474".to_string(),
+                    cwd_hint: None,
+                    use_install_proxy: true,
+                },
+                |_request| Ok(()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            *detector_calls.lock().unwrap(),
+            0,
+            "cached remote_shell must skip detection"
+        );
+        assert_eq!(
+            bootstrap_plans.lock().unwrap()[0].remote_shell,
+            RemoteShellKind::Posix
+        );
+        crate::infra::best_effort::remove_file(path);
+    }
+
+    #[test]
+    fn remote_host_connect_detects_and_caches_remote_shell() {
+        let path = unique_path("remote-host-connect-detect-shell.toml");
+        let history = RemoteHostHistoryStore::new(&path);
+        let mut stored = profile();
+        stored.remote_shell = None;
+        history.upsert_profile(stored).unwrap();
+        let detector_calls = Arc::new(Mutex::new(0));
+        let bootstrap_plans = Arc::new(Mutex::new(Vec::new()));
+        let catalog_targets = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(FakeRegistry::shared(catalog_targets.clone()));
+        let runtime = RemoteHostConnectRuntime::new_with_shell_detector(
+            history.clone(),
+            FakeProbe {
+                calls: Arc::new(Mutex::new(0)),
+                port: 7476,
+            },
+            FakeBootstrapper {
+                plans: bootstrap_plans.clone(),
+                catalog_targets: Some(catalog_targets.clone()),
+            },
+            registry,
+            unused_session_creation(),
+            test_operator_key_store(),
+            Arc::new(FakeShellDetector {
+                calls: detector_calls.clone(),
+                result: RemoteShellKind::Windows,
+            }),
+        );
+
+        runtime
+            .connect(
+                RemoteHostConnectRequest {
+                    profile_name: Some("130".to_string()),
+                    direct_profile: None,
+                    save_profile_name: None,
+                    replace_profile_name: None,
+                    local_connect_endpoint: "10.1.26.84:7474".to_string(),
+                    cwd_hint: None,
+                    use_install_proxy: true,
+                },
+                |_request| Ok(()),
+            )
+            .unwrap();
+
+        assert_eq!(*detector_calls.lock().unwrap(), 1);
+        assert_eq!(
+            bootstrap_plans.lock().unwrap()[0].remote_shell,
+            RemoteShellKind::Windows
+        );
+        let stored = history.load().unwrap();
+        assert_eq!(
+            stored.hosts[0].remote_shell,
+            Some(RemoteShellKind::Windows),
+            "detection result must be persisted to the history store"
+        );
+        crate::infra::best_effort::remove_file(path);
+    }
+
     fn profile() -> RemoteHostProfile {
         RemoteHostProfile {
             name: "130".to_string(),
@@ -1256,6 +1545,7 @@ mod tests {
             last_connected_at: None,
             use_install_proxy: true,
             tls_pin_sha256: None,
+            remote_shell: Some(RemoteShellKind::Posix),
             ..RemoteHostProfile::default()
         }
     }

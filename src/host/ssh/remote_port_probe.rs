@@ -3,9 +3,11 @@ use crate::host::ssh::remote_host_secret_store::{
     DefaultRemoteHostSecretStore, KeyringRemoteHostSecretStore, RemoteHostSecretStore,
     RemoteHostSecretValue,
 };
+use crate::host::ssh::remote_shell::RemoteShellKind;
 use crate::host::ssh::remote_ssh_executor::{
     RemoteSshExecutor, RemoteSshTarget, RusshRemoteSshExecutor,
 };
+use crate::host::ssh::ssh_remote_host_bootstrapper::powershell_command;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,14 +80,20 @@ pub struct SshRemotePortProbe<S = DefaultRemoteHostSecretStore, E = RusshRemoteS
     profile: RemoteHostProfile,
     secret_store: S,
     ssh_executor: E,
+    // Detected remote shell family of the target. The probe command is
+    // generated per family: POSIX `ss` loop or a PowerShell TCP-listener
+    // enumeration (`docs/windows-ssh-target-design.md` task T2). Both emit
+    // the same `port=N` contract.
+    remote_shell: RemoteShellKind,
 }
 
 impl SshRemotePortProbe<DefaultRemoteHostSecretStore, RusshRemoteSshExecutor> {
-    pub fn new(profile: RemoteHostProfile) -> Self {
+    pub fn new(profile: RemoteHostProfile, remote_shell: RemoteShellKind) -> Self {
         Self {
             profile,
             secret_store: KeyringRemoteHostSecretStore,
             ssh_executor: RusshRemoteSshExecutor,
+            remote_shell,
         }
     }
 }
@@ -98,6 +106,7 @@ impl<S> SshRemotePortProbe<S, RusshRemoteSshExecutor> {
             profile,
             secret_store,
             ssh_executor: RusshRemoteSshExecutor,
+            remote_shell: RemoteShellKind::Posix,
         }
     }
 }
@@ -109,11 +118,13 @@ impl<S, E> SshRemotePortProbe<S, E> {
         profile: RemoteHostProfile,
         secret_store: S,
         ssh_executor: E,
+        remote_shell: RemoteShellKind,
     ) -> Self {
         Self {
             profile,
             secret_store,
             ssh_executor,
+            remote_shell,
         }
     }
 
@@ -149,7 +160,7 @@ where
         .map_err(|error| RemotePortProbeError::new(error.to_string()))?;
         let output = self
             .ssh_executor
-            .exec(&target, &remote_probe_command(preference), None)
+            .exec(&target, &self.probe_command(preference), None)
             .map_err(|error| RemotePortProbeError::new(error.to_string()))?;
         if output.status != 0 {
             return Err(RemotePortProbeError::new(format!(
@@ -167,6 +178,13 @@ where
     S: RemoteHostSecretStore,
     S::Error: ToString,
 {
+    fn probe_command(&self, preference: &RemotePortProbePreference) -> String {
+        match self.remote_shell {
+            RemoteShellKind::Posix => remote_probe_command(preference),
+            RemoteShellKind::Windows => windows_remote_probe_command(preference),
+        }
+    }
+
     fn ssh_password(&self) -> Result<Option<RemoteHostSecretValue>, RemotePortProbeError> {
         let RemoteHostAuthProfile::Password { password_secret_id } = &self.profile.auth else {
             return Ok(None);
@@ -207,6 +225,23 @@ pub fn remote_probe_command(preference: &RemotePortProbePreference) -> String {
     format!(
         r#"for p in {candidate_expr}; do if ! ss -ltn 2>/dev/null | grep -q ":$p"; then echo port=$p; exit 0; fi; done; echo no_port; exit 1"#
     )
+}
+
+/// PowerShell port probe for Windows targets: enumerate the active TCP
+/// listeners once and pick the first candidate port not in use. Emits the
+/// same `port=N` contract as the POSIX probe
+/// (`docs/windows-ssh-target-design.md` §2).
+fn windows_remote_probe_command(preference: &RemotePortProbePreference) -> String {
+    let candidates = match preference {
+        RemotePortProbePreference::Auto => "7474..7574".to_string(),
+        RemotePortProbePreference::Port(port) => format!("@({port})"),
+    };
+    let script = format!(
+        "$inUse = @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | ForEach-Object {{ $_.Port }}); \
+foreach ($p in {candidates}) {{ if ($inUse -notcontains $p) {{ Write-Output \"port=$p\"; exit 0 }} }}; \
+Write-Output 'no_port'; exit 1"
+    );
+    powershell_command(&script)
 }
 
 fn parse_probe_output(output: &str) -> Result<RemotePortProbeResult, RemotePortProbeError> {
@@ -324,6 +359,78 @@ mod tests {
         assert!(command.contains("seq 7474 7574"));
         assert!(command.contains("ss -ltn"));
     }
+
+    #[test]
+    fn remote_host_port_probe_windows_command_enumerates_tcp_listeners() {
+        let command = windows_remote_probe_command(&RemotePortProbePreference::Auto);
+
+        assert!(command.starts_with("powershell -NoProfile -NonInteractive -Command \""));
+        assert!(command.contains("GetActiveTcpListeners"));
+        assert!(command.contains("7474..7574"));
+        assert!(command.contains("port="));
+        assert!(command.contains("exit 0"));
+        assert!(command.contains("exit 1"));
+        assert!(!command.contains("ss -ltn"));
+
+        let fixed = windows_remote_probe_command(&RemotePortProbePreference::Port(7476));
+        assert!(fixed.contains("@(7476)"));
+    }
+
+    #[test]
+    fn remote_host_port_probe_dispatches_powershell_command_for_windows_shell() {
+        use crate::host::ssh::remote_host_secret_store::{
+            MemoryRemoteHostSecretStore, RemoteHostSecretId, RemoteHostSecretValue,
+        };
+        let ssh_id = RemoteHostSecretId::new("waitagent.remote-host.win.ssh-password").unwrap();
+        let store = MemoryRemoteHostSecretStore::default();
+        store
+            .put_secret(&ssh_id, RemoteHostSecretValue::new("ssh-secret"))
+            .unwrap();
+        let profile = RemoteHostProfile {
+            name: "win".to_string(),
+            host: "192.168.1.6".to_string(),
+            ssh_user: "jj".to_string(),
+            auth: RemoteHostAuthProfile::Password {
+                password_secret_id: Some(ssh_id),
+            },
+            sudo_password_secret_id: None,
+            preferred_remote_port:
+                crate::host::ssh::remote_host_history_store::RemotePortPreference::Auto,
+            last_remote_port: None,
+            last_endpoint: None,
+            last_connected_at: None,
+            use_install_proxy: true,
+            ..RemoteHostProfile::default()
+        };
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let executor = RecordingSshExecutor {
+            calls: calls.clone(),
+            output: RemoteSshOutput {
+                status: 0,
+                stdout: b"port=7475\n".to_vec(),
+                stderr: Vec::new(),
+            },
+        };
+        let probe = SshRemotePortProbe::with_secret_store_and_executor(
+            profile,
+            store,
+            executor,
+            RemoteShellKind::Windows,
+        );
+
+        let result = probe
+            .choose_remote_port(&RemotePortProbePreference::Auto, "10.1.26.84:7474")
+            .unwrap();
+
+        assert_eq!(result.port, 7475);
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.contains("GetActiveTcpListeners"));
+        assert!(calls[0]
+            .1
+            .starts_with("powershell -NoProfile -NonInteractive -Command \""));
+        assert!(!calls[0].1.contains("ss -ltn"));
+    }
     #[test]
     fn remote_host_port_probe_uses_in_process_ssh_executor() {
         use crate::host::ssh::remote_host_secret_store::{
@@ -359,7 +466,12 @@ mod tests {
                 stderr: Vec::new(),
             },
         };
-        let probe = SshRemotePortProbe::with_secret_store_and_executor(profile, store, executor);
+        let probe = SshRemotePortProbe::with_secret_store_and_executor(
+            profile,
+            store,
+            executor,
+            RemoteShellKind::Posix,
+        );
 
         let result = probe
             .choose_remote_port(&RemotePortProbePreference::Auto, "10.1.26.84:7474")

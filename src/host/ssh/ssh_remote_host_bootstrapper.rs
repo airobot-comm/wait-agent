@@ -3,6 +3,7 @@ use crate::host::ssh::remote_host_secret_store::{
     DefaultRemoteHostSecretStore, KeyringRemoteHostSecretStore, RemoteHostSecretId,
     RemoteHostSecretStore, RemoteHostSecretValue,
 };
+use crate::host::ssh::remote_shell::RemoteShellKind;
 use crate::host::ssh::remote_ssh_executor::{
     RemoteSshAuth, RemoteSshExecutor, RemoteSshOutput, RemoteSshTarget, RusshRemoteSshExecutor,
 };
@@ -11,6 +12,20 @@ use std::fmt;
 
 pub const WAITAGENT_INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/kikakkz/wait-agent/main/scripts/install.sh";
+/// GitHub release download base for the Windows zip archive
+/// (`waitagent-<version>-x86_64-windows.zip`, matching
+/// `scripts/install.ps1`).
+const WAITAGENT_WINDOWS_RELEASE_BASE_URL: &str =
+    "https://github.com/kikakkz/wait-agent/releases/download";
+/// PowerShell expression resolving to the per-user install location on a
+/// Windows target (`%LOCALAPPDATA%\Programs\waitagent\waitagent.exe`, matching
+/// the local `scripts/install.ps1` installer).
+const WINDOWS_WAITAGENT_EXE_PS: &str =
+    "Join-Path $env:LOCALAPPDATA 'Programs\\waitagent\\waitagent.exe'";
+const WINDOWS_WAITAGENT_HOME_PS: &str = "Join-Path $env:USERPROFILE '.waitagent'";
+const WINDOWS_NODE_KEY_PS: &str = "$env:USERPROFILE\\.waitagent\\node.key";
+const WINDOWS_NODE_CERT_PS: &str = "$env:USERPROFILE\\.waitagent\\node.crt";
+const WINDOWS_AUTHORIZED_OPERATORS_PS: &str = "$env:USERPROFILE\\.waitagent\\authorized_operators";
 const REMOTE_ENDPOINT_PREFLIGHT_TIMEOUT_SECS: u16 = 5;
 const REMOTE_INSTALL_PREFLIGHT_TIMEOUT_SECS: u16 = 10;
 
@@ -34,12 +49,14 @@ impl RemoteWaitAgentStartPlan {
         remote_port: u16,
         local_connect_endpoint: impl Into<String>,
         authority_id: impl Into<String>,
+        remote_shell: RemoteShellKind,
     ) -> Self {
         Self::new_with_mode(
             remote_port,
             local_connect_endpoint,
             authority_id,
             true, /* outbound_dial */
+            remote_shell,
         )
     }
 
@@ -48,6 +65,7 @@ impl RemoteWaitAgentStartPlan {
         local_connect_endpoint: impl Into<String>,
         authority_id: impl Into<String>,
         outbound_dial: bool,
+        remote_shell: RemoteShellKind,
     ) -> Self {
         let local_connect_endpoint = local_connect_endpoint.into();
         let authority_id = authority_id.into();
@@ -55,31 +73,45 @@ impl RemoteWaitAgentStartPlan {
         let endpoint_preflight_command = if outbound_dial {
             String::new()
         } else {
-            endpoint_preflight_command(&local_connect_endpoint)
+            endpoint_preflight_command(&local_connect_endpoint, remote_shell)
         };
-        let command = if outbound_dial {
-            format!(
-                "nohup waitagent --port {remote_port} --node-id {} --node-key-path {} --node-cert-path {} __ratatui-node-server >/tmp/waitagent-{remote_port}.log 2>&1 < /dev/null & {}",
-                shell_single_quote(&authority_id),
-                remote_shell_path(&credential_paths.key_path),
-                remote_shell_path(&credential_paths.cert_path),
-                wait_for_port_ready_shell(remote_port)
-            )
-        } else {
-            format!(
-                "nohup waitagent --port {remote_port} --connect {} --node-id {} --node-key-path {} --node-cert-path {} __ratatui-node-server >/tmp/waitagent-{remote_port}.log 2>&1 < /dev/null & {}",
-                shell_single_quote(&local_connect_endpoint),
-                shell_single_quote(&authority_id),
-                remote_shell_path(&credential_paths.key_path),
-                remote_shell_path(&credential_paths.cert_path),
-                wait_for_port_ready_shell(remote_port)
-            )
+        let command = match remote_shell {
+            RemoteShellKind::Posix => {
+                if outbound_dial {
+                    format!(
+                        "nohup waitagent --port {remote_port} --node-id {} --node-key-path {} --node-cert-path {} __ratatui-node-server >/tmp/waitagent-{remote_port}.log 2>&1 < /dev/null & {}",
+                        shell_single_quote(&authority_id),
+                        remote_shell_path(&credential_paths.key_path),
+                        remote_shell_path(&credential_paths.cert_path),
+                        wait_for_port_ready_shell(remote_port)
+                    )
+                } else {
+                    format!(
+                        "nohup waitagent --port {remote_port} --connect {} --node-id {} --node-key-path {} --node-cert-path {} __ratatui-node-server >/tmp/waitagent-{remote_port}.log 2>&1 < /dev/null & {}",
+                        shell_single_quote(&local_connect_endpoint),
+                        shell_single_quote(&authority_id),
+                        remote_shell_path(&credential_paths.key_path),
+                        remote_shell_path(&credential_paths.cert_path),
+                        wait_for_port_ready_shell(remote_port)
+                    )
+                }
+            }
+            RemoteShellKind::Windows => windows_start_command(
+                remote_port,
+                &local_connect_endpoint,
+                &authority_id,
+                outbound_dial,
+            ),
         };
         Self {
             remote_port,
             credential_paths: credential_paths.clone(),
             endpoint_preflight_command,
-            credentials_command: generate_credentials_command(remote_port, &credential_paths),
+            credentials_command: generate_credentials_command(
+                remote_port,
+                &credential_paths,
+                remote_shell,
+            ),
             command,
             local_connect_endpoint,
             authority_id,
@@ -108,6 +140,11 @@ pub struct RemoteHostBootstrapPlan {
     pub remote_bin_path: String,
     /// OpenSSH-formatted operator public key to install on the remote host.
     pub operator_public_key: Option<String>,
+    /// Detected shell family of the remote host. Every remote command
+    /// generator (`install_or_update_command`, `start_plan`, version check,
+    /// daemon check, ...) emits a POSIX or PowerShell script based on this
+    /// kind (`docs/windows-ssh-target-design.md` tasks T2/T3).
+    pub remote_shell: RemoteShellKind,
 }
 
 // TODO(cleanup): transitional remote code, kept for Phase 8 wiring.
@@ -118,6 +155,7 @@ impl RemoteHostBootstrapPlan {
         remote_port: u16,
         local_connect_endpoint: impl Into<String>,
         authority_id: impl Into<String>,
+        remote_shell: RemoteShellKind,
     ) -> Self {
         let (auth_kind, key_path, ssh_password_secret_id) = match &profile.auth {
             RemoteHostAuthProfile::Password { password_secret_id } => {
@@ -130,8 +168,12 @@ impl RemoteHostBootstrapPlan {
             ),
         };
         let authority_id = authority_id.into();
-        let start_plan =
-            RemoteWaitAgentStartPlan::new(remote_port, local_connect_endpoint, authority_id);
+        let start_plan = RemoteWaitAgentStartPlan::new(
+            remote_port,
+            local_connect_endpoint,
+            authority_id,
+            remote_shell,
+        );
         let remote_bin_path = "$HOME/.local/bin/waitagent".to_string();
         Self {
             host: profile.host.clone(),
@@ -140,12 +182,13 @@ impl RemoteHostBootstrapPlan {
             key_path,
             ssh_password_secret_id,
             sudo_password_secret_id: profile.sudo_password_secret_id.clone(),
-            install_or_update_command: install_or_update_command(),
+            install_or_update_command: install_or_update_command_for(remote_shell),
             install_reachability_preflight_command: None,
             start_plan,
             deploy_script_path: None,
             remote_bin_path,
             operator_public_key: None,
+            remote_shell,
         }
     }
 
@@ -289,6 +332,11 @@ where
         }
 
         if plan.deploy_script_path.is_some() {
+            if plan.remote_shell == RemoteShellKind::Windows {
+                return Err(RemoteHostBootstrapError::new(
+                    "local binary deploy is not supported for windows remote hosts",
+                ));
+            }
             self.run_deploy_script(plan)?;
             let (tls_pin_sha256, remote_port) = self.generate_credentials_and_parse(plan)?;
             if !self.remote_waitagent_daemon_is_running(plan)? {
@@ -300,7 +348,11 @@ where
             });
         }
 
-        self.run_ssh_command(plan, &ensure_waitagent_home_command(), false)?;
+        self.run_ssh_command(
+            plan,
+            &ensure_waitagent_home_command(plan.remote_shell),
+            false,
+        )?;
 
         if !self.remote_waitagent_is_current(plan)? {
             if let Some(command) = &plan.install_reachability_preflight_command {
@@ -313,7 +365,11 @@ where
                         ))
                     })?;
             }
-            self.run_ssh_command(plan, &plan.install_or_update_command, true)?;
+            // sudo only exists for the POSIX installer (root install into
+            // /usr/local/bin); the Windows installer is per-user and needs no
+            // elevation (`docs/windows-ssh-target-design.md` §6.5).
+            let allow_sudo = plan.remote_shell == RemoteShellKind::Posix;
+            self.run_ssh_command(plan, &plan.install_or_update_command, allow_sudo)?;
         }
 
         let (tls_pin_sha256, remote_port) = self.generate_credentials_and_parse(plan)?;
@@ -344,7 +400,11 @@ where
         &self,
         plan: &RemoteHostBootstrapPlan,
     ) -> Result<bool, RemoteHostBootstrapError> {
-        let output = self.run_ssh_output(plan, &current_version_check_command(), false)?;
+        let output = self.run_ssh_output(
+            plan,
+            &current_version_check_command(plan.remote_shell),
+            false,
+        )?;
         Ok(output.status == 0)
     }
 
@@ -427,9 +487,14 @@ where
         plan: &RemoteHostBootstrapPlan,
         public_key: &str,
     ) -> Result<(), RemoteHostBootstrapError> {
-        let dir = "$HOME/.waitagent/authorized_operators";
         let fingerprint = operator_public_key_fingerprint(public_key)
             .map_err(|error| RemoteHostBootstrapError::new(error.to_string()))?;
+        if plan.remote_shell == RemoteShellKind::Windows {
+            let command = windows_install_operator_public_key_command(public_key, &fingerprint);
+            self.run_ssh_command(plan, &command, false)?;
+            return Ok(());
+        }
+        let dir = "$HOME/.waitagent/authorized_operators";
         let path = format!("{dir}/{fingerprint}.pub");
         let command = format!(
             "mkdir -p {dir} && printf '%s\\n' {} > {path}",
@@ -581,9 +646,19 @@ pub fn install_or_update_command() -> String {
     );
     format!(
         "if ! {{ {}; }}; then {}; fi",
-        current_version_check_command(),
+        current_version_check_command(RemoteShellKind::Posix),
         install
     )
+}
+
+/// Install command for the remote host's shell family: POSIX keeps the
+/// install.sh pipeline byte-for-byte, Windows downloads the release zip with
+/// curl.exe and unpacks it with tar.exe (task T3).
+pub fn install_or_update_command_for(remote_shell: RemoteShellKind) -> String {
+    match remote_shell {
+        RemoteShellKind::Posix => install_or_update_command(),
+        RemoteShellKind::Windows => windows_install_or_update_command(None, None),
+    }
 }
 
 // TODO(cleanup): transitional remote code, kept for Phase 8 wiring.
@@ -628,28 +703,99 @@ fn deploy_command(plan: &RemoteHostBootstrapPlan) -> String {
     parts.join(" ")
 }
 
-fn current_version_check_command() -> String {
-    let expected_version = env!("CARGO_PKG_VERSION");
-    format!(
-        "command -v waitagent >/dev/null 2>&1 && waitagent --version 2>/dev/null | grep -q {}",
-        shell_single_quote(expected_version)
-    )
+fn current_version_check_command(remote_shell: RemoteShellKind) -> String {
+    match remote_shell {
+        RemoteShellKind::Posix => {
+            let expected_version = env!("CARGO_PKG_VERSION");
+            format!(
+                "command -v waitagent >/dev/null 2>&1 && waitagent --version 2>/dev/null | grep -q {}",
+                shell_single_quote(expected_version)
+            )
+        }
+        RemoteShellKind::Windows => windows_current_version_check_command(),
+    }
 }
 
-fn ensure_waitagent_home_command() -> String {
-    "mkdir -p $HOME/.waitagent".to_string()
+fn windows_current_version_check_command() -> String {
+    let expected_version = env!("CARGO_PKG_VERSION");
+    let script = format!(
+        "$exe = {WINDOWS_WAITAGENT_EXE_PS}; \
+if (-not (Test-Path $exe)) {{ exit 1 }}; \
+$out = & $exe --version 2>$null; \
+if ($LASTEXITCODE -ne 0) {{ exit 1 }}; \
+if (\"$out\" -like {}) {{ exit 0 }} else {{ exit 1 }}",
+        ps_single_quote(&format!("*{expected_version}*"))
+    );
+    powershell_command(&script)
+}
+
+fn ensure_waitagent_home_command(remote_shell: RemoteShellKind) -> String {
+    match remote_shell {
+        RemoteShellKind::Posix => "mkdir -p $HOME/.waitagent".to_string(),
+        RemoteShellKind::Windows => {
+            let script = format!(
+                "$dir = {WINDOWS_WAITAGENT_HOME_PS}; \
+New-Item -ItemType Directory -Force $dir | Out-Null; \
+if (Test-Path $dir) {{ exit 0 }} else {{ exit 1 }}"
+            );
+            powershell_command(&script)
+        }
+    }
 }
 
 fn generate_credentials_command(
     remote_port: u16,
     credential_paths: &NodeCredentialPaths,
+    remote_shell: RemoteShellKind,
 ) -> String {
-    format!(
-        "waitagent --port {} --node-key-path {} --node-cert-path {} __generate-node-credentials",
-        shell_single_quote(&remote_port.to_string()),
-        remote_shell_path(&credential_paths.key_path),
-        remote_shell_path(&credential_paths.cert_path),
-    )
+    match remote_shell {
+        RemoteShellKind::Posix => format!(
+            "waitagent --port {} --node-key-path {} --node-cert-path {} __generate-node-credentials",
+            shell_single_quote(&remote_port.to_string()),
+            remote_shell_path(&credential_paths.key_path),
+            remote_shell_path(&credential_paths.cert_path),
+        ),
+        RemoteShellKind::Windows => {
+            // The credentials subcommand is cross-platform; only the binary
+            // and key/cert paths take Windows form
+            // (`docs/windows-ssh-target-design.md` §2).
+            let script = format!(
+                "$exe = {WINDOWS_WAITAGENT_EXE_PS}; \
+& $exe --port {remote_port} --node-key-path \"{WINDOWS_NODE_KEY_PS}\" --node-cert-path \"{WINDOWS_NODE_CERT_PS}\" __generate-node-credentials; \
+exit $LASTEXITCODE"
+            );
+            powershell_command(&script)
+        }
+    }
+}
+
+/// Windows start command: a plain foreground exec of the installed binary.
+/// Over an SSH exec session the server self-daemonizes
+/// (`daemonize_self_if_needed`, task T4) and the parent copy exits once the
+/// port accepts connections, so — unlike the POSIX `nohup … &` form — this
+/// carries no shell-level backgrounding and returns when the daemon is ready.
+fn windows_start_command(
+    remote_port: u16,
+    local_connect_endpoint: &str,
+    authority_id: &str,
+    outbound_dial: bool,
+) -> String {
+    let mut args = format!(
+        "--port {remote_port} --node-id {} ",
+        ps_single_quote(authority_id)
+    );
+    if !outbound_dial {
+        args.push_str(&format!(
+            "--connect {} ",
+            ps_single_quote(local_connect_endpoint)
+        ));
+    }
+    let script = format!(
+        "$exe = {WINDOWS_WAITAGENT_EXE_PS}; \
+& $exe {args}--node-key-path \"{WINDOWS_NODE_KEY_PS}\" --node-cert-path \"{WINDOWS_NODE_CERT_PS}\" __ratatui-node-server; \
+exit $LASTEXITCODE"
+    );
+    powershell_command(&script)
 }
 
 /// Shell snippet that waits up to ~10 seconds for the remote waitagent to open
@@ -690,6 +836,9 @@ fn operator_public_key_fingerprint(public_key: &str) -> Result<String, String> {
 }
 
 fn daemon_running_check_command(plan: &RemoteHostBootstrapPlan) -> String {
+    if plan.remote_shell == RemoteShellKind::Windows {
+        return windows_daemon_running_check_command(plan);
+    }
     if plan.start_plan.outbound_dial {
         format!(
             "ps -eo args= | grep -F -- {} | grep -F -- {} | grep -F -- {} | grep -F -- {} | grep -v 'grep -F' >/dev/null 2>&1",
@@ -710,6 +859,35 @@ fn daemon_running_check_command(plan: &RemoteHostBootstrapPlan) -> String {
     }
 }
 
+fn windows_daemon_running_check_command(plan: &RemoteHostBootstrapPlan) -> String {
+    let mut needles = vec![
+        format!("--port {}", plan.start_plan.remote_port),
+        format!("--node-id {}", plan.start_plan.authority_id),
+        plan.start_plan.subcommand.clone(),
+    ];
+    if !plan.start_plan.outbound_dial {
+        needles.push(format!(
+            "--connect {}",
+            plan.start_plan.local_connect_endpoint
+        ));
+    }
+    let conditions = needles
+        .iter()
+        .map(|needle| {
+            format!(
+                "($_.CommandLine -like {})",
+                ps_single_quote(&format!("*{needle}*"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" -and ");
+    let script = format!(
+        "$procs = @(Get-CimInstance Win32_Process -Filter \"Name='waitagent.exe'\" | Where-Object {{ {conditions} }}); \
+if ($procs.Count -gt 0) {{ exit 0 }} else {{ exit 1 }}"
+    );
+    powershell_command(&script)
+}
+
 pub fn install_reachability_preflight_command(env_prefixes: &[String]) -> String {
     let command = install_reachability_preflight_curl_command();
     let attempts = env_prefixes
@@ -722,6 +900,23 @@ pub fn install_reachability_preflight_command(env_prefixes: &[String]) -> String
         return attempts.join(" || ");
     }
     command
+}
+
+/// Windows install preflight: `curl.exe` must exist and be able to fetch the
+/// release zip (proxies are injected as `$env:` assignments inside the
+/// script, per `docs/windows-ssh-target-design.md` §2).
+pub fn windows_install_reachability_preflight_command(
+    all_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+) -> String {
+    let url = windows_release_zip_url(env!("CARGO_PKG_VERSION"));
+    let mut script = missing_curl_or_tar_guard();
+    push_proxy_assignments(&mut script, all_proxy, https_proxy);
+    script.push_str(&format!(
+        "curl.exe -fsSL --connect-timeout {REMOTE_ENDPOINT_PREFLIGHT_TIMEOUT_SECS} --max-time {REMOTE_INSTALL_PREFLIGHT_TIMEOUT_SECS} -o NUL {}; exit $LASTEXITCODE",
+        ps_single_quote(&url)
+    ));
+    powershell_command(&script)
 }
 
 fn install_reachability_preflight_curl_command() -> String {
@@ -741,11 +936,35 @@ fn install_proxy_hint(command: &str) -> &'static str {
     }
 }
 
-fn endpoint_preflight_command(endpoint: &str) -> String {
+fn endpoint_preflight_command(endpoint: &str, remote_shell: RemoteShellKind) -> String {
     match parse_endpoint_host_port(endpoint) {
-        Ok((host, port)) => tcp_connect_preflight_command(&host, port),
-        Err(message) => format!("echo {} >&2; exit 2", shell_single_quote(&message)),
+        Ok((host, port)) => match remote_shell {
+            RemoteShellKind::Posix => tcp_connect_preflight_command(&host, port),
+            RemoteShellKind::Windows => windows_tcp_connect_preflight_command(&host, port),
+        },
+        Err(message) => match remote_shell {
+            RemoteShellKind::Posix => {
+                format!("echo {} >&2; exit 2", shell_single_quote(&message))
+            }
+            RemoteShellKind::Windows => powershell_command(&format!(
+                "Write-Error {}; exit 2",
+                ps_single_quote(&message)
+            )),
+        },
     }
+}
+
+fn windows_tcp_connect_preflight_command(host: &str, port: u16) -> String {
+    let script = format!(
+        "$client = New-Object Net.Sockets.TcpClient; \
+$result = $client.BeginConnect({}, {port}, $null, $null); \
+$completed = $result.AsyncWaitHandle.WaitOne({}, $false); \
+if (-not $completed) {{ exit 1 }}; \
+try {{ $client.EndConnect($result); exit 0 }} catch {{ exit 1 }}",
+        ps_single_quote(host),
+        REMOTE_ENDPOINT_PREFLIGHT_TIMEOUT_SECS * 1000,
+    );
+    powershell_command(&script)
 }
 
 fn tcp_connect_preflight_command(host: &str, port: u16) -> String {
@@ -811,6 +1030,120 @@ fn sudo_shell_command(remote_command: &str) -> String {
         "sudo -S -p '' sh -lc {}",
         shell_single_quote(remote_command)
     )
+}
+
+/// Wrap a PowerShell script in the explicit
+/// `powershell -NoProfile -NonInteractive -Command` invocation used for every
+/// Windows remote command, so nothing depends on the target sshd's
+/// DefaultShell configuration.
+///
+/// Stock Win32-OpenSSH feeds the command line to cmd.exe, so the script is
+/// enclosed in double quotes and every inner `"` is escaped for PowerShell as
+/// `` `" `` (cmd passes both characters through literally inside quotes).
+/// Generated scripts avoid cmd metacharacters — `%VAR%` references are
+/// written as `$env:VAR` instead.
+pub(crate) fn powershell_command(script: &str) -> String {
+    let escaped = script.replace('"', "`\"");
+    format!("powershell -NoProfile -NonInteractive -Command \"{escaped}\"")
+}
+
+/// Quote a value as a PowerShell single-quoted string literal.
+pub(crate) fn ps_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn windows_release_zip_url(version: &str) -> String {
+    format!(
+        "{WAITAGENT_WINDOWS_RELEASE_BASE_URL}/v{version}/waitagent-{version}-x86_64-windows.zip"
+    )
+}
+
+/// PowerShell guard emitting a clear error when curl.exe or tar.exe is
+/// missing on the Windows target (both ship with Windows 10+).
+fn missing_curl_or_tar_guard() -> String {
+    "if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { Write-Error 'curl.exe is required to install WaitAgent on Windows but was not found on PATH'; exit 127 }; \
+if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) { Write-Error 'tar.exe is required to install WaitAgent on Windows but was not found on PATH'; exit 127 }; "
+        .to_string()
+}
+
+/// Inject proxy settings into a PowerShell script as `$env:` assignments so
+/// curl.exe picks them up (`docs/windows-ssh-target-design.md` §2).
+fn push_proxy_assignments(script: &mut String, all_proxy: Option<&str>, https_proxy: Option<&str>) {
+    if let Some(proxy) = non_empty(all_proxy) {
+        script.push_str(&format!("$env:ALL_PROXY = {}; ", ps_single_quote(proxy)));
+    }
+    if let Some(proxy) = non_empty(https_proxy) {
+        script.push_str(&format!("$env:HTTPS_PROXY = {}; ", ps_single_quote(proxy)));
+    }
+}
+
+/// Windows installer body (task T3): download the release zip with curl.exe
+/// and unpack it into `%LOCALAPPDATA%\Programs\waitagent\` with tar.exe
+/// (bsdtar, which auto-detects zip archives), then stamp `version.txt`.
+fn windows_install_body(
+    all_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+    version: &str,
+) -> String {
+    let url = windows_release_zip_url(version);
+    let mut body = missing_curl_or_tar_guard();
+    body.push_str("$dir = Split-Path $exe; New-Item -ItemType Directory -Force $dir | Out-Null; ");
+    body.push_str("$tmp = Join-Path $env:TEMP ('waitagent-install-' + [guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Force $tmp | Out-Null; ");
+    body.push_str("$zip = Join-Path $tmp 'waitagent.zip'; ");
+    push_proxy_assignments(&mut body, all_proxy, https_proxy);
+    body.push_str(&format!(
+        "curl.exe -fsSL --retry 3 --connect-timeout 5 --max-time 120 -o $zip {}; ",
+        ps_single_quote(&url)
+    ));
+    body.push_str(
+        "if ($LASTEXITCODE -ne 0) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp; exit 1 }; ",
+    );
+    body.push_str("tar.exe -xf $zip -C $dir; ");
+    body.push_str(
+        "if ($LASTEXITCODE -ne 0) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp; exit 1 }; ",
+    );
+    body.push_str(&format!(
+        "Set-Content -Path (Join-Path $dir 'version.txt') -Value {} -NoNewline; ",
+        ps_single_quote(version)
+    ));
+    body.push_str("Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp");
+    body
+}
+
+/// Windows install command: skip the download when the installed binary
+/// already reports the expected version, otherwise run the zip installer.
+pub fn windows_install_or_update_command(
+    all_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let install = windows_install_body(all_proxy, https_proxy, version);
+    let script = format!(
+        "$exe = {WINDOWS_WAITAGENT_EXE_PS}; \
+$current = $false; \
+if (Test-Path $exe) {{ $out = & $exe --version 2>$null; if ($LASTEXITCODE -eq 0 -and \"$out\" -like {}) {{ $current = $true }} }}; \
+if (-not $current) {{ {install} }}",
+        ps_single_quote(&format!("*{version}*")),
+    );
+    powershell_command(&script)
+}
+
+fn windows_install_operator_public_key_command(public_key: &str, fingerprint: &str) -> String {
+    let file_name = format!("{fingerprint}.pub");
+    let script = format!(
+        "$dir = \"{WINDOWS_AUTHORIZED_OPERATORS_PS}\"; \
+New-Item -ItemType Directory -Force $dir | Out-Null; \
+[System.IO.File]::WriteAllText((Join-Path $dir {}), {} + \"`n\"); \
+if (Test-Path (Join-Path $dir {})) {{ exit 0 }} else {{ exit 1 }}",
+        ps_single_quote(&file_name),
+        ps_single_quote(public_key),
+        ps_single_quote(&file_name),
+    );
+    powershell_command(&script)
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -933,6 +1266,7 @@ mod tests {
             7476,
             "10.1.26.84:7474",
             "10.1.29.130#7476",
+            RemoteShellKind::Posix,
         );
 
         assert!(plan
@@ -962,6 +1296,227 @@ mod tests {
         assert!(plan.start_plan.command.contains("__ratatui-node-server"));
         assert!(plan.start_plan.command.contains("nohup"));
         assert!(plan.start_plan.outbound_dial);
+    }
+
+    #[test]
+    fn remote_host_bootstrapper_runs_powershell_flow_for_windows_shell() {
+        use crate::infra::operator_auth::{MemoryOperatorKeyStore, OperatorKeyStore};
+        let ssh_id = RemoteHostSecretId::new("waitagent.remote-host.win.ssh-password").unwrap();
+        let sudo_id = RemoteHostSecretId::new("waitagent.remote-host.win.sudo-password").unwrap();
+        let store = MemoryRemoteHostSecretStore::default();
+        store
+            .put_secret(&ssh_id, RemoteHostSecretValue::new("ssh-secret"))
+            .unwrap();
+        store
+            .put_secret(&sudo_id, RemoteHostSecretValue::new("sudo-secret"))
+            .unwrap();
+        let profile = RemoteHostProfile {
+            name: "windows-box".to_string(),
+            host: "192.168.1.6".to_string(),
+            ssh_user: "jj".to_string(),
+            auth: RemoteHostAuthProfile::Password {
+                password_secret_id: Some(ssh_id),
+            },
+            sudo_password_secret_id: Some(sudo_id),
+            preferred_remote_port: RemotePortPreference::Auto,
+            last_remote_port: None,
+            last_endpoint: None,
+            last_connected_at: None,
+            use_install_proxy: true,
+            tls_pin_sha256: None,
+            remote_shell: Some(RemoteShellKind::Windows),
+            ..RemoteHostProfile::default()
+        };
+        let plan = RemoteHostBootstrapPlan::from_profile(
+            &profile,
+            7476,
+            "10.1.26.84:7474",
+            "192.168.1.6#7476",
+            RemoteShellKind::Windows,
+        );
+        let operator_key = MemoryOperatorKeyStore::generate().unwrap();
+        let mut plan = plan;
+        plan.operator_public_key = Some(operator_key.public_key_openssh().unwrap());
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let bootstrapper = SshRemoteHostBootstrapper::with_executor(
+            store,
+            RecordingSshExecutor {
+                calls: calls.clone(),
+                statuses: Rc::new(RefCell::new(vec![0, 1, 0, 0, 0, 1, 0])),
+                credentials_stdout: Rc::new(RefCell::new(Some(
+                    "WAITAGENT_CREDENTIALSdeadbeef:7476\n".to_string(),
+                ))),
+            },
+        );
+
+        let result = bootstrapper.ensure_waitagent_and_start(&plan).unwrap();
+
+        assert_eq!(result.tls_pin_sha256, "deadbeef");
+        assert_eq!(result.remote_port, 7476);
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 7);
+        for (target, command, stdin) in calls.iter() {
+            assert_eq!(target.host, "192.168.1.6");
+            assert_eq!(target.user, "jj");
+            assert!(
+                command.starts_with("powershell -NoProfile -NonInteractive -Command \""),
+                "every windows remote command must be an explicit powershell exec: {command}"
+            );
+            assert_eq!(*stdin, None, "windows flow must never use sudo stdin");
+        }
+        assert!(calls[0].1.contains("New-Item"));
+        assert!(calls[0].1.contains("USERPROFILE"));
+        assert!(calls[1].1.contains("Test-Path"));
+        assert!(calls[1].1.contains("--version"));
+        assert!(calls[2].1.contains("curl.exe"));
+        assert!(calls[2].1.contains("tar.exe"));
+        assert!(calls[2].1.contains("LOCALAPPDATA"));
+        assert!(calls[2].1.contains("version.txt"));
+        assert!(calls[3].1.contains("__generate-node-credentials"));
+        assert!(calls[4].1.contains("authorized_operators"));
+        assert!(calls[5].1.contains("Get-CimInstance"));
+        assert!(calls[5].1.contains("--port 7476"));
+        assert!(calls[6].1.contains("__ratatui-node-server"));
+        assert!(calls[6].1.contains("--node-id '192.168.1.6#7476'"));
+        assert!(!calls[6].1.contains("nohup"));
+        assert!(!calls.iter().any(|(_, command, _)| command.contains("sudo")));
+    }
+
+    #[test]
+    fn remote_host_bootstrapper_windows_inbound_mode_preflights_endpoint() {
+        let ssh_id = RemoteHostSecretId::new("waitagent.remote-host.win.ssh-password").unwrap();
+        let store = MemoryRemoteHostSecretStore::default();
+        store
+            .put_secret(&ssh_id, RemoteHostSecretValue::new("ssh-secret"))
+            .unwrap();
+        let profile = RemoteHostProfile {
+            name: "windows-box".to_string(),
+            host: "192.168.1.6".to_string(),
+            ssh_user: "jj".to_string(),
+            auth: RemoteHostAuthProfile::Password {
+                password_secret_id: Some(ssh_id),
+            },
+            sudo_password_secret_id: None,
+            preferred_remote_port: RemotePortPreference::Auto,
+            last_remote_port: None,
+            last_endpoint: None,
+            last_connected_at: None,
+            use_install_proxy: true,
+            tls_pin_sha256: None,
+            remote_shell: Some(RemoteShellKind::Windows),
+            ..RemoteHostProfile::default()
+        };
+        let plan = RemoteHostBootstrapPlan::from_profile(
+            &profile,
+            7476,
+            "192.168.31.178:7474",
+            "192.168.1.6#7476",
+            RemoteShellKind::Windows,
+        );
+        let mut plan = plan;
+        // Force inbound mode so the local-endpoint preflight is exercised.
+        plan.start_plan = RemoteWaitAgentStartPlan::new_with_mode(
+            plan.start_plan.remote_port,
+            plan.start_plan.local_connect_endpoint.clone(),
+            plan.start_plan.authority_id.clone(),
+            false,
+            RemoteShellKind::Windows,
+        );
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let bootstrapper = SshRemoteHostBootstrapper::with_executor(
+            store,
+            RecordingSshExecutor {
+                calls: calls.clone(),
+                statuses: Rc::new(RefCell::new(vec![1])),
+                credentials_stdout: Rc::new(RefCell::new(None)),
+            },
+        );
+
+        let error = bootstrapper.ensure_waitagent_and_start(&plan).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("remote host cannot reach local WaitAgent endpoint"));
+        assert!(error.to_string().contains("--public <host:port>"));
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.contains("TcpClient"));
+        assert!(calls[0].1.contains("192.168.31.178"));
+    }
+
+    #[test]
+    fn windows_plan_generates_powershell_install_start_and_credentials_commands() {
+        let profile = RemoteHostProfile {
+            name: "windows-box".to_string(),
+            host: "192.168.1.6".to_string(),
+            ssh_user: "jj".to_string(),
+            auth: RemoteHostAuthProfile::Password {
+                password_secret_id: None,
+            },
+            sudo_password_secret_id: None,
+            preferred_remote_port: RemotePortPreference::Auto,
+            last_remote_port: None,
+            last_endpoint: None,
+            last_connected_at: None,
+            use_install_proxy: true,
+            tls_pin_sha256: None,
+            remote_shell: Some(RemoteShellKind::Windows),
+            ..RemoteHostProfile::default()
+        };
+
+        let plan = RemoteHostBootstrapPlan::from_profile(
+            &profile,
+            7476,
+            "10.1.26.84:7474",
+            "192.168.1.6#7476",
+            RemoteShellKind::Windows,
+        );
+
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(plan
+            .install_or_update_command
+            .contains(&format!("waitagent-{version}-x86_64-windows.zip")));
+        assert!(plan.install_or_update_command.contains("curl.exe"));
+        assert!(plan.install_or_update_command.contains("tar.exe"));
+        assert!(plan.install_or_update_command.contains("LOCALAPPDATA"));
+        assert!(plan.start_plan.endpoint_preflight_command.is_empty());
+        assert!(!plan.start_plan.command.contains("--connect"));
+        assert!(plan
+            .start_plan
+            .command
+            .contains("--node-id '192.168.1.6#7476'"));
+        assert!(plan.start_plan.command.contains("__ratatui-node-server"));
+        assert!(!plan.start_plan.command.contains("nohup"));
+        assert!(plan
+            .start_plan
+            .credentials_command
+            .contains("__generate-node-credentials"));
+        assert!(plan.start_plan.credentials_command.contains("node.key"));
+        assert!(plan.start_plan.outbound_dial);
+    }
+
+    #[test]
+    fn windows_install_command_injects_proxy_environment() {
+        let command = windows_install_or_update_command(
+            Some("socks5://127.0.0.1:7897"),
+            Some("http://127.0.0.1:7897"),
+        );
+
+        assert!(command.contains("$env:ALL_PROXY = 'socks5://127.0.0.1:7897'"));
+        assert!(command.contains("$env:HTTPS_PROXY = 'http://127.0.0.1:7897'"));
+        assert!(command.contains("curl.exe -fsSL"));
+    }
+
+    #[test]
+    fn windows_install_reachability_preflight_uses_curl_and_nul_sink() {
+        let command =
+            windows_install_reachability_preflight_command(Some("socks5://127.0.0.1:7897"), None);
+
+        assert!(command.contains("curl.exe -fsSL"));
+        assert!(command.contains("-o NUL"));
+        assert!(command.contains("$env:ALL_PROXY = 'socks5://127.0.0.1:7897'"));
+        assert!(!command.contains("$env:HTTPS_PROXY"));
+        assert!(command.contains("exit $LASTEXITCODE"));
     }
 
     #[test]
@@ -997,6 +1552,7 @@ mod tests {
             7476,
             "10.1.26.84:7474",
             "10.1.29.130#7476",
+            RemoteShellKind::Posix,
         );
         let bootstrapper = SshRemoteHostBootstrapper::new(store);
 
@@ -1053,6 +1609,7 @@ mod tests {
             7476,
             "10.1.26.84:7474",
             "10.1.29.130#7476",
+            RemoteShellKind::Posix,
         );
         let calls = Rc::new(RefCell::new(Vec::new()));
         let bootstrapper = SshRemoteHostBootstrapper::with_executor(
@@ -1120,6 +1677,7 @@ mod tests {
             7476,
             "10.1.26.84:7474",
             "10.1.29.130#7476",
+            RemoteShellKind::Posix,
         );
         let env_prefixes = vec![
             "all_proxy='socks5://127.0.0.1:7897'".to_string(),
@@ -1183,6 +1741,7 @@ mod tests {
             7476,
             "192.168.31.178:7474",
             "10.1.29.130#7476",
+            RemoteShellKind::Posix,
         );
         // Force inbound mode so the local-endpoint preflight is exercised.
         plan.start_plan = RemoteWaitAgentStartPlan::new_with_mode(
@@ -1190,6 +1749,7 @@ mod tests {
             plan.start_plan.local_connect_endpoint.clone(),
             plan.start_plan.authority_id.clone(),
             false,
+            RemoteShellKind::Posix,
         );
         let calls = Rc::new(RefCell::new(Vec::new()));
         let bootstrapper = SshRemoteHostBootstrapper::with_executor(
@@ -1212,7 +1772,7 @@ mod tests {
 
     #[test]
     fn endpoint_preflight_command_rejects_malformed_endpoint() {
-        let command = endpoint_preflight_command("127.0.0.1");
+        let command = endpoint_preflight_command("127.0.0.1", RemoteShellKind::Posix);
 
         assert!(command.contains("missing a port"));
         assert!(command.contains("exit 2"));
@@ -1250,6 +1810,7 @@ mod tests {
             7476,
             "10.1.26.84:7474",
             "10.1.29.130#7476",
+            RemoteShellKind::Posix,
         );
         let calls = Rc::new(RefCell::new(Vec::new()));
         let bootstrapper = SshRemoteHostBootstrapper::with_executor(
@@ -1312,6 +1873,7 @@ mod tests {
             7476,
             "10.1.26.84:7474",
             "10.1.29.130#7476",
+            RemoteShellKind::Posix,
         );
         let calls = Rc::new(RefCell::new(Vec::new()));
         let bootstrapper = SshRemoteHostBootstrapper::with_executor(
@@ -1362,6 +1924,7 @@ mod tests {
             7476,
             "10.1.26.84:7474",
             "10.1.29.130#7476",
+            RemoteShellKind::Posix,
         )
         .with_local_binary_deploy();
 

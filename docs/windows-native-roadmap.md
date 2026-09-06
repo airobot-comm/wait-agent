@@ -101,6 +101,16 @@
 
 验收状态：GitHub Actions `windows-latest` 上 6 个 job 全绿（run 对 `47be311`，含 windows-test 533 passed / 0 failed）。`cargo test --release` 在真实 Windows 上通过。诚实备注：交互式人工端到端（真机 TUI 里启动 server、attach session、跑 agent、连远程 host）未执行——CI 测试已覆盖其中的可编程部分（本地 PTY spawn、signal env、bundle 提取、粘贴分发等），剩余为人工体验验证，发现问题按阶段 8 流程继续修。
 
+## 阶段 9：Windows-as-SSH-target（进行中）
+
+- 目标：Ctrl+W 通过 SSH 把 waitagent 装进 Windows 目标机（当前 bootstrap 全流程是 POSIX
+  shell 脚本，Windows 目标在端口探测阶段即失败）。
+- 方案已固化：`docs/windows-ssh-target-design.md`（含管线解剖、PowerShell 命令生成器、
+  进程存活设计、讨论结论）。
+- 硬性要求：目标机使用 Windows 自带 native OpenSSH（Win32-OpenSSH）；MSYS/Cygwin sshd
+  不支持。安装目录 `%LOCALAPPDATA%\Programs\waitagent\`（与本地 irm 安装器一致，按用户、
+  免管理员）；密码与密钥登录均在验证范围。
+
 ## 通用约束
 
 - 每次阶段改动必须保持 Linux/macOS 功能完整。

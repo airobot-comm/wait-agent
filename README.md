@@ -221,6 +221,36 @@ waitagent --connect <server-ip>:7474
 Windows hosts run the native Windows binary (`irm ... install.ps1 | iex`); the
 WSL2 alternative is documented under [Windows remote access](#windows-remote-access).
 
+### Windows as a connection target
+
+`Ctrl-W` can also connect a **native Windows host** over SSH. The target needs
+Microsoft's native OpenSSH Server (not WSL, not MSYS/OpenSSH):
+
+```powershell
+# Install and start OpenSSH Server (admin PowerShell)
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd
+Set-Service -Name sshd -StartupType Automatic
+# Open the firewall (usually already created by the installer)
+New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' -Enabled True `
+  -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
+```
+
+Then connect with `Ctrl-W` as usual. Password login works out of the box;
+key login works with a key registered in
+`C:\ProgramData\ssh\administrators_authorized_keys` (administrators) or
+`%USERPROFILE%\.ssh\authorized_keys` (regular users).
+
+Notes and limitations:
+
+- Requires the **native** OpenSSH Server; MSYS/Git-for-Windows sshd setups are
+  not supported as targets.
+- `waitagent` is installed per user into `%LOCALAPPDATA%\Programs\waitagent\`
+  (no administrator rights needed on the target).
+- The remote daemon runs as your SSH user and does **not** start automatically
+  on boot; the first `Ctrl-W` connect starts it on demand.
+- Remote daemon logs land in `%TEMP%\waitagent-<port>.log` on the target.
+
 ---
 
 ## How WaitAgent Works

@@ -12,6 +12,7 @@ use crate::host::ssh::remote_install_proxy_store::{
     no_proxy_for_install, RemoteInstallProxyProfile, RemoteInstallProxySettings,
     RemoteInstallProxyStore,
 };
+use crate::host::ssh::remote_shell::RemoteShellKind;
 use crate::lifecycle::LifecycleError;
 use crate::process::current_executable::current_waitagent_executable;
 use crate::ratatui_node::node_runtime::ServerMessageJson;
@@ -773,7 +774,10 @@ impl ConnectRemoteHostState {
             row if row == details.rows.password && point_in_rect(x, y, details.authentication) => {
                 self.set_focus(Focus::Password)
             }
-            row if row == details.rows.sudo && point_in_rect(x, y, details.authentication) => {
+            row if row == details.rows.sudo
+                && point_in_rect(x, y, details.authentication)
+                && !self.selected_profile_is_windows_shell() =>
+            {
                 self.set_focus(Focus::Sudo)
             }
             row if row == details.rows.remember => {
@@ -888,7 +892,7 @@ impl ConnectRemoteHostState {
     }
 
     fn start_sudo_password_edit(&mut self) {
-        if self.sudo_mode == SudoMode::None {
+        if self.sudo_mode == SudoMode::None || self.selected_profile_is_windows_shell() {
             return;
         }
         if self.sudo_mode == SudoMode::SameAsSsh {
@@ -1122,19 +1126,35 @@ impl ConnectRemoteHostState {
     }
 
     fn next_focus(&self) -> Focus {
-        self.focus.next(
+        let focus = self.focus.next(
             self.auth,
             self.has_saved_selection(),
             self.selected_proxy_config(),
-        )
+        );
+        if focus == Focus::Sudo && self.selected_profile_is_windows_shell() {
+            return focus.next(
+                self.auth,
+                self.has_saved_selection(),
+                self.selected_proxy_config(),
+            );
+        }
+        focus
     }
 
     fn prev_focus(&self) -> Focus {
-        self.focus.prev(
+        let focus = self.focus.prev(
             self.auth,
             self.has_saved_selection(),
             self.selected_proxy_config(),
-        )
+        );
+        if focus == Focus::Sudo && self.selected_profile_is_windows_shell() {
+            return focus.prev(
+                self.auth,
+                self.has_saved_selection(),
+                self.selected_proxy_config(),
+            );
+        }
+        focus
     }
 
     fn proxy_selection_index(&self) -> usize {
@@ -1266,6 +1286,21 @@ impl ConnectRemoteHostState {
 
     fn selected_profile(&self) -> Option<&RemoteHostProfile> {
         self.profiles.get(self.selected)
+    }
+
+    /// True when the selected saved profile is a known Windows SSH target.
+    ///
+    /// The shell family is cached in the profile by the first connect, so
+    /// brand-new (unsaved) hosts are unclassified and keep the editable sudo
+    /// field. The sudo password only exists for the POSIX installer
+    /// (`allow_sudo` in `ssh_remote_host_bootstrapper.rs`); the Windows
+    /// installer is per-user and needs no elevation
+    /// (`docs/windows-ssh-target-design.md` §6.5), so on Windows targets the
+    /// sudo row is annotated instead of editable.
+    fn selected_profile_is_windows_shell(&self) -> bool {
+        self.selected_profile()
+            .and_then(|profile| profile.remote_shell)
+            == Some(RemoteShellKind::Windows)
     }
 
     fn has_saved_selection(&self) -> bool {
@@ -2413,7 +2448,16 @@ fn render_authentication(frame: &mut Frame<'_>, area: Rect, state: &ConnectRemot
         ));
     }
     if state.host_kind == RemoteHostKind::Lan {
-        rows.push(icon_password_row("▲", "Sudo", PasswordField::Sudo, state));
+        if state.selected_profile_is_windows_shell() {
+            // The sudo password only exists for the POSIX installer; on a
+            // known Windows target the row is an annotation, not a field.
+            rows.push(
+                readonly_detail_row("▲  Sudo", "Not needed on Windows hosts")
+                    .style(Style::default().fg(Color::DarkGray)),
+            );
+        } else {
+            rows.push(icon_password_row("▲", "Sudo", PasswordField::Sudo, state));
+        }
     }
     render_detail_table(frame, table_area, rows);
 }
@@ -3418,6 +3462,9 @@ where
         use_install_proxy: state.use_install_proxy,
         tls_pin_sha256,
         host_kind: state.host_kind,
+        remote_shell: state
+            .selected_profile()
+            .and_then(|profile| profile.remote_shell),
     };
 
     history_store
@@ -4042,6 +4089,54 @@ mod tests {
         assert_eq!(state.host, "127.0.0.1");
         assert_eq!(state.ssh_user, "k");
         assert_eq!(segmented_for_test(&auth_tabs(&state)), "Password  Key");
+    }
+
+    fn state_with_shell_profile(remote_shell: Option<RemoteShellKind>) -> ConnectRemoteHostState {
+        let mut state = ConnectRemoteHostState::load();
+        state.profiles = vec![RemoteHostProfile {
+            name: "win".to_string(),
+            host: "192.168.1.6".to_string(),
+            ssh_user: "jj".to_string(),
+            auth: RemoteHostAuthProfile::Password {
+                password_secret_id: None,
+            },
+            remote_shell,
+            ..RemoteHostProfile::default()
+        }];
+        state.selected = 0;
+        let _ = state.sync_selected_profile();
+        state
+    }
+
+    #[test]
+    fn windows_shell_profile_skips_sudo_focus_and_blocks_editing() {
+        let mut state = state_with_shell_profile(Some(RemoteShellKind::Windows));
+
+        assert!(state.selected_profile_is_windows_shell());
+        state.set_focus(Focus::Password);
+        assert_eq!(state.next_focus(), Focus::Remember);
+        state.set_focus(Focus::Remember);
+        assert_eq!(state.prev_focus(), Focus::Password);
+
+        state.focus = Focus::Sudo;
+        state.start_sudo_password_edit();
+        assert_eq!(state.editing, None);
+    }
+
+    #[test]
+    fn posix_or_unclassified_profile_keeps_sudo_field() {
+        let mut posix = state_with_shell_profile(Some(RemoteShellKind::Posix));
+        assert!(!posix.selected_profile_is_windows_shell());
+        posix.set_focus(Focus::Password);
+        assert_eq!(posix.next_focus(), Focus::Sudo);
+        posix.focus = Focus::Sudo;
+        posix.start_sudo_password_edit();
+        assert_eq!(posix.editing, Some(EditField::SudoPassword));
+
+        let mut unknown = state_with_shell_profile(None);
+        assert!(!unknown.selected_profile_is_windows_shell());
+        unknown.set_focus(Focus::Password);
+        assert_eq!(unknown.next_focus(), Focus::Sudo);
     }
 
     #[test]
@@ -5729,6 +5824,7 @@ mod tests {
             use_install_proxy: true,
             tls_pin_sha256: None,
             host_kind: RemoteHostKind::Lan,
+            remote_shell: None,
         };
 
         let mut state = ConnectRemoteHostState::load();
@@ -5773,6 +5869,7 @@ mod tests {
             use_install_proxy: true,
             tls_pin_sha256: Some("deadbeef".to_string()),
             host_kind: RemoteHostKind::Lan,
+            remote_shell: None,
         };
 
         let mut state = ConnectRemoteHostState::load();
