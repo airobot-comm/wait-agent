@@ -22,7 +22,7 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
     CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 /// A Windows ConPTY session.
@@ -208,6 +208,13 @@ pub fn spawn_shell(
         std::mem::zeroed()
     };
     startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    // Setting `STARTF_USESTDHANDLES` with all std handles left null stops the
+    // child from inheriting this process's std handles. Without the flag, a
+    // child spawned from a context whose std handles are anonymous pipes (an
+    // ssh-exec'd daemon, a service) inherits those pipes instead of using the
+    // pseudoconsole, sees EOF on the inherited stdin, and exits immediately.
+    // Same approach as alacritty_terminal's ConPTY spawn.
+    startup_info.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
     startup_info.lpAttributeList = attributes.buffer.as_ptr() as *mut core::ffi::c_void;
     let mut process_info: PROCESS_INFORMATION = unsafe {
         // SAFETY: PROCESS_INFORMATION is plain data; CreateProcessW fills it
@@ -218,8 +225,9 @@ pub fn spawn_shell(
     // SAFETY: command_line is NUL-terminated wide text; env_block is a
     // correctly terminated environment block; startup_info points at a valid
     // attribute list containing the pseudoconsole handle; process_info is
-    // writable. No handles are inherited: the child uses the pseudoconsole
-    // for all stdio.
+    // writable. No handles are inherited (`bInheritHandles` is false and
+    // `STARTF_USESTDHANDLES` pins all std handles to null): the child uses the
+    // pseudoconsole for all stdio.
     let ok = unsafe {
         CreateProcessW(
             std::ptr::null(),
