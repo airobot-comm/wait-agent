@@ -109,17 +109,18 @@ impl RemoteAuthorityTransportRuntime {
     ) -> Result<Self, RemoteAuthorityTransportError> {
         let node_id = node_id.into();
         let mut stream = RemoteControlStream::connect(addr)?;
-        write_client_hello(&mut stream, &node_id)?;
-        let _server_hello = read_server_hello(&mut stream)?;
-        let writer = stream.try_clone()?;
-        // Reader/Writer timeouts prevent indefinite blocking under network jitter:
-        // the reader may be stranded during a gRPC reconnect window on the authority
-        // node, and a slow or broken FIFO reader on the output-pump side must not
-        // freeze the event loop by back-pressuring the transport writer.
+        // Bound the whole handshake, not just the steady-state reads: the
+        // listener side writes its server hello only after internal setup, and
+        // a listener that is no longer accepting (or is wedged) would
+        // otherwise leave `read_server_hello` blocked forever.  Callers such
+        // as the node ingress event loop must never wedge on a silent peer.
         stream
             .set_read_timeout(Some(AUTHORITY_TRANSPORT_READ_TIMEOUT))
             .ok();
-        writer.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        write_client_hello(&mut stream, &node_id)?;
+        let _server_hello = read_server_hello(&mut stream)?;
+        let writer = stream.try_clone()?;
         Ok(Self {
             node_id,
             reader: Mutex::new(stream),

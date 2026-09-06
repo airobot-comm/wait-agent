@@ -558,20 +558,27 @@ fn spawn_authority_transport_acceptor(
         let Some(listener) = listener else {
             return;
         };
-        match listener.accept() {
-            Ok((stream, _)) => {
-                handle_authority_transport_stream(
-                    stream,
-                    session.clone(),
-                    &target_id,
-                    &session_id,
-                    &authority_node_id,
-                );
-            }
-            Err(error) => {
-                ERROR_LOG.log(format!(
-                    "[ratatui-remote-session] authority accept error: {error}"
-                ));
+        // Accept in a loop: after a bridge connection drops (e.g. during a
+        // node reconnect), the ingress reconnects a new bridge to this same
+        // listener.  A single accept would leave subsequent connections
+        // stranded in the backlog, stalling the reconnect forever.
+        while session.running.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    handle_authority_transport_stream(
+                        stream,
+                        session.clone(),
+                        &target_id,
+                        &session_id,
+                        &authority_node_id,
+                    );
+                }
+                Err(error) => {
+                    ERROR_LOG.log(format!(
+                        "[ratatui-remote-session] authority accept error: {error}"
+                    ));
+                    break;
+                }
             }
         }
     });

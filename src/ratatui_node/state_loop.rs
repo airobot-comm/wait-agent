@@ -1980,8 +1980,28 @@ fn perform_remote_host_connect(
             // A stale ingress session from a previous disconnect may still be
             // registered for this node.  Evict it before queuing the new dial
             // so the duplicate-dial guard does not reject the reuse attempt.
+            // Never evict a healthy online session: doing so kills the
+            // connection the user is actively using, and the close races with
+            // the offline handler (which starts a retry worker whose dials
+            // then race this one).  With an online session present the
+            // duplicate-dial guard skips the redundant dial and the connect
+            // proceeds over the existing session.
             let node_id = request.node_id.clone();
-            let _ = tx.send(InternalEvent::CloseNodeIngressSession { node_id });
+            let has_online_session = {
+                let sessions = shared
+                    .sessions
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                sessions.values().any(|record| {
+                    *record.address.transport() == SessionTransport::RemotePeer
+                        && record.address.authority_id() == node_id
+                        && record.availability == SessionAvailability::Online
+                })
+            };
+            if !has_online_session {
+                let _ = tx.send(InternalEvent::CloseNodeIngressSession { node_id });
+            }
             tx.send(InternalEvent::InitiateOutboundConnection { request })
                 .map_err(|_| "remote node ingress is not ready".to_string())
         })
