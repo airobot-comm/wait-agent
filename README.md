@@ -243,8 +243,9 @@ key login works with a key registered in
 
 Notes and limitations:
 
-- Requires the **native** OpenSSH Server; MSYS/Git-for-Windows sshd setups are
-  not supported as targets.
+- Requires the **native** OpenSSH Server; a third-party MSYS/Cygwin sshd as
+  the SSH daemon is not supported. A native server on a machine with Git for
+  Windows on `PATH` works fine (it is detected as a Windows target).
 - `waitagent` is installed per user into `%LOCALAPPDATA%\Programs\waitagent\`
   (no administrator rights needed on the target).
 - The remote daemon runs as your SSH user and does **not** start automatically

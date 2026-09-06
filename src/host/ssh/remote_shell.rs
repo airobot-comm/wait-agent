@@ -5,9 +5,11 @@
 //! executed over SSH exec, so the command generators need to know the target's
 //! shell family up front. Detection runs a single `uname -s` exec: exit code 0
 //! means a POSIX target, while a missing/non-zero exit means a Windows target
-//! running native OpenSSH (MSYS/Cygwin sshd setups answer `uname` too and are
-//! a known unsupported limitation). The result is cached in the remote host
-//! profile so later connects skip the extra exec.
+//! running native OpenSSH. An exit-0 answer of `MSYS_NT-…`/`MINGW*_NT-…`/
+//! `CYGWIN_NT-…` is still classified as Windows: it means a Windows machine
+//! whose `PATH` reaches Git for Windows / Cygwin `uname` (native sshd with a
+//! Git install is the common case), not a POSIX OS. The result is cached in
+//! the remote host profile so later connects skip the extra exec.
 
 use crate::host::ssh::remote_host_history_store::{RemoteHostAuthProfile, RemoteHostProfile};
 use crate::host::ssh::remote_host_secret_store::{
@@ -21,8 +23,11 @@ use std::fmt;
 use std::str::FromStr;
 
 /// One-shot probe command sent to a remote SSH target to classify its shell.
-/// Present on every POSIX target (Linux, macOS, WSL, *BSD); not found on a
-/// Windows target running native OpenSSH.
+/// Present on every POSIX target (Linux, macOS, WSL, *BSD). On a Windows
+/// target running native OpenSSH it is either missing (exit non-zero) or
+/// answered by Git for Windows / Cygwin `uname` (exit 0 with an
+/// `MSYS_NT-…`-style kernel name); both shapes are classified by
+/// [`SshRemoteShellDetector`].
 pub const REMOTE_SHELL_PROBE_COMMAND: &str = "uname -s";
 
 /// Shell family of a remote SSH target.
@@ -35,10 +40,11 @@ pub enum RemoteShellKind {
     /// command generators currently emit POSIX scripts only.
     #[default]
     Posix,
-    /// Windows target reached through native OpenSSH (Win32-OpenSSH). MSYS /
-    /// Cygwin sshd setups also answer `uname` and are misclassified here;
-    /// they are a known unsupported configuration
-    /// (`docs/windows-ssh-target-design.md` §1).
+    /// Windows target reached through native OpenSSH (Win32-OpenSSH). A
+    /// Windows machine with Git for Windows / Cygwin `uname` on `PATH`
+    /// (`MSYS_NT-…`, `MINGW*_NT-…`, `CYGWIN_NT-…` answers) is classified
+    /// here too; an actual MSYS/Cygwin *sshd* is a known unsupported
+    /// configuration (`docs/windows-ssh-target-design.md` §1).
     Windows,
 }
 
@@ -61,6 +67,20 @@ impl FromStr for RemoteShellKind {
             other => Err(format!("unknown remote shell kind `{other}`")),
         }
     }
+}
+
+/// `uname -s` answers that identify a Windows machine with Git for Windows /
+/// Cygwin on `PATH` (native sshd delivers the command to `cmd.exe`, which
+/// resolves `uname` from `C:\Program Files\Git\usr\bin` when the installer
+/// added it to the system `PATH`). A real POSIX kernel name never contains
+/// these tokens.
+fn stdout_is_windows_uname(stdout: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stdout);
+    let Some(first_line) = text.lines().next() else {
+        return false;
+    };
+    let upper = first_line.trim().to_ascii_uppercase();
+    upper.contains("MSYS") || upper.contains("MINGW") || upper.contains("CYGWIN")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,13 +150,16 @@ where
     E: RemoteSshExecutor,
     E::Error: ToString,
 {
-    /// Runs the probe and classifies the target by exit code.
+    /// Runs the probe and classifies the target.
     ///
-    /// Exit code 0 means POSIX; any executed-but-non-zero exit (command not
-    /// found, shell failure) means Windows. Errors from `exec` itself — SSH
-    /// connect, authentication, channel setup — describe a failed SSH session,
-    /// not a Windows shell, and propagate unchanged instead of being
-    /// misclassified as Windows.
+    /// Exit code 0 means POSIX, except when the `uname` answer is an
+    /// MSYS/Mingw/Cygwin kernel name (`MSYS_NT-…`, `MINGW64_NT-…`,
+    /// `CYGWIN_NT-…`): that is a Windows machine with Git for Windows /
+    /// Cygwin on `PATH`, not a POSIX OS. Any executed-but-non-zero exit
+    /// (command not found, shell failure) means Windows. Errors from `exec`
+    /// itself — SSH connect, authentication, channel setup — describe a
+    /// failed SSH session, not a Windows shell, and propagate unchanged
+    /// instead of being misclassified as Windows.
     pub fn detect_remote_shell(
         &self,
         profile: &RemoteHostProfile,
@@ -153,11 +176,13 @@ where
             .ssh_executor
             .exec(&target, REMOTE_SHELL_PROBE_COMMAND, None)
             .map_err(|error| RemoteShellDetectError::new(error.to_string()))?;
-        Ok(if output.status == 0 {
-            RemoteShellKind::Posix
-        } else {
-            RemoteShellKind::Windows
-        })
+        Ok(
+            if output.status == 0 && !stdout_is_windows_uname(&output.stdout) {
+                RemoteShellKind::Posix
+            } else {
+                RemoteShellKind::Windows
+            },
+        )
     }
 }
 
@@ -301,6 +326,29 @@ mod tests {
         assert_eq!(calls[0].0.user, "kk");
         assert_eq!(calls[0].1, REMOTE_SHELL_PROBE_COMMAND);
         assert_eq!(calls[0].2, None);
+    }
+
+    #[test]
+    fn remote_shell_detection_classifies_msys_uname_answer_as_windows() {
+        // Native Win32-OpenSSH with Git for Windows on PATH: cmd.exe resolves
+        // `uname` from Git's usr\bin, which answers exit 0 with an MSYS kernel
+        // name. The target is still a Windows machine and needs the
+        // PowerShell pipeline.
+        for stdout in [
+            b"MSYS_NT-10.0-19045\n".to_vec(),
+            b"MINGW64_NT-10.0-22631\n".to_vec(),
+            b"CYGWIN_NT-10.0-19045\n".to_vec(),
+        ] {
+            let (detector, _calls) = detector_with_output(RemoteSshOutput {
+                status: 0,
+                stdout,
+                stderr: Vec::new(),
+            });
+
+            let kind = detector.detect_remote_shell(&key_auth_profile()).unwrap();
+
+            assert_eq!(kind, RemoteShellKind::Windows);
+        }
     }
 
     #[test]

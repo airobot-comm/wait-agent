@@ -362,18 +362,19 @@ mod tests {
 
     #[test]
     fn remote_host_port_probe_windows_command_enumerates_tcp_listeners() {
+        use crate::host::ssh::ssh_remote_host_bootstrapper::decode_powershell_command;
         let command = windows_remote_probe_command(&RemotePortProbePreference::Auto);
 
-        assert!(command.starts_with("powershell -NoProfile -NonInteractive -Command \""));
-        assert!(command.contains("GetActiveTcpListeners"));
-        assert!(command.contains("7474..7574"));
-        assert!(command.contains("port="));
-        assert!(command.contains("exit 0"));
-        assert!(command.contains("exit 1"));
-        assert!(!command.contains("ss -ltn"));
+        let script = decode_powershell_command(&command);
+        assert!(script.contains("GetActiveTcpListeners"));
+        assert!(script.contains("7474..7574"));
+        assert!(script.contains("port="));
+        assert!(script.contains("exit 0"));
+        assert!(script.contains("exit 1"));
+        assert!(!script.contains("ss -ltn"));
 
         let fixed = windows_remote_probe_command(&RemotePortProbePreference::Port(7476));
-        assert!(fixed.contains("@(7476)"));
+        assert!(decode_powershell_command(&fixed).contains("@(7476)"));
     }
 
     #[test]
@@ -381,6 +382,7 @@ mod tests {
         use crate::host::ssh::remote_host_secret_store::{
             MemoryRemoteHostSecretStore, RemoteHostSecretId, RemoteHostSecretValue,
         };
+        use crate::host::ssh::ssh_remote_host_bootstrapper::decode_powershell_command;
         let ssh_id = RemoteHostSecretId::new("waitagent.remote-host.win.ssh-password").unwrap();
         let store = MemoryRemoteHostSecretStore::default();
         store
@@ -425,11 +427,12 @@ mod tests {
         assert_eq!(result.port, 7475);
         let calls = calls.borrow();
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].1.contains("GetActiveTcpListeners"));
+        let script = decode_powershell_command(&calls[0].1);
+        assert!(script.contains("GetActiveTcpListeners"));
         assert!(calls[0]
             .1
-            .starts_with("powershell -NoProfile -NonInteractive -Command \""));
-        assert!(!calls[0].1.contains("ss -ltn"));
+            .starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "));
+        assert!(!script.contains("ss -ltn"));
     }
     #[test]
     fn remote_host_port_probe_uses_in_process_ssh_executor() {

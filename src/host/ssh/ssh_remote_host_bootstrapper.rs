@@ -1033,18 +1033,42 @@ fn sudo_shell_command(remote_command: &str) -> String {
 }
 
 /// Wrap a PowerShell script in the explicit
-/// `powershell -NoProfile -NonInteractive -Command` invocation used for every
-/// Windows remote command, so nothing depends on the target sshd's
+/// `powershell -NoProfile -NonInteractive -EncodedCommand` invocation used
+/// for every Windows remote command, so nothing depends on the target sshd's
 /// DefaultShell configuration.
 ///
-/// Stock Win32-OpenSSH feeds the command line to cmd.exe, so the script is
-/// enclosed in double quotes and every inner `"` is escaped for PowerShell as
-/// `` `" `` (cmd passes both characters through literally inside quotes).
-/// Generated scripts avoid cmd metacharacters — `%VAR%` references are
-/// written as `$env:VAR` instead.
+/// The script is base64-encoded UTF-16LE, which survives every delivery layer
+/// untouched: sshd feeds the command line to the target's default shell
+/// (stock Win32-OpenSSH uses cmd.exe; some hosts set PowerShell or even
+/// git-bash), and each of those re-parses quoting differently. The earlier
+/// `-Command "…"` wrapper with `` `" `` escapes was verified to be mangled by
+/// cmd.exe's argv parsing (inner quotes toggled instead of escaping), so the
+/// payload is encoded instead of quoted — base64 contains no characters any
+/// of these shells treat specially.
 pub(crate) fn powershell_command(script: &str) -> String {
-    let escaped = script.replace('"', "`\"");
-    format!("powershell -NoProfile -NonInteractive -Command \"{escaped}\"")
+    let utf16_le: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &utf16_le);
+    format!("powershell -NoProfile -NonInteractive -EncodedCommand {encoded}")
+}
+
+/// Decode a command produced by [`powershell_command`] back into the
+/// original script. Test-only helper so assertions can keep checking the
+/// plain script content instead of the base64 payload.
+#[cfg(test)]
+pub(crate) fn decode_powershell_command(command: &str) -> String {
+    let encoded = command
+        .strip_prefix("powershell -NoProfile -NonInteractive -EncodedCommand ")
+        .expect("command must use the EncodedCommand wrapper");
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim())
+        .expect("EncodedCommand payload must be valid base64");
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    String::from_utf16(&units).expect("EncodedCommand payload must be UTF-16LE")
 }
 
 /// Quote a value as a PowerShell single-quoted string literal.
@@ -1222,7 +1246,15 @@ mod tests {
                 stdin.map(str::to_string),
             ));
             let status = self.statuses.borrow_mut().pop().unwrap_or(0);
-            let stdout = if command.contains("__generate-node-credentials") {
+            // Windows commands carry a base64-encoded payload; decode before
+            // matching substrings so fixtures key off the plain script.
+            let plain_command =
+                if command.starts_with("powershell -NoProfile -NonInteractive -EncodedCommand ") {
+                    decode_powershell_command(command)
+                } else {
+                    command.to_string()
+                };
+            let stdout = if plain_command.contains("__generate-node-credentials") {
                 self.credentials_stdout
                     .borrow_mut()
                     .take()
@@ -1359,27 +1391,31 @@ mod tests {
             assert_eq!(target.host, "192.168.1.6");
             assert_eq!(target.user, "jj");
             assert!(
-                command.starts_with("powershell -NoProfile -NonInteractive -Command \""),
+                command.starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
                 "every windows remote command must be an explicit powershell exec: {command}"
             );
             assert_eq!(*stdin, None, "windows flow must never use sudo stdin");
         }
-        assert!(calls[0].1.contains("New-Item"));
-        assert!(calls[0].1.contains("USERPROFILE"));
-        assert!(calls[1].1.contains("Test-Path"));
-        assert!(calls[1].1.contains("--version"));
-        assert!(calls[2].1.contains("curl.exe"));
-        assert!(calls[2].1.contains("tar.exe"));
-        assert!(calls[2].1.contains("LOCALAPPDATA"));
-        assert!(calls[2].1.contains("version.txt"));
-        assert!(calls[3].1.contains("__generate-node-credentials"));
-        assert!(calls[4].1.contains("authorized_operators"));
-        assert!(calls[5].1.contains("Get-CimInstance"));
-        assert!(calls[5].1.contains("--port 7476"));
-        assert!(calls[6].1.contains("__ratatui-node-server"));
-        assert!(calls[6].1.contains("--node-id '192.168.1.6#7476'"));
-        assert!(!calls[6].1.contains("nohup"));
-        assert!(!calls.iter().any(|(_, command, _)| command.contains("sudo")));
+        let scripts: Vec<String> = calls
+            .iter()
+            .map(|(_, command, _)| decode_powershell_command(command))
+            .collect();
+        assert!(scripts[0].contains("New-Item"));
+        assert!(scripts[0].contains("USERPROFILE"));
+        assert!(scripts[1].contains("Test-Path"));
+        assert!(scripts[1].contains("--version"));
+        assert!(scripts[2].contains("curl.exe"));
+        assert!(scripts[2].contains("tar.exe"));
+        assert!(scripts[2].contains("LOCALAPPDATA"));
+        assert!(scripts[2].contains("version.txt"));
+        assert!(scripts[3].contains("__generate-node-credentials"));
+        assert!(scripts[4].contains("authorized_operators"));
+        assert!(scripts[5].contains("Get-CimInstance"));
+        assert!(scripts[5].contains("--port 7476"));
+        assert!(scripts[6].contains("__ratatui-node-server"));
+        assert!(scripts[6].contains("--node-id '192.168.1.6#7476'"));
+        assert!(!scripts[6].contains("nohup"));
+        assert!(!scripts.iter().any(|script| script.contains("sudo")));
     }
 
     #[test]
@@ -1440,8 +1476,9 @@ mod tests {
         assert!(error.to_string().contains("--public <host:port>"));
         let calls = calls.borrow();
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].1.contains("TcpClient"));
-        assert!(calls[0].1.contains("192.168.31.178"));
+        let script = decode_powershell_command(&calls[0].1);
+        assert!(script.contains("TcpClient"));
+        assert!(script.contains("192.168.31.178"));
     }
 
     #[test]
@@ -1473,25 +1510,20 @@ mod tests {
         );
 
         let version = env!("CARGO_PKG_VERSION");
-        assert!(plan
-            .install_or_update_command
-            .contains(&format!("waitagent-{version}-x86_64-windows.zip")));
-        assert!(plan.install_or_update_command.contains("curl.exe"));
-        assert!(plan.install_or_update_command.contains("tar.exe"));
-        assert!(plan.install_or_update_command.contains("LOCALAPPDATA"));
+        let install = decode_powershell_command(&plan.install_or_update_command);
+        assert!(install.contains(&format!("waitagent-{version}-x86_64-windows.zip")));
+        assert!(install.contains("curl.exe"));
+        assert!(install.contains("tar.exe"));
+        assert!(install.contains("LOCALAPPDATA"));
         assert!(plan.start_plan.endpoint_preflight_command.is_empty());
-        assert!(!plan.start_plan.command.contains("--connect"));
-        assert!(plan
-            .start_plan
-            .command
-            .contains("--node-id '192.168.1.6#7476'"));
-        assert!(plan.start_plan.command.contains("__ratatui-node-server"));
-        assert!(!plan.start_plan.command.contains("nohup"));
-        assert!(plan
-            .start_plan
-            .credentials_command
-            .contains("__generate-node-credentials"));
-        assert!(plan.start_plan.credentials_command.contains("node.key"));
+        let start = decode_powershell_command(&plan.start_plan.command);
+        assert!(!start.contains("--connect"));
+        assert!(start.contains("--node-id '192.168.1.6#7476'"));
+        assert!(start.contains("__ratatui-node-server"));
+        assert!(!start.contains("nohup"));
+        let credentials = decode_powershell_command(&plan.start_plan.credentials_command);
+        assert!(credentials.contains("__generate-node-credentials"));
+        assert!(credentials.contains("node.key"));
         assert!(plan.start_plan.outbound_dial);
     }
 
@@ -1502,9 +1534,10 @@ mod tests {
             Some("http://127.0.0.1:7897"),
         );
 
-        assert!(command.contains("$env:ALL_PROXY = 'socks5://127.0.0.1:7897'"));
-        assert!(command.contains("$env:HTTPS_PROXY = 'http://127.0.0.1:7897'"));
-        assert!(command.contains("curl.exe -fsSL"));
+        let script = decode_powershell_command(&command);
+        assert!(script.contains("$env:ALL_PROXY = 'socks5://127.0.0.1:7897'"));
+        assert!(script.contains("$env:HTTPS_PROXY = 'http://127.0.0.1:7897'"));
+        assert!(script.contains("curl.exe -fsSL"));
     }
 
     #[test]
@@ -1512,11 +1545,12 @@ mod tests {
         let command =
             windows_install_reachability_preflight_command(Some("socks5://127.0.0.1:7897"), None);
 
-        assert!(command.contains("curl.exe -fsSL"));
-        assert!(command.contains("-o NUL"));
-        assert!(command.contains("$env:ALL_PROXY = 'socks5://127.0.0.1:7897'"));
-        assert!(!command.contains("$env:HTTPS_PROXY"));
-        assert!(command.contains("exit $LASTEXITCODE"));
+        let script = decode_powershell_command(&command);
+        assert!(script.contains("curl.exe -fsSL"));
+        assert!(script.contains("-o NUL"));
+        assert!(script.contains("$env:ALL_PROXY = 'socks5://127.0.0.1:7897'"));
+        assert!(!script.contains("$env:HTTPS_PROXY"));
+        assert!(script.contains("exit $LASTEXITCODE"));
     }
 
     #[test]

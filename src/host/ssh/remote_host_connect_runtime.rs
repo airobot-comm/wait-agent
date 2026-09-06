@@ -206,7 +206,7 @@ where
                     .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
             }
         }
-        let remote_shell = profile.remote_shell.unwrap_or_default();
+        let mut remote_shell = profile.remote_shell.unwrap_or_default();
 
         // Fast path: if the remote waitagent is still running from a previous
         // connection, dial it directly using the stored TLS pin and operator key
@@ -219,9 +219,37 @@ where
 
         let preference = port_preference(&profile.preferred_remote_port);
         let port_probe = self.port_probe_factory.create(&profile, remote_shell);
-        let port = port_probe
-            .choose_remote_port(&preference, &request.local_connect_endpoint)
-            .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+        let port = match port_probe.choose_remote_port(&preference, &request.local_connect_endpoint)
+        {
+            Ok(port) => port,
+            Err(probe_error) => {
+                // Heal a stale or wrong cached shell kind: a POSIX probe fails
+                // on a Windows host whose `uname` is Git for Windows /
+                // Cygwin (classified Posix by older builds and cached). Probe
+                // failure aborts the connect anyway, so re-detect once; if
+                // the kind flipped, persist it and retry with the matching
+                // pipeline. Genuine POSIX hosts re-detect as Posix and the
+                // original error is returned.
+                let fresh = self
+                    .shell_detector
+                    .detect_remote_shell(&profile)
+                    .map_err(|_| LifecycleError::Protocol(probe_error.to_string()))?;
+                if fresh == remote_shell {
+                    return Err(LifecycleError::Protocol(probe_error.to_string()));
+                }
+                profile.remote_shell = Some(fresh);
+                remote_shell = fresh;
+                if request.profile_name.is_some() {
+                    self.history_store
+                        .upsert_profile(profile.clone())
+                        .map_err(|error| LifecycleError::Protocol(error.to_string()))?;
+                }
+                self.port_probe_factory
+                    .create(&profile, remote_shell)
+                    .choose_remote_port(&preference, &request.local_connect_endpoint)
+                    .map_err(|error| LifecycleError::Protocol(error.to_string()))?
+            }
+        };
         let authority_node_id = authority_id_for_profile_port(&profile, port.port);
         let existing_endpoint = self.find_online_target_for_authority(&authority_node_id)?;
         let mut plan = RemoteHostBootstrapPlan::from_profile(
@@ -1402,16 +1430,22 @@ mod tests {
             .install_reachability_preflight_command
             .as_deref()
             .expect("windows connect must still preflight install reachability");
-        assert!(preflight.contains("curl.exe"));
-        assert!(preflight.contains("-o NUL"));
-        assert!(!preflight.contains("sh -lc"));
-        assert!(plans[0].install_or_update_command.contains("curl.exe"));
-        assert!(plans[0].install_or_update_command.contains("tar.exe"));
-        assert!(!plans[0].install_or_update_command.contains("sh -lc"));
+        let preflight_script =
+            crate::host::ssh::ssh_remote_host_bootstrapper::decode_powershell_command(preflight);
+        assert!(preflight_script.contains("curl.exe"));
+        assert!(preflight_script.contains("-o NUL"));
+        assert!(!preflight_script.contains("sh -lc"));
+        let install_script =
+            crate::host::ssh::ssh_remote_host_bootstrapper::decode_powershell_command(
+                &plans[0].install_or_update_command,
+            );
+        assert!(install_script.contains("curl.exe"));
+        assert!(install_script.contains("tar.exe"));
+        assert!(!install_script.contains("sh -lc"));
         assert!(plans[0]
             .start_plan
             .command
-            .starts_with("powershell -NoProfile -NonInteractive -Command \""));
+            .starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "));
     }
 
     #[test]

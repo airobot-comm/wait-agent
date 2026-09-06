@@ -38,13 +38,18 @@
 
 ```
 命令: uname -s
-- 退出码 0        → Posix（Linux/macOS/WSL 都覆盖）
+- 退出码 0 且输出不是 MSYS/MINGW/CYGWIN 内核名 → Posix（Linux/macOS/WSL 都覆盖）
+- 退出码 0 且输出是 MSYS_NT-…/MINGW*_NT-…/CYGWIN_NT-… → Windows（见下）
 - 失败/找不到     → Windows
 ```
 
-风险与缓解：目标机是装了 Cygwin/MSYS sshd 且默认 shell 为 bash 的 Windows 时，`uname`
-会误报 Posix——该场景下后续 POSIX 启动脚本（nohup）也会失败，属于已知限制，文档标注。
-WSL 不受影响（`uname` 返回 Linux，正确）。探测结果可选缓存进
+风险与缓解：目标机的 `uname` 可能是 Git for Windows / Cygwin 提供的（native sshd +
+系统 PATH 含 `C:\Program Files\Git\usr\bin` 是开发机常见配置），此时退出码也是 0，
+输出为 `MSYS_NT-…`——必须按 **输出内容** 分类为 Windows（真 POSIX 内核名不会含这些
+token）。真实装了 Cygwin/MSYS **sshd** 且默认 shell 为 bash 的 Windows 仍会被归为
+Windows 但命令经 bash 传递会被展开破坏，属于已知限制，文档标注；缓解是 connect
+runtime 在端口探测失败时用新分类重探测一次并修正缓存（自愈旧缓存）。WSL 不受影响
+（`uname` 返回 Linux，正确）。探测结果可选缓存进
 `RemoteHostProfile`（新增 `remote_shell` 字段），后续 connect 跳过探测。
 
 Windows 侧执行统一显式调 `powershell -NoProfile -NonInteractive -Command <脚本>`
@@ -115,7 +120,9 @@ sshd 把每个 exec 会话跑在带 kill-on-close 的 Job Object 里，SSH 断�
 
 1. **进程存活**：选 A（自守护化 + `CREATE_BREAKAWAY_FROM_JOB`）。
 2. **目标机 SSH 要求**：只支持 Windows 自带的 native OpenSSH（Win32-OpenSSH，可选功能）；
-   MSYS/Cygwin sshd 为已知不支持，文档标注。此决定下 `uname` 探测方案成立。
+   MSYS/Cygwin **sshd** 为已知不支持，文档标注。native sshd + Git for Windows 在
+   PATH（`uname` 回答 `MSYS_NT-…` 但登录 shell 是 cmd）按输出内容归类为 Windows，
+   正常使用。探测失败时 connect runtime 会用新分类重探测并修正缓存（自愈）。
 3. **安装目录**：`%LOCALAPPDATA%\Programs\waitagent\`（与本地 irm 安装器一致，按用户、免管理员）。
 4. **密钥登录**：与密码登录同在验证范围（E2E 两种都测）。
 5. **提权等价物**：Linux 上 sudo 仅用于"装到 /usr/local/bin"这一步；Windows 按用户安装
