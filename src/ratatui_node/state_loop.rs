@@ -625,7 +625,7 @@ fn handle_client_command_event(
     }
 
     if let ClientCommand::ConnectRemoteHost { profile_name } = &command {
-        connect_remote_host_target(
+        let outcome = connect_remote_host_target(
             shared,
             remote_owner,
             client_id,
@@ -633,6 +633,17 @@ fn handle_client_command_event(
             connecting_profiles,
             state_event_tx,
         );
+        if let CommandOutcome::Error(message) = &outcome {
+            // The duplicate-guard rejection never becomes a
+            // RemoteHostConnectResult event; without this write the
+            // client's connect popup would spin on "connecting" forever.
+            ERROR_LOG.log(format!(
+                "[ratatui-state-loop] connect rejected for `{profile_name}`: {message}"
+            ));
+            let response: ControlResponse = outcome.into();
+            let payload = response_json(&response);
+            client_writer.send(ClientWriterRequest::Write { client_id, payload });
+        }
         return;
     }
 
