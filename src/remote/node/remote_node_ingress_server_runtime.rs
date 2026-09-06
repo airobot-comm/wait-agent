@@ -1755,13 +1755,23 @@ fn run_node_ingress_server_loop<
                 if has_active_ingress_session_for_node(&sessions, &node_id)
                     || pending_outbound_dials.contains(&node_id)
                 {
+                    ERROR_LOG.log(format!(
+                        "[remote-node-ingress] skipping duplicate outbound dial for node {node_id} (active_session={}, pending_dial={})",
+                        has_active_ingress_session_for_node(&sessions, &node_id),
+                        pending_outbound_dials.contains(&node_id)
+                    ));
                     continue;
                 }
                 pending_outbound_dials.insert(node_id.clone());
+                ERROR_LOG.log(format!(
+                    "[remote-node-ingress] dialing node {node_id} endpoint={}",
+                    request.endpoint_uri
+                ));
 
                 let outbound_transport = outbound_transport.clone();
                 let outbound_guard_tx = outbound_guard_tx.clone();
                 let outbound_transport_tx = outbound_transport_tx.clone();
+                let dial_node_id = node_id.clone();
                 thread::spawn(move || {
                     let result =
                         outbound_transport.connect_outbound(request, outbound_transport_tx);
@@ -1770,7 +1780,7 @@ fn run_node_ingress_server_loop<
                             "[remote-node-ingress] outbound connection failed: {error}"
                         ));
                     }
-                    let _ = outbound_guard_tx.send((node_id, result));
+                    let _ = outbound_guard_tx.send((dial_node_id, result));
                 });
             }
             IngressServerEvent::Internal(InternalEvent::CloseNodeIngressSession { node_id }) => {
