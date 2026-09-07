@@ -4,6 +4,14 @@
 
 ## 当前进度
 
+路线图全部阶段（1–9）已完成。最后的真机验收（2026-09-07）：
+
+- Windows 宿主 → Windows 目标（1.6）SSH 连接、主 pane 输入输出正常。
+- Windows 宿主 → Ubuntu 目标（1.9）连接成功，sidebar 聚合显示目标机上多个 node session。
+- operator 认证被拒绝时 connect 直接报错并给出清理指引，不再 fallback 堆 node（v0.1.73）。
+
+## 历史阶段记录
+
 - 阶段 2 已完成：本地 IPC 从 Unix Domain Socket 切换到跨平台的 `LocalListener`/`LocalStream`。
   - Unix 继续走 UDS。
   - Windows 走 `127.0.0.1:<port>` TCP 回环 + marker 文件做服务发现。
@@ -17,7 +25,7 @@
   - Linux 验证：`cargo test --release`、`cargo clippy -- -D warnings`、`cargo fmt --check` 全绿。
   - Windows 行为需在真实 Windows 环境或 CI 上验证（阶段 8）。
 
-## 剩余阶段
+## 阶段记录
 
 ### 阶段 4：Windows 本地 PTY
 
@@ -101,15 +109,27 @@
 
 验收状态：GitHub Actions `windows-latest` 上 6 个 job 全绿（run 对 `47be311`，含 windows-test 533 passed / 0 failed）。`cargo test --release` 在真实 Windows 上通过。诚实备注：交互式人工端到端（真机 TUI 里启动 server、attach session、跑 agent、连远程 host）未执行——CI 测试已覆盖其中的可编程部分（本地 PTY spawn、signal env、bundle 提取、粘贴分发等），剩余为人工体验验证，发现问题按阶段 8 流程继续修。
 
-## 阶段 9：Windows-as-SSH-target（进行中）
+## 阶段 9：Windows-as-SSH-target ✅
 
-- 目标：Ctrl+W 通过 SSH 把 waitagent 装进 Windows 目标机（当前 bootstrap 全流程是 POSIX
+- 目标：Ctrl+W 通过 SSH 把 waitagent 装进 Windows 目标机（此前 bootstrap 全流程是 POSIX
   shell 脚本，Windows 目标在端口探测阶段即失败）。
 - 方案已固化：`docs/windows-ssh-target-design.md`（含管线解剖、PowerShell 命令生成器、
   进程存活设计、讨论结论）。
 - 硬性要求：目标机使用 Windows 自带 native OpenSSH（Win32-OpenSSH）；MSYS/Cygwin sshd
   不支持。安装目录 `%LOCALAPPDATA%\Programs\waitagent\`（与本地 irm 安装器一致，按用户、
   免管理员）；密码与密钥登录均在验证范围。
+- 发布与真机验收（v0.1.68 → v0.1.73）：
+  - `ae27cba` 实现 Windows SSH target（PowerShell 命令生成器、Windows 安装目录、
+    远端 shell 探测 Git-for-Windows 伪装）。
+  - `8d38a2e` 重复 connect 排队而非拒绝（修复 first-connect in-progress 报错）。
+  - `f62cd20` 修复 ingress owner 控制监听在 Windows 上的绑定。
+  - `8092bc2` 修复 reconnect-before-ingress 竞态不再堆冗余远端 node。
+  - `fd60ca7` 远端多 node 聚合：SSH 枚举 marker 端口 + sibling dial。
+  - `c7ac350` operator 认证被拒绝时 connect 直接报错并给出清理指引，禁止 fallback
+    bootstrap 堆 node。
+  - 真机验证通过（2026-09-07）：Windows 宿主 → Windows 目标（1.6）与 → Ubuntu 目标
+    （1.9）均连接成功、主 pane 输入输出正常、多 node session 全部出现在 sidebar；
+    README 已写明 Windows 目标机 OpenSSH Server 安装方式。
 
 ## 通用约束
 
