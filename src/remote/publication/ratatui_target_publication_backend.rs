@@ -193,6 +193,21 @@ impl RemoteTargetPublicationBackend for RatatuiRemoteTargetPublicationBackend {
         Ok(())
     }
 
+    fn signal_remote_node_auth_rejected(
+        &self,
+        node_id: &str,
+        message: &str,
+    ) -> Result<(), LifecycleError> {
+        let _ = self
+            .shared
+            .state_sender()
+            .send(StateEvent::RemoteNodeAuthRejected {
+                node_id: node_id.to_string(),
+                message: message.to_string(),
+            });
+        Ok(())
+    }
+
     fn record_inbound_remote_node_connection(
         &self,
         node_id: &str,

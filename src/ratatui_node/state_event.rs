@@ -102,6 +102,12 @@ pub(crate) enum StateEvent {
     /// Any remote-peer sessions that were views into that node are stale and
     /// should be removed from the local catalog.
     RemoteNodeOffline { node_id: String },
+    /// A remote peer actively rejected this host's operator key during the
+    /// outbound dial. Re-dialing cannot succeed until the stale authorized
+    /// operator keys are removed on the remote host, so the connect flow must
+    /// not fall back to an SSH bootstrap that would only spawn redundant
+    /// node servers.
+    RemoteNodeAuthRejected { node_id: String, message: String },
     /// A remote peer that was offline has re-established its gRPC node session.
     /// This cancels any outbound-dial retry worker for the node and lets
     /// per-session reconnect workers proceed.

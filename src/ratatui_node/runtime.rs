@@ -146,6 +146,11 @@ pub(crate) struct SharedState {
     /// Connection metadata for remote peers, keyed by `authority_node_id`.
     /// Accessed only from `StateEventLoop`.
     pub(crate) remote_node_connections: Mutex<HashMap<String, RemoteNodeConnectionInfo>>,
+    /// Nodes that rejected this host's operator key during an outbound dial,
+    /// keyed by `authority_node_id` with the rejection message. Written by
+    /// `StateEventLoop`; read by the remote host connect flow to refuse the
+    /// SSH bootstrap fallback. Cleared when the node later comes online.
+    pub(crate) remote_node_auth_rejections: Mutex<HashMap<String, String>>,
 }
 
 /// Runtime configuration for agent lifecycle signals.
@@ -228,6 +233,7 @@ impl SharedState {
             ingress_internal_tx: Mutex::new(None),
             process_monitor: Mutex::new(None),
             remote_node_connections: Mutex::new(HashMap::new()),
+            remote_node_auth_rejections: Mutex::new(HashMap::new()),
         }))
     }
 }
@@ -361,6 +367,16 @@ impl SharedState {
 
     pub(crate) fn remote_node_connection(&self, node_id: &str) -> Option<RemoteNodeConnectionInfo> {
         self.remote_node_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(node_id)
+            .cloned()
+    }
+
+    /// The operator-auth rejection message recorded for `node_id`, if the
+    /// remote node actively refused this host's operator key.
+    pub(crate) fn remote_node_auth_rejection(&self, node_id: &str) -> Option<String> {
+        self.remote_node_auth_rejections
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(node_id)

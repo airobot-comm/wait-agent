@@ -364,6 +364,11 @@ fn run_state_event_loop(
 
             StateEvent::RemoteNodeOnline { node_id } => {
                 offline_nodes.remove(&node_id);
+                shared
+                    .remote_node_auth_rejections
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&node_id);
                 if let Some(worker) = outbound_dial_retry_handles.remove(&node_id) {
                     let _ = worker.cancel_tx.send(());
                 }
@@ -374,6 +379,17 @@ fn run_state_event_loop(
                     let _ = worker.cancel_tx.send(());
                 }
                 last_retry_reset.remove(&node_id);
+            }
+
+            StateEvent::RemoteNodeAuthRejected { node_id, message } => {
+                ERROR_LOG.log(format!(
+                    "[ratatui-state-loop] remote node {node_id} rejected operator authentication: {message}"
+                ));
+                shared
+                    .remote_node_auth_rejections
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(node_id.clone(), message.clone());
             }
 
             StateEvent::RemoteNodeReachable { node_id } => {
@@ -2013,13 +2029,17 @@ fn perform_remote_host_connect(
         use_install_proxy: true,
     };
 
+    let auth_rejection_shared = shared.clone();
     let runtime = RemoteHostConnectRuntime::new(
         history_store.clone(),
         SshRemotePortProbeFactory,
         SshRemoteHostBootstrapper::default(),
         target_registry,
         session_creation,
-    );
+    )
+    .with_auth_rejection_checker(Arc::new(move |node_id| {
+        auth_rejection_shared.remote_node_auth_rejection(node_id)
+    }));
 
     let outcome = runtime
         .connect(request, |request: OutboundNodeSessionRequest| {

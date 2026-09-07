@@ -141,6 +141,19 @@ pub trait RemoteTargetPublicationBackend: Clone + Send + Sync + 'static {
     /// Signal that a remote node that was offline has reconnected.
     fn signal_remote_node_online(&self, node_id: &str) -> Result<(), LifecycleError>;
 
+    /// Signal that a remote node actively rejected this host's operator key
+    /// during the outbound dial (operator challenge failed). Unlike an
+    /// offline node, re-dialing cannot succeed until the remote host removes
+    /// the stale authorized operator keys.
+    fn signal_remote_node_auth_rejected(
+        &self,
+        node_id: &str,
+        message: &str,
+    ) -> Result<(), LifecycleError> {
+        let _ = (node_id, message);
+        Ok(())
+    }
+
     /// Record metadata for an inbound `--connect` peer so the state loop can
     /// choose the correct offline timeout.
     fn record_inbound_remote_node_connection(

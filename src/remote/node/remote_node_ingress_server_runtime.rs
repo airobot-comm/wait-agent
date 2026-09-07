@@ -1669,7 +1669,19 @@ fn run_node_ingress_server_loop<
                 Err(error) => {
                     // The worker thread already logged the error; nothing else
                     // to do here.
-                    let _ = error;
+                    let error_message = error.to_string();
+                    if is_operator_auth_rejection(&error_message) {
+                        ERROR_LOG.log_error(format!(
+                            "[remote-node-ingress] node {node_id} rejected operator authentication; refusing SSH bootstrap fallback"
+                        ));
+                        if let Err(signal_error) = publication_runtime
+                            .signal_remote_node_auth_rejected(&node_id, &error_message)
+                        {
+                            ERROR_LOG.log_error(format!(
+                                "ingress server: failed to signal auth rejection for {node_id}: {signal_error}"
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -2200,6 +2212,10 @@ fn publish_local_catalog_delta<G: LocalSessionCatalog>(
 
     active.published_sessions = active.observed_sessions.clone();
     Ok(())
+}
+
+fn is_operator_auth_rejection(error_message: &str) -> bool {
+    error_message.contains("Unauthenticated") || error_message.contains("operator challenge")
 }
 
 fn has_active_ingress_session_for_node(

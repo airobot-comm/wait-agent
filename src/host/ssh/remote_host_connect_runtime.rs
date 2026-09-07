@@ -86,7 +86,16 @@ pub struct RemoteHostConnectRuntime<H, P, B> {
     #[allow(dead_code)]
     session_creation_service: Arc<dyn SessionCreationPort>,
     operator_key_store: Arc<dyn OperatorKeyStore>,
+    /// When set, consulted while waiting for a dialed node to come online: if
+    /// the node rejected this host's operator key, the wait aborts with an
+    /// error instead of falling back to an SSH bootstrap that would only
+    /// spawn a redundant node server the dial would reject anyway.
+    auth_rejection: Option<AuthRejectionChecker>,
 }
+
+/// Reports whether the given node has actively rejected this host's operator
+/// key, returning the rejection message when it has.
+pub type AuthRejectionChecker = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 impl<H, P, B> RemoteHostConnectRuntime<H, P, B> {
     pub fn new(
@@ -142,7 +151,15 @@ impl<H, P, B> RemoteHostConnectRuntime<H, P, B> {
             target_registry,
             session_creation_service,
             operator_key_store,
+            auth_rejection: None,
         }
+    }
+
+    /// Install a checker that reports operator-auth rejections per node id
+    /// (see [`AuthRejectionChecker`]).
+    pub fn with_auth_rejection_checker(mut self, checker: AuthRejectionChecker) -> Self {
+        self.auth_rejection = Some(checker);
+        self
     }
 }
 
@@ -343,6 +360,7 @@ where
             &authority_node_id,
             DEFAULT_ENDPOINT_POLL_INTERVAL,
             DEFAULT_ENDPOINT_WAIT_TIMEOUT,
+            self.auth_rejection.as_ref(),
         )?;
         profile.last_remote_port = Some(port.port);
         profile.last_endpoint = Some(format!("{}:{}", profile.host, port.port));
@@ -440,6 +458,7 @@ where
             &authority_node_id,
             DEFAULT_ENDPOINT_POLL_INTERVAL,
             REUSE_CONNECTION_WAIT_TIMEOUT,
+            self.auth_rejection.as_ref(),
         ) {
             Ok(target) => Ok(Some(RemoteHostConnectOutcome {
                 authority_node_id,
@@ -447,6 +466,17 @@ where
                 reused_existing_endpoint: true,
             })),
             Err(error) => {
+                if is_auth_rejection_error(&error) {
+                    // The remote node actively refused this host's operator key.
+                    // Falling back to an SSH bootstrap would spawn yet another
+                    // node server whose dial would be rejected the same way, so
+                    // surface the error and the remediation instead.
+                    ERROR_LOG.log_error(format!(
+                        "[remote-host-connect] stored endpoint for {}:{} rejected operator authentication: {error}",
+                        profile.host, port
+                    ));
+                    return Err(error);
+                }
                 ERROR_LOG.log(format!(
                     "[remote-host-connect] stored endpoint for {}:{} did not come online, falling back to SSH bootstrap: {error}",
                     profile.host, port
@@ -461,10 +491,18 @@ where
         expected: &str,
         poll_interval: Duration,
         timeout: Duration,
+        auth_check: Option<&AuthRejectionChecker>,
     ) -> Result<ManagedSessionRecord, LifecycleError> {
         let expected = expected.to_string();
         let deadline = Instant::now() + timeout;
         loop {
+            if let Some(checker) = auth_check {
+                if let Some(message) = checker(&expected) {
+                    return Err(LifecycleError::Protocol(format!(
+                        "remote WaitAgent `{expected}` rejected this host's operator key ({message}). Re-dialing cannot succeed until the stale authorized operator keys are removed on the remote host: delete the `authorized_operators` directory (`rm -rf ~/.waitagent/authorized_operators` on Linux/macOS, `Remove-Item -Recurse $env:USERPROFILE\\.waitagent\\authorized_operators` in PowerShell on Windows), then reconnect"
+                    )));
+                }
+            }
             let targets = self
                 .target_registry
                 .list_targets_on_authority(&expected)
@@ -707,6 +745,12 @@ fn parse_remote_port(value: Option<&str>) -> Result<HistoryRemotePortPreference,
 
 fn authority_id_for_profile_port(profile: &RemoteHostProfile, remote_port: u16) -> String {
     format!("{}#{}", profile.host, remote_port)
+}
+
+fn is_auth_rejection_error(error: &LifecycleError) -> bool {
+    error
+        .to_string()
+        .contains("rejected this host's operator key")
 }
 
 fn operator_public_key_for_profile(
@@ -1029,6 +1073,59 @@ mod tests {
     }
 
     #[test]
+    fn remote_host_connect_refuses_fallback_when_operator_key_rejected() {
+        let path = unique_path("remote-host-connect-auth-rejected.toml");
+        let history = RemoteHostHistoryStore::new(&path);
+        let mut stored = profile();
+        stored.last_remote_port = Some(7476);
+        stored.tls_pin_sha256 = Some("deadbeef".to_string());
+        history.upsert_profile(stored).unwrap();
+        let bootstrap_plans = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(FakeRegistry::new(Vec::new()));
+        let runtime = RemoteHostConnectRuntime::new_with_keystore(
+            history,
+            FakeProbe {
+                calls: Arc::new(Mutex::new(0)),
+                port: 7476,
+            },
+            FakeBootstrapper {
+                plans: bootstrap_plans.clone(),
+                catalog_targets: None,
+            },
+            registry,
+            unused_session_creation(),
+            test_operator_key_store(),
+        )
+        .with_auth_rejection_checker(Arc::new(|_node_id| {
+            Some("operator challenge signature invalid".to_string())
+        }));
+
+        let error = runtime
+            .connect(
+                RemoteHostConnectRequest {
+                    profile_name: Some("130".to_string()),
+                    direct_profile: None,
+                    save_profile_name: None,
+                    replace_profile_name: None,
+                    local_connect_endpoint: "10.1.26.84:7474".to_string(),
+                    cwd_hint: None,
+                    use_install_proxy: true,
+                },
+                |_request| Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("rejected this host's operator key"));
+        assert!(
+            bootstrap_plans.lock().unwrap().is_empty(),
+            "auth rejection must not fall back to an SSH bootstrap"
+        );
+        crate::infra::best_effort::remove_file(path);
+    }
+
+    #[test]
     fn remote_host_connect_ignores_stale_endpoint_with_different_port() {
         let path = unique_path("remote-host-connect-ignore-stale.toml");
         let history = RemoteHostHistoryStore::new(&path);
@@ -1302,6 +1399,7 @@ mod tests {
                 "10.1.29.130#7476",
                 Duration::from_millis(0),
                 Duration::from_secs(1),
+                None,
             )
             .unwrap();
 
@@ -1332,6 +1430,7 @@ mod tests {
                 "10.1.29.130#7476",
                 Duration::from_millis(0),
                 Duration::from_millis(1),
+                None,
             )
             .unwrap_err();
 

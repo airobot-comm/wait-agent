@@ -276,6 +276,15 @@ impl<B: RemoteTargetPublicationBackend> RemoteTargetPublicationRuntime<B> {
         self.backend.signal_remote_node_online(node_id)
     }
 
+    pub fn signal_remote_node_auth_rejected(
+        &self,
+        node_id: &str,
+        message: &str,
+    ) -> Result<(), LifecycleError> {
+        self.backend
+            .signal_remote_node_auth_rejected(node_id, message)
+    }
+
     pub fn record_inbound_remote_node_connection(
         &self,
         node_id: &str,
