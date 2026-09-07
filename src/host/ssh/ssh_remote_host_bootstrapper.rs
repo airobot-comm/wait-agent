@@ -500,7 +500,11 @@ where
             "mkdir -p {dir} && printf '%s\\n' {} > {path}",
             shell_single_quote(public_key)
         );
-        self.run_ssh_command(plan, &command, true)?;
+        // Never sudo here: the directory lives under the target user's
+        // `$HOME`, and a sudo-wrapped command would expand `$HOME` to root's
+        // home, silently installing the key where the per-user node server
+        // never looks.
+        self.run_ssh_command(plan, &command, false)?;
         Ok(())
     }
 
@@ -1873,6 +1877,83 @@ mod tests {
         assert!(calls[4].1.contains("__ratatui-node-server"));
         assert_eq!(calls[4].2, None);
         assert!(!calls.iter().any(|(_, command, _)| command.contains("sudo")));
+    }
+
+    #[test]
+    fn remote_host_bootstrapper_installs_operator_key_without_sudo() {
+        use crate::infra::operator_auth::{MemoryOperatorKeyStore, OperatorKeyStore};
+        let ssh_id = RemoteHostSecretId::new("waitagent.remote-host.130.ssh-password").unwrap();
+        let sudo_id = RemoteHostSecretId::new("waitagent.remote-host.130.sudo-password").unwrap();
+        let store = MemoryRemoteHostSecretStore::default();
+        store
+            .put_secret(&ssh_id, RemoteHostSecretValue::new("ssh-secret"))
+            .unwrap();
+        store
+            .put_secret(&sudo_id, RemoteHostSecretValue::new("sudo-secret"))
+            .unwrap();
+        let profile = RemoteHostProfile {
+            name: "130".to_string(),
+            host: "10.1.29.130".to_string(),
+            ssh_user: "kk".to_string(),
+            auth: RemoteHostAuthProfile::Password {
+                password_secret_id: Some(ssh_id),
+            },
+            sudo_password_secret_id: Some(sudo_id),
+            preferred_remote_port: RemotePortPreference::Auto,
+            last_remote_port: None,
+            last_endpoint: None,
+            last_connected_at: None,
+            use_install_proxy: true,
+            tls_pin_sha256: None,
+            ..RemoteHostProfile::default()
+        };
+        let plan = RemoteHostBootstrapPlan::from_profile(
+            &profile,
+            7476,
+            "10.1.26.84:7474",
+            "10.1.29.130#7476",
+            RemoteShellKind::Posix,
+        );
+        let operator_key = MemoryOperatorKeyStore::generate().unwrap();
+        let mut plan = plan;
+        plan.operator_public_key = Some(operator_key.public_key_openssh().unwrap());
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let bootstrapper = SshRemoteHostBootstrapper::with_executor(
+            store,
+            RecordingSshExecutor {
+                calls: calls.clone(),
+                statuses: Rc::new(RefCell::new(vec![0, 1, 0, 0, 0, 1, 0])),
+                credentials_stdout: Rc::new(RefCell::new(Some(
+                    "WAITAGENT_CREDENTIALSdeadbeef:7476\n".to_string(),
+                ))),
+            },
+        );
+
+        bootstrapper.ensure_waitagent_and_start(&plan).unwrap();
+
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 7);
+        let install = calls
+            .iter()
+            .find(|(_, command, _)| command.contains("authorized_operators"))
+            .expect("operator key install command must run");
+        assert!(
+            !install.1.contains("sudo"),
+            "operator key install must stay in the target user's $HOME, not sudo: {}",
+            install.1
+        );
+        assert!(
+            install.2.is_none(),
+            "operator key install must not consume the sudo password stdin"
+        );
+        let update = calls
+            .iter()
+            .find(|(_, command, _)| command.contains("sudo -S"))
+            .expect("system install command must run with sudo");
+        assert!(
+            update.2.is_some(),
+            "sudo install must consume the sudo password stdin"
+        );
     }
 
     #[test]
