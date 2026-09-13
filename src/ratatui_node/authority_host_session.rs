@@ -139,6 +139,11 @@ impl RatatuiAuthorityHostSession {
             )
             .collect();
         signal_env.apply_to_hashmap(&mut env)?;
+        if let Err(error) = crate::platform::shell_prompt::ensure_bashrc_compact_prompt() {
+            ERROR_LOG.log_warn(format!(
+                "[ratatui-authority-host-session] failed to provision compact shell prompt: {error}"
+            ));
+        }
         let child =
             crate::platform::pty::spawn_shell(std::ffi::OsStr::new(&shell), &env, &mut conpty)
                 .map_err(|error| {

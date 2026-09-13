@@ -136,6 +136,14 @@ impl CommandDispatcher {
         &self,
         _command: RatatuiNodeServerCommand,
     ) -> Result<RatatuiNodeRuntime, AppError> {
+        // Best-effort: make sure the operator's ~/.bashrc carries the compact
+        // prompt so shells spawned by this node (local panes and sessions
+        // hosted for remote viewers) render venv prefixes on one line.
+        if let Err(error) = crate::platform::shell_prompt::ensure_bashrc_compact_prompt() {
+            crate::infra::error_log::ERROR_LOG.log_warn(format!(
+                "[waitagent] failed to provision compact shell prompt: {error}"
+            ));
+        }
         let network = self.network.clone();
         let remote_owner = RemoteRuntimeOwnerRuntime::from_build_env_with_network(network.clone())?;
 

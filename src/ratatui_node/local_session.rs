@@ -45,6 +45,11 @@ impl RatatuiLocalSession {
             token: shared.agent_signal.token.clone(),
         };
         signal_env.apply_to_hashmap(&mut env)?;
+        if let Err(error) = crate::platform::shell_prompt::ensure_bashrc_compact_prompt() {
+            ERROR_LOG.log_warn(format!(
+                "[ratatui-local-session] failed to provision compact shell prompt: {error}"
+            ));
+        }
         let options = Options {
             shell: Some(Shell::new(shell, Vec::new())),
             working_directory: std::env::current_dir().ok(),

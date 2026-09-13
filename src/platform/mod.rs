@@ -11,5 +11,6 @@ pub mod local_ipc;
 pub mod process;
 pub mod pty;
 pub mod remote_ipc;
+pub mod shell_prompt;
 pub mod signal;
 pub mod wake_pipe;
