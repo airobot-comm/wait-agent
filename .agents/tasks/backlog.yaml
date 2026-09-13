@@ -780,6 +780,94 @@ next:
   - id: task.ratatui-phase-5-cloud
     title: activate distributed control topologies on the server/client foundation
     status: in_progress
+  - id: task.relay-1-mux-frame-layer-and-peer-connection-seam
+    title: introduce relay mux frame layer and the PeerConnection transport seam
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 1 the node-to-node TCP dial becomes a
+        pluggable PeerConnection byte stream so relay streams are a second
+        transport; direct TCP folds behind the seam unchanged.
+  - id: task.relay-2-relay-daemon-core-routing
+    title: implement relay daemon with connection table, routing, heartbeat, and whitelist auth
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 2 relay serve runs the hub with connection
+        table, open/close routing, 10s/3-miss heartbeat, whitelist auth via
+        authorized_nodes/, and the local admin socket.
+  - id: task.relay-3-invite-join-enrollment
+    title: implement relay invite/join enrollment with automatic mutual fingerprint pinning
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 3 invite/join binds node and relay in one
+        flow without manual fingerprint transcription; relay remove revokes.
+  - id: task.relay-4-node-relay-client
+    title: implement node relay client with persistent connection, on-demand streams, and re-registration
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 4 nodes keep one persistent outbound
+        connection, open streams on demand, re-register after drops, and
+        receive presence events for the console.
+  - id: task.relay-5-stream-backpressure-fair-scheduling
+    title: add per-stream window backpressure and fair scheduling to the relay mux
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 5 window/ack frames give every stream
+        independent backpressure and fair scheduling on a shared connection.
+  - id: task.relay-6-single-node-capacity-model
+    title: implement single-relay capacity model with usage metering and admission control
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 6 max_nodes/max_streams/throughput admission
+        with usage metering on the connection tables is the future cluster
+        scheduler input.
+  - id: task.relay-7-config-surface
+    title: land relay config surface with relay.toml, remote-hosts via selector, and connect-path integration
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 7 relay.toml on both sides plus an explicit
+        remote-hosts via = relay|direct selector wired into the Ctrl-W
+        connect path; no implicit fallback.
+  - id: task.relay-8-structured-error-semantics
+    title: define structured relay error semantics from relay through node to console
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 8 relay failures surface as error codes plus
+        human-readable messages on sidebar and status line, never raw strings.
+  - id: task.relay-9-e2e-and-regression-tests
+    title: build relay e2e suite with docker-isolated topology, reconnect, concurrency, and direct regression
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 9 docker network-isolated two-node-plus-relay
+        e2e, disconnect/reconnect, concurrent sessions, Windows CI, and a
+        green direct-dial regression.
+  - id: task.relay-10-webui
+    title: implement WebUI as special-node web service with browser terminal and management plane
+    status: backlog
+    design_ref:
+      document: docs/relay-design.md
+      authorizes: >
+        Phase 1 task split item 10 the web service enrolls as a special node
+        (single-binary co-located deployment, loopback standard protocol) and
+        carries the browser terminal plus the management plane; CLI shrinks
+        to the bootstrap minimum.
 templates:
   - id: task-template.local-acceptance-cycle
     title: local acceptance rerun or bug-fix slice
