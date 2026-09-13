@@ -17,11 +17,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// Marks the start of the waitagent-managed block inside `.bashrc`.
+/// Its presence is the idempotency guard for provisioning.
 #[cfg(windows)]
 const BLOCK_BEGIN: &str = "# >>> waitagent compact bash prompt >>>";
-/// Marks the end of the waitagent-managed block inside `.bashrc`.
-#[cfg(windows)]
-const BLOCK_END: &str = "# <<< waitagent compact bash prompt <<<";
 
 /// The managed block appended to `.bashrc`. Kept self-contained: the git
 /// branch helper is defined right here so the prompt works in non-login
