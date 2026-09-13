@@ -427,7 +427,11 @@ fn run_io_loop(
             if event.readable {
                 dead = read_pty(&session_id, &mut sessions);
                 if dead {
-                    if let Some(state) = sessions.remove(&session_id) {
+                    if let Some(mut state) = sessions.remove(&session_id) {
+                        // Reap the shell: the PTY reached EOF/error because the
+                        // child exited, and dropping `Child` without waiting
+                        // would leave a zombie.
+                        let _ = state.child.try_wait();
                         let qualified_target_id =
                             format!("{}:{session_id}", shared.local_authority_id());
                         if let Some(monitor) = shared.process_monitor() {
@@ -694,7 +698,10 @@ fn drain_requests(
                 );
             }
             AuthorityHostIoRequest::UnregisterSession { session_id } => {
-                if let Some(state) = sessions.remove(&session_id) {
+                if let Some(mut state) = sessions.remove(&session_id) {
+                    // The session is being unregistered because it exited;
+                    // reap the shell so it does not linger as a zombie.
+                    let _ = state.child.try_wait();
                     let qualified_target_id =
                         format!("{}:{session_id}", shared.local_authority_id());
                     if let Some(monitor) = shared.process_monitor() {
@@ -1352,6 +1359,56 @@ mod tests {
         assert!(
             text.contains("line4"),
             "bootstrap should contain visible line4: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unregister_session_reaps_exited_child() {
+        let mut sessions = HashMap::new();
+        let state = make_test_session_state(None);
+        let child_pid = state.child.id();
+        sessions.insert("sess".to_string(), state);
+        // Wait for the short-lived child to become a zombie; without an
+        // explicit reap it would linger in /proc even after unregister.
+        let proc_dir = std::path::PathBuf::from(format!("/proc/{child_pid}"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let gone_or_zombie = !proc_dir.exists()
+                || std::fs::read_to_string(proc_dir.join("stat"))
+                    .map(|stat| stat.contains(") Z"))
+                    .unwrap_or(true);
+            if gone_or_zombie || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let (req_tx, req_rx) = mpsc::channel();
+        let shared = SharedState::new(RemoteNetworkConfig::default()).expect("shared state");
+        let mut poller = polling::Poller::new().expect("poller");
+        let mut token_to_session = HashMap::new();
+        let mut next_token = 1000;
+        req_tx
+            .send(AuthorityHostIoRequest::UnregisterSession {
+                session_id: "sess".to_string(),
+            })
+            .unwrap();
+        drain_requests(
+            &mut None,
+            &req_rx,
+            &shared,
+            &mut poller,
+            &mut sessions,
+            &mut token_to_session,
+            &mut next_token,
+        )
+        .expect("drain should succeed");
+
+        assert!(!sessions.contains_key("sess"));
+        assert!(
+            !proc_dir.exists(),
+            "child {child_pid} should be reaped, not left as a zombie"
         );
     }
 }

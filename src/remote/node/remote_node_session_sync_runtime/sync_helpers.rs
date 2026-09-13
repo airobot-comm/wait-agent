@@ -678,6 +678,12 @@ pub(super) fn run_remote_session_sync_loop<G, T, O, F, A, P>(
                 }
                 SessionSyncEvent::LocalCatalogChanged(request) => {
                     let _reason = request.reason.clone();
+                    if let LocalCatalogChangeReason::LocalTargetExited {
+                        target_session_name,
+                    } = &request.reason
+                    {
+                        authority_manager.handle_local_target_exited(&node_id, target_session_name);
+                    }
 
                     let ack = if observe_local_session_catalog(
                         &gateway,
@@ -720,6 +726,12 @@ pub(super) fn run_remote_session_sync_loop<G, T, O, F, A, P>(
         match wait_for_reconnect_delay_or_stop(&session_event_rx, reconnect_delay) {
             ReconnectWaitOutcome::Stop => return,
             ReconnectWaitOutcome::LocalCatalogChanged(request) => {
+                if let LocalCatalogChangeReason::LocalTargetExited {
+                    target_session_name,
+                } = &request.reason
+                {
+                    authority_manager.handle_local_target_exited(&node_id, target_session_name);
+                }
                 let ack = if observe_local_session_catalog(
                     &gateway,
                     &node_id,

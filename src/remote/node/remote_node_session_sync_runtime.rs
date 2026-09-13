@@ -166,6 +166,15 @@ pub(crate) struct SessionSyncAuthorityHost {
     /// when a new inbound gRPC session takes over the same target, so the
     /// existing target host and bridge survive transient reconnects.
     pub(crate) bridge_session_id: Arc<RwLock<String>>,
+    /// Sender half of the channel that carries PTY output from the authority
+    /// host IO loop to this host's output pump. Re-installed into the IO loop
+    /// whenever the host is reused, because a recreated session replaces the
+    /// IO-loop `SessionState` and drops the previously installed sender.
+    pub(crate) output_tx: mpsc::Sender<Vec<u8>>,
+    /// Set to `false` by any host thread (listener, target host, output pump)
+    /// when it exits. A host with dead threads must not be reused; the next
+    /// `ensure_authority_host` spawns a replacement.
+    pub(crate) threads_alive: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -584,6 +593,20 @@ where
         }
     }
 
+    /// Drop the authority host serving `qualified_target` (e.g.
+    /// `local#7474:3`) if one is running. Called when the local authority
+    /// session exits so host threads and their socket pairs do not leak and a
+    /// future session reusing the same id gets a freshly spawned host.
+    pub(super) fn handle_local_target_exited(&mut self, node_id: &str, qualified_target: &str) {
+        let Some((_, session_id)) = qualified_target.rsplit_once(':') else {
+            return;
+        };
+        let target_id = format!("{node_id}:{session_id}");
+        if let Some(host) = self.running_hosts.remove(&target_id) {
+            self.authority_backend.shutdown_authority_host(&host);
+        }
+    }
+
     pub(super) fn handle_event(
         &mut self,
         session_handle: &RemoteNodeSessionHandle,
@@ -729,7 +752,13 @@ where
     ) -> Result<(), LifecycleError> {
         let bound_session_instance_id = session_handle.session_instance_id().to_string();
         let should_remove_stale = if let Some(existing) = self.running_hosts.get(target_id) {
-            if existing.running.load(Ordering::Relaxed) {
+            // A host whose threads have exited can no longer serve commands or
+            // forward output even though `running` may still be set; treat it
+            // as stale so a replacement is spawned below.
+            if existing.running.load(Ordering::Relaxed)
+                && existing.threads_alive.load(Ordering::Relaxed)
+            {
+                let output_tx = existing.output_tx.clone();
                 // A healthy authority target host is already running for this
                 // target. Reuse it: just point the bridge at the new inbound
                 // gRPC session id so output is forwarded to the current client
@@ -740,6 +769,12 @@ where
                         *guard = bound_session_instance_id;
                     }
                 }
+                // A reused host may outlive the IO-loop SessionState it was
+                // bound to (a recreated session re-registering under the same
+                // id replaces the state and drops the installed output
+                // sender). Re-install the sender so PTY output keeps flowing.
+                self.authority_backend
+                    .rebind_authority_host_output(target_id, output_tx)?;
                 return Ok(());
             }
             // Host has already exited; drop the stale entry so a new one can be
@@ -749,7 +784,11 @@ where
             false
         };
         if should_remove_stale {
-            self.running_hosts.remove(target_id);
+            if let Some(stale) = self.running_hosts.remove(target_id) {
+                // Signal the leaked host threads to unwind; dropping the map
+                // entry alone would leave them blocked on the socket pair.
+                self.authority_backend.shutdown_authority_host(&stale);
+            }
         }
 
         let host = self.authority_backend.spawn_authority_host(
@@ -817,7 +856,9 @@ where
                         "authority host for `{target_id}` closed before accepting command"
                     )));
                 }
-                self.running_hosts.remove(target_id);
+                if let Some(closed) = self.running_hosts.remove(target_id) {
+                    self.authority_backend.shutdown_authority_host(&closed);
+                }
                 self.ensure_authority_host(session_handle, target_id)?;
                 self.deliver_with_host_rebuild(session_handle, target_id, command, true)
             }
@@ -833,5 +874,217 @@ impl Drop for RemoteNodeSessionSyncGuard {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::authority::remote_authority_transport_runtime::RemoteAuthorityCommand;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone, Default)]
+    struct MockTargetFactory;
+
+    impl LocalTargetFactory for MockTargetFactory {
+        type Error = LifecycleError;
+
+        fn create_local_target(
+            &self,
+            _node_id: &str,
+            _cwd: &std::path::Path,
+            _cols: u16,
+            _rows: u16,
+        ) -> Result<CreatedLocalTarget, Self::Error> {
+            unimplemented!("not exercised by these tests")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MockAuthorityBackend {
+        inner: Arc<MockBackendInner>,
+    }
+
+    #[derive(Default)]
+    struct MockBackendInner {
+        spawns: AtomicUsize,
+        rebinds: StdMutex<Vec<String>>,
+        shutdowns: AtomicUsize,
+    }
+
+    impl MockAuthorityBackend {
+        fn spawn_count(&self) -> usize {
+            self.inner.spawns.load(AtomicOrdering::SeqCst)
+        }
+
+        fn rebind_targets(&self) -> Vec<String> {
+            self.inner
+                .rebinds
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+
+        fn shutdown_count(&self) -> usize {
+            self.inner.shutdowns.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    fn test_host(threads_alive: bool) -> SessionSyncAuthorityHost {
+        let (output_tx, _output_rx) = mpsc::channel::<Vec<u8>>();
+        let (host_end, _listener_end) =
+            crate::platform::remote_ipc::socket_pair().expect("socket pair should succeed");
+        SessionSyncAuthorityHost {
+            writer: Arc::new(Mutex::new(Some(host_end))),
+            running: Arc::new(AtomicBool::new(true)),
+            writer_ready: Arc::new(Condvar::new()),
+            bound_session_instance_id: "server-session-a".to_string(),
+            bridge_session_id: Arc::new(RwLock::new("server-session-a".to_string())),
+            output_tx,
+            threads_alive: Arc::new(AtomicBool::new(threads_alive)),
+        }
+    }
+
+    impl LocalAuthorityHostBackend for MockAuthorityBackend {
+        type Error = LifecycleError;
+
+        fn spawn_authority_host(
+            &self,
+            _session_handle: &RemoteNodeSessionHandle,
+            _target_id: &str,
+            _output_route: SessionSyncAuthorityOutputRoute,
+        ) -> Result<SessionSyncAuthorityHost, Self::Error> {
+            self.inner.spawns.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(test_host(true))
+        }
+
+        fn authority_host_signal(&self, host: &SessionSyncAuthorityHost) -> AuthorityHostSignal {
+            if host.writer.lock().is_ok_and(|guard| guard.is_some()) {
+                AuthorityHostSignal::Ready
+            } else if host.running.load(AtomicOrdering::Relaxed) {
+                AuthorityHostSignal::Starting
+            } else {
+                AuthorityHostSignal::Closed
+            }
+        }
+
+        fn rebind_authority_host_output(
+            &self,
+            target_id: &str,
+            _output_tx: mpsc::Sender<Vec<u8>>,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .rebinds
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(target_id.to_string());
+            Ok(())
+        }
+
+        fn deliver_command(
+            &self,
+            _host: &SessionSyncAuthorityHost,
+            _command: RemoteAuthorityCommand,
+        ) -> Result<AuthorityHostSignal, Self::Error> {
+            Ok(AuthorityHostSignal::Ready)
+        }
+
+        fn shutdown_authority_host(&self, _host: &SessionSyncAuthorityHost) {
+            self.inner.shutdowns.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn test_manager(
+        backend: MockAuthorityBackend,
+    ) -> SessionSyncAuthorityManager<MockTargetFactory, MockAuthorityBackend> {
+        let (session_event_tx, _session_event_rx) = mpsc::channel::<SessionSyncEvent>();
+        SessionSyncAuthorityManager {
+            running_hosts: HashMap::new(),
+            output_route: SessionSyncAuthorityOutputRoute::OwnerEvent(session_event_tx),
+            target_factory: MockTargetFactory,
+            authority_backend: backend,
+        }
+    }
+
+    #[test]
+    fn ensure_reuses_live_host_and_rebinds_output_sender() {
+        let backend = MockAuthorityBackend::default();
+        let mut manager = test_manager(backend.clone());
+        let target_id = "node-a#7474:3";
+        manager
+            .running_hosts
+            .insert(target_id.to_string(), test_host(true));
+        let handle = RemoteNodeSessionHandle::for_test("node-a#7474", "server-session-b");
+
+        manager
+            .ensure_authority_host(&handle, target_id)
+            .expect("reuse should succeed");
+
+        assert_eq!(backend.spawn_count(), 0, "live host must be reused");
+        assert_eq!(backend.rebind_targets(), vec![target_id.to_string()]);
+        let host = manager
+            .running_hosts
+            .get(target_id)
+            .expect("host should remain registered");
+        assert_eq!(host.bound_session_instance_id, "server-session-b");
+        assert_eq!(
+            *host
+                .bridge_session_id
+                .read()
+                .unwrap_or_else(|e| e.into_inner()),
+            "server-session-b"
+        );
+    }
+
+    #[test]
+    fn ensure_respawns_host_with_dead_threads() {
+        let backend = MockAuthorityBackend::default();
+        let mut manager = test_manager(backend.clone());
+        let target_id = "node-a#7474:3";
+        manager
+            .running_hosts
+            .insert(target_id.to_string(), test_host(false));
+        let handle = RemoteNodeSessionHandle::for_test("node-a#7474", "server-session-b");
+
+        manager
+            .ensure_authority_host(&handle, target_id)
+            .expect("respawn should succeed");
+
+        assert_eq!(backend.spawn_count(), 1, "dead host must be replaced");
+        assert!(
+            backend.rebind_targets().is_empty(),
+            "fresh spawn installs the output sender itself"
+        );
+        assert!(manager.running_hosts.contains_key(target_id));
+    }
+
+    #[test]
+    fn local_target_exited_drops_matching_host() {
+        let backend = MockAuthorityBackend::default();
+        let mut manager = test_manager(backend.clone());
+        manager
+            .running_hosts
+            .insert("node-a#7474:3".to_string(), test_host(true));
+        manager
+            .running_hosts
+            .insert("node-a#7474:4".to_string(), test_host(true));
+
+        manager.handle_local_target_exited("node-a#7474", "local#7474:3");
+
+        assert_eq!(backend.shutdown_count(), 1);
+        assert!(!manager.running_hosts.contains_key("node-a#7474:3"));
+        assert!(manager.running_hosts.contains_key("node-a#7474:4"));
+    }
+
+    #[test]
+    fn local_target_exited_ignores_unknown_target() {
+        let backend = MockAuthorityBackend::default();
+        let mut manager = test_manager(backend.clone());
+
+        manager.handle_local_target_exited("node-a#7474", "local#7474:9");
+
+        assert_eq!(backend.shutdown_count(), 0);
+        assert!(manager.running_hosts.is_empty());
     }
 }

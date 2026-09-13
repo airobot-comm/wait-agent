@@ -160,6 +160,19 @@ impl RemoteNodeSessionHandle {
         &self.node_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        node_id: impl Into<String>,
+        session_instance_id: impl Into<String>,
+    ) -> Self {
+        let (outbound_tx, _outbound_rx) = tokio_mpsc::unbounded_channel::<NodeSessionEnvelope>();
+        Self {
+            node_id: node_id.into(),
+            session_instance_id: session_instance_id.into(),
+            outbound_tx,
+        }
+    }
+
     pub fn session_instance_id(&self) -> &str {
         &self.session_instance_id
     }

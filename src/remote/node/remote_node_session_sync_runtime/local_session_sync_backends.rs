@@ -101,6 +101,16 @@ pub trait LocalAuthorityHostBackend: Clone + Send + 'static {
     /// Return the current readiness signal for a host.
     fn authority_host_signal(&self, host: &SessionSyncAuthorityHost) -> AuthorityHostSignal;
 
+    /// Re-install the host's PTY output sender into the authority host IO loop
+    /// for `target_id`. Required when a reused host outlives an IO-loop
+    /// `SessionState` replacement (e.g. a recreated session reusing the same
+    /// id), which drops the previously installed sender.
+    fn rebind_authority_host_output(
+        &self,
+        target_id: &str,
+        output_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), Self::Error>;
+
     /// Deliver an authority command to a ready host.
     fn deliver_command(
         &self,
@@ -738,7 +748,7 @@ impl LocalAuthorityHostBackend for RatatuiLocalAuthorityHostBackend {
             .authority_host_io_sender()
             .send(crate::ratatui_node::authority_host_io_loop::AuthorityHostIoRequest::SetOutputSender {
                 session_id: session_name.clone(),
-                output_tx,
+                output_tx: output_tx.clone(),
             })
             .map_err(|error| {
                 LifecycleError::Io(
@@ -752,6 +762,7 @@ impl LocalAuthorityHostBackend for RatatuiLocalAuthorityHostBackend {
         let writer_ready = Arc::new(Condvar::new());
         let running = Arc::new(AtomicBool::new(true));
         let bridge_session_id = Arc::new(RwLock::new(bound_session_instance_id.clone()));
+        let threads_alive = Arc::new(AtomicBool::new(true));
 
         spawn_ratatui_authority_listener(SpawnRatatuiAuthorityListenerArgs {
             host_stream: host_end.try_clone().map_err(|error| {
@@ -766,6 +777,7 @@ impl LocalAuthorityHostBackend for RatatuiLocalAuthorityHostBackend {
             running: running.clone(),
             writer: writer.clone(),
             writer_ready: writer_ready.clone(),
+            threads_alive: threads_alive.clone(),
         });
 
         spawn_ratatui_authority_target_host(SpawnRatatuiAuthorityTargetHostArgs {
@@ -778,6 +790,7 @@ impl LocalAuthorityHostBackend for RatatuiLocalAuthorityHostBackend {
             io_tx,
             output_rx,
             shared: self.shared.clone(),
+            threads_alive: threads_alive.clone(),
         });
 
         Ok(SessionSyncAuthorityHost {
@@ -786,6 +799,8 @@ impl LocalAuthorityHostBackend for RatatuiLocalAuthorityHostBackend {
             writer_ready,
             bound_session_instance_id,
             bridge_session_id,
+            output_tx,
+            threads_alive,
         })
     }
 
@@ -813,6 +828,32 @@ impl LocalAuthorityHostBackend for RatatuiLocalAuthorityHostBackend {
                 }
             }
         }
+    }
+
+    fn rebind_authority_host_output(
+        &self,
+        target_id: &str,
+        output_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), Self::Error> {
+        let session_name = target_session_name_from_target_id(target_id).ok_or_else(|| {
+            LifecycleError::Protocol(format!(
+                "failed to derive local session from target id `{target_id}`"
+            ))
+        })?;
+        self.shared
+            .authority_host_io_sender()
+            .send(
+                crate::ratatui_node::authority_host_io_loop::AuthorityHostIoRequest::SetOutputSender {
+                    session_id: session_name,
+                    output_tx,
+                },
+            )
+            .map_err(|error| {
+                LifecycleError::Io(
+                    "failed to rebind authority host output sender".to_string(),
+                    io::Error::other(error.to_string()),
+                )
+            })
     }
 
     fn deliver_command(
@@ -883,6 +924,7 @@ struct SpawnRatatuiAuthorityListenerArgs {
     running: Arc<AtomicBool>,
     writer: Arc<Mutex<Option<RemoteControlStream>>>,
     writer_ready: Arc<Condvar>,
+    threads_alive: Arc<AtomicBool>,
 }
 
 fn spawn_ratatui_authority_listener(args: SpawnRatatuiAuthorityListenerArgs) {
@@ -895,6 +937,7 @@ fn spawn_ratatui_authority_listener(args: SpawnRatatuiAuthorityListenerArgs) {
         running,
         writer,
         writer_ready,
+        threads_alive,
     } = args;
     thread::spawn(move || {
         // The ratatui authority host is backed by an internal socket pair
@@ -922,6 +965,7 @@ fn spawn_ratatui_authority_listener(args: SpawnRatatuiAuthorityListenerArgs) {
                         "[ratatui-session-sync] authority listener failed to clone host stream: {error}"
                     ));
                     running.store(false, Ordering::Relaxed);
+                    threads_alive.store(false, Ordering::Relaxed);
                     return;
                 }
             }
@@ -941,6 +985,7 @@ fn spawn_ratatui_authority_listener(args: SpawnRatatuiAuthorityListenerArgs) {
             "[ratatui-session-sync] authority listener output forwarder exited: {result:?}"
         ));
         running.store(false, Ordering::Relaxed);
+        threads_alive.store(false, Ordering::Relaxed);
         let _ = match writer.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
@@ -960,6 +1005,7 @@ struct SpawnRatatuiAuthorityTargetHostArgs {
     io_tx: crate::ratatui_node::authority_host_io_loop::AuthorityHostIoHandle,
     output_rx: mpsc::Receiver<Vec<u8>>,
     shared: Arc<SharedState>,
+    threads_alive: Arc<AtomicBool>,
 }
 
 /// Return whether the authority-host session should receive `@`-prefixed file
@@ -1058,6 +1104,7 @@ fn spawn_ratatui_authority_target_host(args: SpawnRatatuiAuthorityTargetHostArgs
         io_tx,
         output_rx,
         shared,
+        threads_alive,
     } = args;
     thread::spawn(move || {
         let session_id = session.session_id.clone();
@@ -1073,6 +1120,7 @@ fn spawn_ratatui_authority_target_host(args: SpawnRatatuiAuthorityTargetHostArgs
                 ERROR_LOG.log(format!(
                     "failed to clone listener stream for output pump: {error}"
                 ));
+                threads_alive.store(false, Ordering::Relaxed);
                 return;
             }
         };
@@ -1080,6 +1128,7 @@ fn spawn_ratatui_authority_target_host(args: SpawnRatatuiAuthorityTargetHostArgs
         let output_running = running.clone();
         let output_target_id = target_id.clone();
         let output_session_id = session_id.clone();
+        let output_threads_alive = threads_alive.clone();
         thread::spawn(move || {
             let mut output_seq: u64 = 1;
             while output_running.load(Ordering::Relaxed) {
@@ -1113,6 +1162,7 @@ fn spawn_ratatui_authority_target_host(args: SpawnRatatuiAuthorityTargetHostArgs
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+            output_threads_alive.store(false, Ordering::Relaxed);
         });
 
         let mut _input_seq: u64 = 1;
@@ -1275,6 +1325,7 @@ fn spawn_ratatui_authority_target_host(args: SpawnRatatuiAuthorityTargetHostArgs
             session.unregister_console(&io_tx, console_id);
         }
         running.store(false, Ordering::Relaxed);
+        threads_alive.store(false, Ordering::Relaxed);
     });
 }
 
@@ -1513,6 +1564,7 @@ mod tests {
         let (mut host_stream, listener_stream) =
             crate::platform::remote_ipc::socket_pair().expect("create transport pair");
         let running = Arc::new(AtomicBool::new(true));
+        let threads_alive = Arc::new(AtomicBool::new(true));
         spawn_ratatui_authority_target_host(SpawnRatatuiAuthorityTargetHostArgs {
             listener_stream,
             host_stream: host_stream.try_clone().expect("clone host stream"),
@@ -1523,6 +1575,7 @@ mod tests {
             io_tx,
             output_rx,
             shared,
+            threads_alive,
         });
 
         // Send OpenMirrorRequest from the viewer side.
