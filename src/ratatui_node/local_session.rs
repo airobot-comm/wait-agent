@@ -24,11 +24,16 @@ pub struct RatatuiLocalSession {
 
 impl RatatuiLocalSession {
     /// Spawn a new shell in a PTY and start the alacritty terminal event loop.
+    ///
+    /// `cwd` is the directory the shell should start in (the creating
+    /// client's working directory); when absent or not a directory the node
+    /// server's own cwd is used.
     pub fn spawn(
         session_id: impl Into<String>,
         _command_name: impl Into<String>,
         cols: u16,
         rows: u16,
+        cwd: Option<std::path::PathBuf>,
         shared: Arc<SharedState>,
     ) -> Result<Arc<Self>, LifecycleError> {
         let session_id = session_id.into();
@@ -52,7 +57,9 @@ impl RatatuiLocalSession {
         }
         let options = Options {
             shell: Some(Shell::new(shell, Vec::new())),
-            working_directory: std::env::current_dir().ok(),
+            working_directory: cwd
+                .filter(|path| path.is_dir())
+                .or_else(|| std::env::current_dir().ok()),
             drain_on_exit: true,
             env,
             #[cfg(target_os = "windows")]
@@ -598,7 +605,7 @@ mod local_session_tests {
         with_shell_env();
         let network = RemoteNetworkConfig::default();
         let shared = SharedState::new(network).expect("SharedState::new should succeed");
-        let session = RatatuiLocalSession::spawn("local#17474:1", "sh", 80, 24, shared)
+        let session = RatatuiLocalSession::spawn("local#17474:1", "sh", 80, 24, None, shared)
             .expect("spawn local session");
         assert!(
             session.has_event_loop_sender(),
@@ -615,7 +622,7 @@ mod local_session_tests {
         let (tx, rx) = mpsc::channel::<StateEvent>();
         shared.set_state_tx(tx);
 
-        let session = RatatuiLocalSession::spawn("local#17474:2", "sh", 80, 24, shared)
+        let session = RatatuiLocalSession::spawn("local#17474:2", "sh", 80, 24, None, shared)
             .expect("spawn local session");
         session.feed_input("echo HELLO\n");
 

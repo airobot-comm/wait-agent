@@ -8,6 +8,7 @@ use crate::infra::settings_store::SettingsStore;
 use crate::lifecycle::LifecycleError;
 use crate::ports::session_creation::RemoteSessionCreationRequest;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -721,8 +722,12 @@ fn handle_client_command_event(
         return;
     }
 
-    if let ClientCommand::CreateRemoteSession { authority_node_id } = &command {
-        create_remote_session_target(shared, client_id, authority_node_id, state_event_tx);
+    if let ClientCommand::CreateRemoteSession {
+        authority_node_id,
+        cwd,
+    } = &command
+    {
+        create_remote_session_target(shared, client_id, authority_node_id, cwd, state_event_tx);
         return;
     }
 
@@ -1359,9 +1364,9 @@ fn handle_client_command(
             CommandOutcome::Data(serde_json::to_value(&sessions).unwrap_or_default())
         }
 
-        ClientCommand::CreateLocalSession => {
+        ClientCommand::CreateLocalSession { cwd } => {
             let id = shared.next_local_session_id();
-            match shared.create_local_session(&id, 80, 24) {
+            match shared.create_local_session(&id, 80, 24, cwd.clone().map(PathBuf::from)) {
                 Ok(target) => {
                     let _ = catalog_tx.send(LocalCatalogChangeRequest {
                         reason: LocalCatalogChangeReason::LocalRuntimeChanged,
@@ -2416,12 +2421,14 @@ fn create_remote_session_target(
     shared: &Arc<SharedState>,
     client_id: u64,
     authority_node_id: &str,
+    cwd: &Option<String>,
     state_event_tx: mpsc::Sender<StateEvent>,
 ) {
     let authority_node_id = authority_node_id.to_string();
+    let cwd = cwd.clone();
     let shared = shared.clone();
     std::thread::spawn(move || {
-        let result = perform_create_remote_session_on_authority(&shared, &authority_node_id);
+        let result = perform_create_remote_session_on_authority(&shared, &authority_node_id, &cwd);
         let _ = state_event_tx.send(StateEvent::RemoteSessionCreateResult {
             client_id,
             authority_node_id: authority_node_id.clone(),
@@ -2433,6 +2440,7 @@ fn create_remote_session_target(
 fn perform_create_remote_session_on_authority(
     shared: &Arc<SharedState>,
     authority_node_id: &str,
+    cwd: &Option<String>,
 ) -> Result<ManagedSessionRecord, String> {
     let Some(session_creation) = shared.session_creation_port.clone() else {
         return Err("session creation port not configured".to_string());
@@ -2440,7 +2448,7 @@ fn perform_create_remote_session_on_authority(
 
     let request = RemoteSessionCreationRequest {
         authority_node_id: authority_node_id.to_string(),
-        cwd_hint: None,
+        cwd_hint: cwd.clone().map(PathBuf::from),
         cols: 0,
         rows: 0,
     };

@@ -179,8 +179,11 @@ pub(crate) enum ClientCommand {
     Stop,
     /// LIST_SESSIONS one-shot command.
     ListSessions,
-    /// Create a new local PTY session.
-    CreateLocalSession,
+    /// Create a new local PTY session. `cwd` is the creating client's working
+    /// directory; the shell starts there so the pane lands where the operator
+    /// launched the TUI instead of wherever the node server's cwd happens to
+    /// be. Falls back to the node server's cwd when absent or invalid.
+    CreateLocalSession { cwd: Option<String> },
     /// Activate a specific session target.
     ActivateTarget { target_id: String },
     /// Connect to a saved remote host profile.
@@ -202,7 +205,13 @@ pub(crate) enum ClientCommand {
     /// Request the full scrollback history for a session.
     GetHistory { target_id: String },
     /// Create a new remote session on the authority of the selected target.
-    CreateRemoteSession { authority_node_id: String },
+    CreateRemoteSession {
+        authority_node_id: String,
+        /// The creating client's working directory, forwarded as the
+        /// authority's cwd hint so the remote shell starts where the
+        /// operator is working.
+        cwd: Option<String>,
+    },
     /// Close a session and cancel any pending reconnect for it.
     CloseSession { target_id: String },
     /// Set or clear the public endpoint advertised to remote peers.

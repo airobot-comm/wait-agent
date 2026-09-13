@@ -674,6 +674,7 @@ impl SharedState {
         session_id: &str,
         cols: u16,
         rows: u16,
+        cwd: Option<std::path::PathBuf>,
     ) -> Result<String, LifecycleError> {
         let command_name = std::env::var("SHELL")
             .ok()
@@ -690,6 +691,7 @@ impl SharedState {
             command_name.clone(),
             cols,
             rows,
+            cwd,
             self.clone(),
         )?;
 
@@ -1034,7 +1036,7 @@ impl RatatuiNodeRuntime {
         // event loops are running, because authority-host sessions must be
         // registered with AuthorityHostIoLoop.
         if network.node_id.is_none() && network.connect.is_none() {
-            let _ = shared.create_local_session(DEFAULT_SESSION_ID, 80, 24);
+            let _ = shared.create_local_session(DEFAULT_SESSION_ID, 80, 24, None);
         }
 
         Ok(Self {

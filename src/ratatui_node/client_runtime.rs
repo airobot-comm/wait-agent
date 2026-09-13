@@ -780,9 +780,12 @@ fn handle_crossterm_event(
                     {
                         if let Some(session) = snapshot.sessions.get(*selected_index) {
                             if session.transport != "local" {
+                                let cwd = std::env::current_dir()
+                                    .map(|path| path.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
                                 let _ = writeln!(
                                     stream,
-                                    "CREATE_REMOTE_SESSION {}",
+                                    "CREATE_REMOTE_SESSION {} {cwd}",
                                     session.authority_node_id
                                 );
                                 let _ = stream.flush();
@@ -796,7 +799,10 @@ fn handle_crossterm_event(
                         }
                     }
                     KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let _ = writeln!(stream, "CREATE_LOCAL_SESSION");
+                        let cwd = std::env::current_dir()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let _ = writeln!(stream, "CREATE_LOCAL_SESSION {cwd}");
                         let _ = stream.flush();
                     }
                     KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {

@@ -128,7 +128,7 @@ fn parse_command(line: &str) -> Option<ClientCommand> {
         "STATUS" => Some(ClientCommand::Status),
         "STOP" => Some(ClientCommand::Stop),
         "LIST_SESSIONS" => Some(ClientCommand::ListSessions),
-        "CREATE_LOCAL_SESSION" => Some(ClientCommand::CreateLocalSession),
+        "CREATE_LOCAL_SESSION" => Some(ClientCommand::CreateLocalSession { cwd: None }),
         "DETACH_ALL" => Some(ClientCommand::DetachAll),
         "CLEAR_PUBLIC" => Some(ClientCommand::SetPublic {
             endpoint: None,
@@ -187,8 +187,19 @@ fn parse_command(line: &str) -> Option<ClientCommand> {
                     target_id: args.to_string(),
                 })
             } else if let Some(args) = trimmed.strip_prefix("CREATE_REMOTE_SESSION ") {
+                let mut parts = args.splitn(2, ' ');
+                let authority_node_id = parts.next().unwrap_or("").to_string();
+                let cwd = parts
+                    .next()
+                    .filter(|cwd| !cwd.is_empty())
+                    .map(|cwd| cwd.to_string());
                 Some(ClientCommand::CreateRemoteSession {
-                    authority_node_id: args.to_string(),
+                    authority_node_id,
+                    cwd,
+                })
+            } else if let Some(cwd) = trimmed.strip_prefix("CREATE_LOCAL_SESSION ") {
+                Some(ClientCommand::CreateLocalSession {
+                    cwd: Some(cwd.to_string()),
                 })
             } else if let Some(args) = trimmed.strip_prefix("SET_PUBLIC ") {
                 let trimmed_args = args.trim();
@@ -246,6 +257,40 @@ pub(crate) fn remove_client(client_id: u64, clients: &Arc<Mutex<Vec<ClientHandle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_create_commands_carry_client_cwd() {
+        let command = parse_command("CREATE_LOCAL_SESSION /d/workspace/r2-earn");
+        assert!(
+            matches!(
+                command,
+                Some(ClientCommand::CreateLocalSession { ref cwd })
+                    if cwd.as_deref() == Some("/d/workspace/r2-earn")
+            ),
+            "unexpected command: {command:?}"
+        );
+
+        // Paths with spaces survive: node id has no spaces, the remainder is
+        // the cwd.
+        let command = parse_command("CREATE_REMOTE_SESSION peer#7474 D:\\my projects\\app");
+        assert!(
+            matches!(
+                command,
+                Some(ClientCommand::CreateRemoteSession {
+                    ref authority_node_id,
+                    ref cwd,
+                }) if authority_node_id == "peer#7474"
+                    && cwd.as_deref() == Some("D:\\my projects\\app")
+            ),
+            "unexpected command: {command:?}"
+        );
+
+        // Legacy clients without a cwd still parse.
+        assert!(matches!(
+            parse_command("CREATE_LOCAL_SESSION"),
+            Some(ClientCommand::CreateLocalSession { cwd: None })
+        ));
+    }
 
     #[test]
     fn parse_paste_text_command() {
