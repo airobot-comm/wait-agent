@@ -1049,7 +1049,7 @@ fn apply_console_resize(
     console_id: String,
     cols: u16,
     rows: u16,
-) {
+) -> bool {
     state
         .consoles
         .insert(console_id.clone(), ConsoleState { cols, rows });
@@ -1061,25 +1061,37 @@ fn apply_console_resize(
         _ => true,
     };
 
-    if should_activate {
-        if state.active_console.as_deref() != Some(console_id.as_str()) {
-            ERROR_LOG.log(format!(
-                "[ratatui-authority-host-io] session={session_id} active_console={console_id}"
-            ));
-            state.active_console = Some(console_id);
-        }
-        ERROR_LOG.log(format!(
-            "[ratatui-authority-host-io] resize PTY session={session_id} cols={cols} rows={rows}"
-        ));
-        state.resize_pty(cols, rows);
-        state.term.resize(TermSize {
-            cols: cols as usize,
-            rows: rows as usize,
-        });
-        // Do not send bootstrap here. The authority-host target reader defers
-        // bootstrap for a short stability window after OpenMirrorRequest to
-        // avoid redraws for connections that drop immediately.
+    if !should_activate {
+        return false;
     }
+
+    if state.active_console.as_deref() != Some(console_id.as_str()) {
+        ERROR_LOG.log(format!(
+            "[ratatui-authority-host-io] session={session_id} active_console={console_id}"
+        ));
+        state.active_console = Some(console_id);
+    }
+
+    // Skip the PTY resize when the resulting size is unchanged. Session
+    // switches re-register the local console and would otherwise send a
+    // no-op SIGWINCH that forces the foreground application into a full
+    // repaint (a burst of PTY output) on every switch.
+    let grid = state.term.grid();
+    if grid.columns() == cols as usize && grid.screen_lines() == rows as usize {
+        return false;
+    }
+    ERROR_LOG.log(format!(
+        "[ratatui-authority-host-io] resize PTY session={session_id} cols={cols} rows={rows}"
+    ));
+    state.resize_pty(cols, rows);
+    state.term.resize(TermSize {
+        cols: cols as usize,
+        rows: rows as usize,
+    });
+    // Do not send bootstrap here. The authority-host target reader defers
+    // bootstrap for a short stability window after OpenMirrorRequest to
+    // avoid redraws for connections that drop immediately.
+    true
 }
 
 /// Remove a console from the session. If the active console was removed, elect
@@ -1409,6 +1421,37 @@ mod tests {
         assert!(
             !proc_dir.exists(),
             "child {child_pid} should be reaped, not left as a zombie"
+        );
+    }
+
+    #[test]
+    fn apply_console_resize_skips_unchanged_size() {
+        let mut state = make_test_session_state(None);
+
+        // A different size resizes and activates the console.
+        assert!(
+            apply_console_resize(&mut state, "sess", "local".to_string(), 100, 40),
+            "size change must resize the PTY"
+        );
+        assert_eq!(state.active_console.as_deref(), Some("local"));
+
+        // Re-activating with the same size (e.g. a session switch) must not
+        // send another SIGWINCH that forces a full repaint.
+        assert!(
+            !apply_console_resize(&mut state, "sess", "local".to_string(), 100, 40),
+            "same-size resize must be suppressed"
+        );
+
+        // A remote console taking over at the same size must not resize either,
+        // and the local console keeps priority while it is active.
+        assert!(
+            !apply_console_resize(&mut state, "sess", "remote-a".to_string(), 100, 40),
+            "same-size takeover must skip the PTY resize"
+        );
+        assert_eq!(
+            state.active_console.as_deref(),
+            Some("local"),
+            "local console must keep priority"
         );
     }
 }

@@ -863,7 +863,7 @@ impl LocalAuthorityHostBackend for RatatuiLocalAuthorityHostBackend {
     ) -> Result<AuthorityHostSignal, Self::Error> {
         const AUTHORITY_HOST_READY_TIMEOUT: Duration = Duration::from_secs(5);
         let target_id = authority_command_target_id(&command).to_string();
-        ERROR_LOG.log(format!(
+        ERROR_LOG.log_debug(format!(
             "[ratatui-session-sync] deliver_command target={target_id} command={command:?} writer_ready={}",
             host.writer.lock().is_ok_and(|g| g.is_some())
         ));
@@ -1204,7 +1204,7 @@ fn spawn_ratatui_authority_target_host(args: SpawnRatatuiAuthorityTargetHostArgs
                             };
                         }
                         ControlPlanePayload::RawPtyInput(payload) => {
-                            ERROR_LOG.log(format!(
+                            ERROR_LOG.log_debug(format!(
                                 "[ratatui-session-sync] target host received RawPtyInput session={} target={} bytes={}",
                                 payload.session_id, payload.target_id, payload.input_bytes.len()
                             ));
@@ -1286,7 +1286,7 @@ fn spawn_ratatui_authority_target_host(args: SpawnRatatuiAuthorityTargetHostArgs
                     }
                 }
                 Ok(AuthorityTransportFrame::RawPtyInput(payload)) => {
-                    ERROR_LOG.log(format!(
+                    ERROR_LOG.log_debug(format!(
                         "[ratatui-session-sync] target host received raw frame RawPtyInput session={} target={} bytes={}",
                         payload.session_id, payload.target_id, payload.input_bytes.len()
                     ));

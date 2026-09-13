@@ -97,6 +97,11 @@ impl StateEventLoop {
     }
 }
 
+/// Interval between coalesced output-driven snapshot broadcasts. 16ms keeps
+/// keystroke-echo latency imperceptible while collapsing a screen repaint
+/// (which arrives as many small PTY chunks) into one broadcast per interval.
+const OUTPUT_BROADCAST_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
 #[allow(clippy::too_many_arguments)]
 fn run_state_event_loop(
     shared: Arc<SharedState>,
@@ -134,6 +139,19 @@ fn run_state_event_loop(
     // flood the single state-loop thread. Cleared when the node comes back.
     let mut offline_nodes: HashSet<String> = HashSet::new();
     let mut network_online: bool = true;
+    // PTY output events only set this flag; a detached timer (below) flushes
+    // at most one snapshot broadcast per OUTPUT_BROADCAST_FLUSH_INTERVAL.
+    // Local to the single writer thread — no synchronization needed.
+    let mut output_dirty = false;
+    // The timer only sends an event; broadcasting itself stays exclusive to
+    // this loop. It exits when the channel closes (state loop gone).
+    let flush_tx = state_event_tx.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(OUTPUT_BROADCAST_FLUSH_INTERVAL);
+        if flush_tx.send(StateEvent::FlushOutputBroadcast).is_err() {
+            break;
+        }
+    });
 
     while let Ok(event) = rx.recv() {
         match event {
@@ -187,7 +205,7 @@ fn run_state_event_loop(
             }
 
             StateEvent::LocalSessionOutput { .. } => {
-                broadcast_snapshot(&shared, &client_writer, &connected_clients);
+                output_dirty = true;
             }
 
             StateEvent::ClientConnected { client_id } => {
@@ -282,7 +300,14 @@ fn run_state_event_loop(
             }
 
             StateEvent::RemoteSessionOutput { .. } => {
-                broadcast_snapshot(&shared, &client_writer, &connected_clients);
+                output_dirty = true;
+            }
+
+            StateEvent::FlushOutputBroadcast => {
+                if output_dirty {
+                    output_dirty = false;
+                    broadcast_snapshot(&shared, &client_writer, &connected_clients);
+                }
             }
 
             StateEvent::RemoteSessionDisconnected { target_id } => {
@@ -1262,7 +1287,7 @@ fn broadcast_snapshot(
     }
     let count = shared.clients.client_count.load(Ordering::SeqCst);
     let snapshot = build_snapshot(count, shared);
-    let payload = snapshot_json(&snapshot);
+    let payload = snapshot_json(snapshot);
     #[cfg(test)]
     {
         use std::sync::atomic::Ordering;
@@ -2570,8 +2595,8 @@ mod state_loop_tests {
 
         // Register the client stream first, then notify the state loop. This
         // keeps the ClientWriter queue order deterministic: Register, then the
-        // ClientConnected broadcast, then the LocalSessionOutput broadcast, then
-        // the Status response.
+        // ClientConnected broadcast, then the flushed LocalSessionOutput
+        // broadcast, then the Status response.
         client_writer.send(super::super::client_writer::ClientWriterRequest::Register {
             client_id: 1,
             stream: crate::platform::local_ipc::unix::LocalStream::from_unix(client),
@@ -2579,10 +2604,12 @@ mod state_loop_tests {
         });
         let _ = tx.send(StateEvent::ClientConnected { client_id: 1 });
 
-        // Trigger a snapshot broadcast via the single-writer loop.
+        // Output events only mark the snapshot dirty; the flush event delivers
+        // the coalesced broadcast.
         let _ = tx.send(StateEvent::LocalSessionOutput {
             target_id: "local#0:1".to_string(),
         });
+        let _ = tx.send(StateEvent::FlushOutputBroadcast);
 
         // Send a one-shot status command so we have a deterministic final line.
         let _ = tx.send(StateEvent::ClientCommand {
@@ -2617,6 +2644,66 @@ mod state_loop_tests {
         assert!(
             status_line.contains("\"ok\":true"),
             "expected ok status response, got: {status_line}"
+        );
+
+        drop(tx);
+        drop(client_writer);
+        handle.join().expect("state loop should exit cleanly");
+    }
+
+    #[test]
+    fn state_loop_coalesces_output_broadcast_until_flush() {
+        let _guard = STATE_LOOP_TEST_LOCK.lock().unwrap();
+        let (_shared, tx, client_writer, handle) = start_test_loop();
+        let (server, client) = UnixStream::pair().expect("stream pair");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set timeout");
+        client_writer.send(super::super::client_writer::ClientWriterRequest::Register {
+            client_id: 3,
+            stream: crate::platform::local_ipc::unix::LocalStream::from_unix(client),
+            broadcast: true,
+        });
+        let _ = tx.send(StateEvent::ClientConnected { client_id: 3 });
+
+        let mut reader = BufReader::new(server);
+        let mut connected_snapshot = String::new();
+        reader
+            .read_line(&mut connected_snapshot)
+            .expect("ClientConnected snapshot should be broadcast immediately");
+
+        // An output event must not broadcast immediately; a following
+        // non-output command response must come first.
+        let _ = tx.send(StateEvent::LocalSessionOutput {
+            target_id: "local#0:3".to_string(),
+        });
+        let _ = tx.send(StateEvent::ClientCommand {
+            client_id: 3,
+            command: ClientCommand::Status,
+        });
+        let mut status_line = String::new();
+        reader
+            .read_line(&mut status_line)
+            .expect("status response should arrive without a preceding output broadcast");
+        assert!(
+            status_line.contains("\"ok\":true"),
+            "expected Status response before any flushed output snapshot, got: {status_line}"
+        );
+
+        // The flush event delivers the coalesced output snapshot.
+        let _ = tx.send(StateEvent::FlushOutputBroadcast);
+        let _ = tx.send(StateEvent::ClientCommand {
+            client_id: 3,
+            command: ClientCommand::Status,
+        });
+        let mut flushed_snapshot = String::new();
+        reader
+            .read_line(&mut flushed_snapshot)
+            .expect("flush should broadcast the deferred output snapshot");
+        assert!(
+            flushed_snapshot.contains("\"type\":\"Snapshot\"")
+                || flushed_snapshot.contains("Snapshot"),
+            "expected flushed snapshot broadcast, got: {flushed_snapshot}"
         );
 
         drop(tx);

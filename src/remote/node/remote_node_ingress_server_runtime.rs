@@ -2504,7 +2504,7 @@ fn handle_internal_event<G: LocalSessionCatalog>(
             endpoint,
             command,
         } => {
-            ERROR_LOG.log(format!(
+            ERROR_LOG.log_debug(format!(
                 "[remote-node-ingress] authority command received node={node_id} session_instance_id={session_instance_id} endpoint={endpoint} command={command:?}",
             ));
             let Some(active) = sessions.get(&session_instance_id) else {
@@ -3583,7 +3583,7 @@ fn spawn_authority_bridge_reader(
 ) {
     thread::spawn(move || {
         while let Ok(command) = reader.recv_command() {
-            ERROR_LOG.log(format!(
+            ERROR_LOG.log_debug(format!(
                 "[remote-node-ingress] bridge reader recv_command node={node_id} session_instance_id={session_instance_id} endpoint={endpoint} command={command:?}",
             ));
             if internal_tx

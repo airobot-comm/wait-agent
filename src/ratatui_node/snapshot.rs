@@ -88,9 +88,8 @@ pub enum ServerMessageJson {
     History(HistoryResponse),
 }
 
-pub(crate) fn snapshot_json(snapshot: &RatatuiSnapshot) -> String {
-    serde_json::to_string(&ServerMessageJson::Snapshot(Box::new(snapshot.clone())))
-        .unwrap_or_default()
+pub(crate) fn snapshot_json(snapshot: RatatuiSnapshot) -> String {
+    serde_json::to_string(&ServerMessageJson::Snapshot(Box::new(snapshot))).unwrap_or_default()
 }
 
 pub(crate) fn response_json(response: &ControlResponse) -> String {

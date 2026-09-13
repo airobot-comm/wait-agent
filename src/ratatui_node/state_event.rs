@@ -160,6 +160,12 @@ pub(crate) enum StateEvent {
         authority_node_id: String,
         result: Box<Result<crate::domain::session_catalog::ManagedSessionRecord, String>>,
     },
+    /// Timer tick telling the state loop to flush a pending output-driven
+    /// snapshot broadcast. Sent by a detached interval thread; only the state
+    /// loop consumes it. PTY output events only set a dirty flag and are
+    /// coalesced into one broadcast per interval so a screen repaint arriving
+    /// as many small chunks does not serialize a full snapshot per chunk.
+    FlushOutputBroadcast,
 }
 
 /// A command sent by a TUI client and processed by `StateEventLoop`.

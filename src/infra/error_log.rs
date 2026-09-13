@@ -124,6 +124,14 @@ fn suppressible_lines(
 
 pub struct ErrorLog;
 
+/// Whether debug-level log entries are emitted, cached for the process
+/// lifetime. Debug entries are per-keystroke / per-protocol-message volumes
+/// and stay silent unless explicitly requested.
+fn debug_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WAITAGENT_DEBUG_LOG").is_some())
+}
+
 impl ErrorLog {
     pub const fn new() -> Self {
         Self
@@ -139,6 +147,16 @@ impl ErrorLog {
 
     pub fn log_error(&self, message: String) {
         self.write(LogLevel::Error, message);
+    }
+
+    /// Log a high-frequency diagnostics entry (per keystroke, per protocol
+    /// message). Emitted only when `WAITAGENT_DEBUG_LOG` is set; skipped
+    /// entirely otherwise so the hot input path pays no formatting or I/O
+    /// cost.
+    pub fn log_debug(&self, message: String) {
+        if debug_logging_enabled() {
+            self.write(LogLevel::Debug, message);
+        }
     }
 
     fn write(&self, level: LogLevel, message: String) {
